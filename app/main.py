@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
@@ -152,64 +152,69 @@ async def delete_session(session_id: str):
     return {"status": "deleted", "session_id": session_id}
 
 
-@app.post("/channels/feishu/events")
-async def feishu_events(request: Request):
-    """飞书事件回调入口
-
-    处理流程：
-    1. challenge 验证（配置事件订阅时）
-    2. token 校验
-    3. 解析消息事件
-    4. 调用 Orchestrator 处理
-    5. 回复飞书消息
-    """
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
-
-    # 1. challenge 验证
-    challenge_response = feishu_adapter.verify_challenge(body)
-    if challenge_response:
-        return challenge_response
-
-    # 2. token 校验
-    if not feishu_adapter.verify_token(body):
-        return JSONResponse(status_code=403, content={"error": "Invalid token"})
-
-    # 3. 解析消息事件
-    event_data = feishu_adapter.parse_event(body)
-    if not event_data:
-        return {"code": 0}
-
+async def process_feishu_message(event_data: dict) -> None:
+    """后台处理飞书消息并回复"""
     open_id = event_data.get("open_id")
     chat_id = event_data.get("chat_id")
     message_id = event_data.get("message_id")
     text = event_data.get("text")
 
-    if not text:
-        return {"code": 0}
-
-    # 4. 生成 session_id 并调用 Orchestrator
-    session_id = feishu_adapter.generate_session_id(open_id, chat_id)
-
-    ask_request = AskRequest(
-        channel="feishu",
-        user_id=open_id,
-        session_id=session_id,
-        question=text,
-    )
-
     try:
+        session_id = feishu_adapter.generate_session_id(open_id, chat_id)
+        ask_request = AskRequest(
+            channel="feishu",
+            user_id=open_id,
+            session_id=session_id,
+            question=text,
+        )
         response = await orchestrator.process(ask_request)
         answer = response.answer
     except Exception as e:
         logger.error(f"飞书消息处理失败: {e}", exc_info=True)
         answer = "抱歉，处理您的问题时出现错误，请稍后重试。"
 
-    # 5. 回复飞书消息
-    await feishu_adapter.reply_message(message_id, answer)
+    try:
+        await feishu_adapter.reply_message(message_id, answer)
+    except Exception as e:
+        logger.error(f"飞书消息回复失败: {e}", exc_info=True)
 
+
+@app.post("/channels/feishu/events")
+async def feishu_events(request: Request, background_tasks: BackgroundTasks):
+    """飞书事件回调入口
+
+    处理流程：
+    1. token 校验
+    2. challenge 验证（配置事件订阅时）
+    3. 解析消息事件
+    4. 幂等登记
+    5. 后台调用 Orchestrator 并回复飞书消息
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    # 1. token 校验。challenge 也必须通过 token 校验后再返回。
+    if not feishu_adapter.verify_token(body):
+        return JSONResponse(status_code=403, content={"error": "Invalid token"})
+
+    # 2. challenge 验证
+    challenge_response = feishu_adapter.verify_challenge(body)
+    if challenge_response:
+        return challenge_response
+
+    # 3. 解析消息事件
+    event_data = feishu_adapter.parse_event(body)
+    if not event_data:
+        return {"code": 0}
+
+    # 4. 幂等登记，重复事件直接确认，避免飞书重试造成重复回复。
+    if not feishu_adapter.mark_event_seen(event_data.get("dedupe_key")):
+        return {"code": 0}
+
+    # 5. 后台处理，确保回调入口快速返回。
+    background_tasks.add_task(process_feishu_message, event_data)
     return {"code": 0}
 
 
