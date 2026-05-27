@@ -2,18 +2,48 @@
 
 import asyncio
 from typing import Optional
+from openai import AsyncOpenAI, APIError, APITimeoutError, AuthenticationError
 from app.config import settings
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
 
+class LLMGatewayError(Exception):
+    """LLM网关异常"""
+    pass
+
+
 class LLMGateway:
     """LLM网关"""
 
     def __init__(self):
-        self.provider = settings.llm_provider
-        self._client = None
+        self._client: Optional[AsyncOpenAI] = None
+
+    @property
+    def provider(self) -> str:
+        """当前LLM提供商。
+
+        每次从配置读取，避免全局单例在导入时把 provider 固化。
+        """
+        return settings.llm_provider
+
+    @provider.setter
+    def provider(self, value: str) -> None:
+        """兼容测试中直接设置 provider 的写法。"""
+        settings.llm_provider = value
+
+    def _get_client(self) -> AsyncOpenAI:
+        """获取或创建客户端"""
+        if self._client is None:
+            if not settings.deepseek_api_key:
+                raise LLMGatewayError("未配置DEEPSEEK_API_KEY")
+            self._client = AsyncOpenAI(
+                api_key=settings.deepseek_api_key,
+                base_url=settings.deepseek_base_url,
+                timeout=settings.llm_timeout_seconds,
+            )
+        return self._client
 
     async def generate(
         self,
@@ -28,7 +58,7 @@ class LLMGateway:
         elif self.provider == "deepseek":
             return await self._deepseek_generate(prompt, system_prompt, max_tokens, temperature)
         else:
-            raise ValueError(f"不支持的LLM提供商: {self.provider}")
+            raise LLMGatewayError(f"不支持的LLM提供商: {self.provider}")
 
     async def _mock_generate(self, prompt: str) -> str:
         """模拟生成"""
@@ -43,15 +73,7 @@ class LLMGateway:
         temperature: float,
     ) -> str:
         """调用DeepSeek API"""
-        if not settings.deepseek_api_key:
-            raise ValueError("未配置DEEPSEEK_API_KEY")
-
-        if self._client is None:
-            from openai import AsyncOpenAI
-            self._client = AsyncOpenAI(
-                api_key=settings.deepseek_api_key,
-                base_url=settings.deepseek_base_url,
-            )
+        client = self._get_client()
 
         messages = []
         if system_prompt:
@@ -59,18 +81,29 @@ class LLMGateway:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            response = await self._client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=settings.deepseek_model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                timeout=settings.llm_timeout_seconds,
             )
-            return response.choices[0].message.content or ""
+            content = response.choices[0].message.content
+            if not content:
+                logger.warning("DeepSeek返回空内容")
+                return "抱歉，无法生成回答。"
+            return content
+        except AuthenticationError as e:
+            logger.error(f"DeepSeek认证失败: {e}")
+            raise LLMGatewayError("API Key无效或已过期") from e
+        except APITimeoutError as e:
+            logger.error(f"DeepSeek请求超时: {e}")
+            raise LLMGatewayError(f"请求超时({settings.llm_timeout_seconds}秒)") from e
+        except APIError as e:
+            logger.error(f"DeepSeek API错误: {e}")
+            raise LLMGatewayError(f"API错误: {e.message}") from e
         except Exception as e:
-            logger.error(f"DeepSeek API调用失败: {e}")
-            raise
+            logger.error(f"DeepSeek调用异常: {e}")
+            raise LLMGatewayError(f"调用异常: {str(e)}") from e
 
 
-# 全局实例
 llm_gateway = LLMGateway()

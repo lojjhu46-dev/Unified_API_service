@@ -10,6 +10,7 @@ from app.schemas import (
     TimingInfo,
 )
 from app.llm.gateway import llm_gateway
+from app.llm.prompts import build_direct_prompt, build_rag_prompt
 from app.retrieval.retriever import retriever
 from app.observability.logging import get_logger
 
@@ -95,8 +96,9 @@ class Orchestrator:
 
     async def _handle_direct(self, request: AskRequest) -> dict:
         """处理直接问答"""
+        system_prompt, prompt = build_direct_prompt(request.question)
         start = time.perf_counter()
-        answer = await self.llm.generate(request.question)
+        answer = await self.llm.generate(prompt, system_prompt=system_prompt)
         llm_ms = (time.perf_counter() - start) * 1000
 
         return {
@@ -117,10 +119,10 @@ class Orchestrator:
         retrieval_ms = (time.perf_counter() - start) * 1000
 
         context = "\n\n".join([s.snippet for s in sources])
-        prompt = f"基于以下文档回答问题:\n\n{context}\n\n问题: {request.question}"
+        system_prompt, prompt = build_rag_prompt(request.question, context)
 
         start = time.perf_counter()
-        answer = await self.llm.generate(prompt)
+        answer = await self.llm.generate(prompt, system_prompt=system_prompt)
         llm_ms = (time.perf_counter() - start) * 1000
 
         return {

@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
@@ -10,9 +10,12 @@ from app.schemas import (
     AskRequest,
     AgentResponse,
     HealthResponse,
+    UploadResponse,
     ErrorResponse,
 )
+from app.llm.gateway import LLMGatewayError
 from app.orchestrator import orchestrator
+from app.retrieval.ingest import validate_file_extension, save_uploaded_file, ingest_file
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -30,6 +33,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(LLMGatewayError)
+async def llm_gateway_exception_handler(request: Request, exc: LLMGatewayError) -> JSONResponse:
+    request_id = str(uuid.uuid4())[:12]
+    logger.warning(
+        f"LLM网关错误: {exc}",
+        extra={"request_id": request_id},
+    )
+    return JSONResponse(
+        status_code=503,
+        content=ErrorResponse(
+            detail=str(exc),
+            request_id=request_id,
+        ).model_dump(),
+    )
 
 
 @app.exception_handler(Exception)
@@ -61,6 +80,31 @@ async def health():
 @app.post("/ask", response_model=AgentResponse)
 async def ask(request: AskRequest):
     return await orchestrator.process(request)
+
+
+@app.post("/documents/upload", response_model=UploadResponse)
+async def upload_document(file: UploadFile = File(...)):
+    """上传文档到知识库"""
+    if not validate_file_extension(file.filename):
+        raise HTTPException(status_code=400, detail="仅支持 PDF 和 TXT 文件")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:  # 10MB限制
+        raise HTTPException(status_code=400, detail="文件大小不能超过10MB")
+
+    try:
+        file_path = save_uploaded_file(content, file.filename)
+        result = ingest_file(file_path)
+        return UploadResponse(
+            document_id=result["document_id"],
+            filename=result["filename"],
+            chunks=result["chunks"],
+            status="success",
+            message=f"文档上传成功，共{result['chunks']}个切块",
+        )
+    except Exception as e:
+        logger.error(f"文档上传失败: {e}")
+        raise HTTPException(status_code=500, detail=f"文档处理失败: {str(e)}")
 
 
 @app.get("/")
