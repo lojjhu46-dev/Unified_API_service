@@ -1,0 +1,48 @@
+# Unified API Service 核心依赖
+# 阶段1：统一API骨架
+
+# Web 框架
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# 数据验证和序列化
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# HTTP 客户端（后续阶段使用）
+httpx>=0.26.0
+
+# Redis 客户端（后续阶段使用）
+redis>=5.0.0
+
+# OpenAI 兼容客户端（后续阶段使用）
+openai>=1.12.0
+
+# 文档处理（后续阶段使用）
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-openai>=0.0.5
+langchain-text-splitters>=0.0.1
+
+# 向量数据库（后续阶段使用）
+chromadb>=0.4.22
+
+# BM25 检索（后续阶段使用）
+rank-bm25>=0.2.2
+
+# 文档加载（后续阶段使用）
+pypdf>=4.0.0
+
+# 测试依赖
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+httpx>=0.26.0
+
+# 代码质量
+black>=24.1.0
+isort>=5.13.0
+flake8>=7.0.0
+mypy>=1.8.0
