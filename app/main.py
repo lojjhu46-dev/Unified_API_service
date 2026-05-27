@@ -11,6 +11,8 @@ from app.schemas import (
     AgentResponse,
     HealthResponse,
     UploadResponse,
+    SessionCreateResponse,
+    SessionHistoryResponse,
     ErrorResponse,
 )
 from app.llm.gateway import LLMGatewayError
@@ -123,6 +125,30 @@ async def upload_document(file: UploadFile = File(...)):
                 request_id=request_id,
             ).model_dump(),
         )
+
+
+@app.post("/sessions", response_model=SessionCreateResponse)
+async def create_session():
+    """创建新会话"""
+    session_id = await orchestrator.memory.create_session()
+    return SessionCreateResponse(session_id=session_id)
+
+
+@app.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
+async def get_session_history(session_id: str):
+    """获取会话历史"""
+    history = await orchestrator.memory.get_history(session_id)
+    return SessionHistoryResponse(
+        session_id=session_id,
+        messages=history,
+    )
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """删除会话"""
+    await orchestrator.memory.clear_session(session_id)
+    return {"status": "deleted", "session_id": session_id}
 
 
 @app.get("/")

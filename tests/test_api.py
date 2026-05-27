@@ -1,7 +1,7 @@
 """API测试"""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from app.main import app
 from app.llm.gateway import LLMGatewayError
@@ -234,3 +234,99 @@ def test_upload_processing_error_is_sanitized(client):
     assert data["detail"] == "文档处理失败，请稍后重试"
     assert "request_id" in data
     assert "secret" not in data["detail"]
+
+
+def test_create_session(client):
+    response = client.post("/sessions")
+    assert response.status_code == 200
+    data = response.json()
+    assert "session_id" in data
+
+
+def test_get_session_history(client):
+    with patch("app.main.orchestrator.memory") as mock_memory:
+        mock_memory.create_session = AsyncMock(return_value="shared_session")
+        mock_memory.get_history = AsyncMock(return_value=[
+            {"role": "user", "content": "问题"},
+            {"role": "assistant", "content": "回答"},
+        ])
+
+        create_resp = client.post("/sessions")
+        session_id = create_resp.json()["session_id"]
+        response = client.get(f"/sessions/{session_id}/history")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_id"] == session_id
+    assert data["messages"][0]["content"] == "问题"
+    mock_memory.get_history.assert_awaited_once_with("shared_session")
+
+
+def test_delete_session(client):
+    with patch("app.main.orchestrator.memory") as mock_memory:
+        mock_memory.create_session = AsyncMock(return_value="shared_session")
+        mock_memory.clear_session = AsyncMock()
+
+        create_resp = client.post("/sessions")
+        session_id = create_resp.json()["session_id"]
+        response = client.delete(f"/sessions/{session_id}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "deleted"
+    mock_memory.clear_session.assert_awaited_once_with("shared_session")
+
+
+def test_ask_with_standalone_question(client):
+    with patch("app.orchestrator.orchestrator.memory") as mock_memory, \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])):
+
+        mock_memory.get_history = AsyncMock(return_value=[
+            {"role": "user", "content": "iPhone 15有什么特点"},
+            {"role": "assistant", "content": "特点..."},
+        ])
+        mock_memory.create_session = AsyncMock(return_value="test_session")
+        mock_memory.append_turn = AsyncMock()
+
+        with patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="iPhone 15的价格")):
+            payload = {
+                "user_id": "test_user",
+                "question": "它的价格呢",
+            }
+            response = client.post("/ask", json=payload)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["standalone_question"] == "iPhone 15的价格"
+
+
+def test_rag_prompt_includes_history_original_and_standalone_question(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "iPhone 15有什么特点"},
+        {"role": "assistant", "content": "特点..."},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate, patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[]),
+    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="iPhone 15的价格")):
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "它的价格呢"},
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.args[0]
+    assert "最近对话历史" in prompt
+    assert "iPhone 15有什么特点" in prompt
+    assert "用户原始问题" in prompt
+    assert "它的价格呢" in prompt
+    assert "独立检索问题" in prompt
+    assert "iPhone 15的价格" in prompt
