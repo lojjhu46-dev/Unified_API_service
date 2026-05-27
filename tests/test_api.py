@@ -165,7 +165,9 @@ def test_orchestrator_uses_rag_prompt_template(client):
 
 
 def test_upload_pdf(client):
-    with patch("app.main.ingest_file") as mock_ingest:
+    with patch("app.main.ingest_file") as mock_ingest, patch(
+        "app.main.orchestrator.retriever.refresh"
+    ) as mock_refresh:
         mock_ingest.return_value = {
             "document_id": "test123",
             "filename": "test.pdf",
@@ -180,6 +182,7 @@ def test_upload_pdf(client):
     data = response.json()
     assert data["status"] == "success"
     assert data["chunks"] == 5
+    mock_refresh.assert_called_once()
 
 
 def test_upload_txt(client):
@@ -206,3 +209,28 @@ def test_upload_invalid_extension(client):
     )
     assert response.status_code == 400
     assert "仅支持" in response.json()["detail"]
+
+
+def test_upload_too_large(client):
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("big.txt", b"x" * (10 * 1024 * 1024 + 1), "text/plain")},
+    )
+    assert response.status_code == 400
+    assert "10MB" in response.json()["detail"]
+
+
+def test_upload_processing_error_is_sanitized(client):
+    with patch("app.main.save_uploaded_file", return_value="D:/secret/path/test.txt"), patch(
+        "app.main.ingest_file", side_effect=RuntimeError("secret path D:/secret/path/test.txt")
+    ):
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["detail"] == "文档处理失败，请稍后重试"
+    assert "request_id" in data
+    assert "secret" not in data["detail"]

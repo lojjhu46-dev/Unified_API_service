@@ -15,7 +15,12 @@ from app.schemas import (
 )
 from app.llm.gateway import LLMGatewayError
 from app.orchestrator import orchestrator
-from app.retrieval.ingest import validate_file_extension, save_uploaded_file, ingest_file
+from app.retrieval.ingest import (
+    ingest_file,
+    sanitize_filename,
+    save_uploaded_file,
+    validate_file_extension,
+)
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -93,8 +98,10 @@ async def upload_document(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="文件大小不能超过10MB")
 
     try:
+        safe_filename = sanitize_filename(file.filename)
         file_path = save_uploaded_file(content, file.filename)
-        result = ingest_file(file_path)
+        result = ingest_file(file_path, original_filename=safe_filename)
+        orchestrator.retriever.refresh()
         return UploadResponse(
             document_id=result["document_id"],
             filename=result["filename"],
@@ -103,8 +110,19 @@ async def upload_document(file: UploadFile = File(...)):
             message=f"文档上传成功，共{result['chunks']}个切块",
         )
     except Exception as e:
-        logger.error(f"文档上传失败: {e}")
-        raise HTTPException(status_code=500, detail=f"文档处理失败: {str(e)}")
+        request_id = str(uuid.uuid4())[:12]
+        logger.error(
+            f"文档上传失败: {e}",
+            extra={"request_id": request_id},
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=ErrorResponse(
+                detail="文档处理失败，请稍后重试",
+                request_id=request_id,
+            ).model_dump(),
+        )
 
 
 @app.get("/")

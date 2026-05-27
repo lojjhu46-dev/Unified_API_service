@@ -68,4 +68,4 @@ def _sync_similarity_search(query: str, k: int) -> list:
         return results
     except Exception as e:
         logger.error(f"相似度搜索失败: {e}")
-        return []
+        raise
