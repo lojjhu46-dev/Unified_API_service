@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from app.main import app
 from app.llm.gateway import LLMGatewayError
+from app.schemas import ToolTrace
 
 
 @pytest.fixture
@@ -316,10 +317,10 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     ) as mock_generate, patch(
         "app.orchestrator.orchestrator.retriever.search",
         new=AsyncMock(return_value=[]),
-    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="iPhone 15的价格")):
+    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="iPhone 15的续航")):
         response = client.post(
             "/ask",
-            json={"user_id": "test_user", "question": "它的价格呢"},
+            json={"user_id": "test_user", "question": "它的续航怎么样"},
         )
 
     assert response.status_code == 200
@@ -327,6 +328,98 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     assert "最近对话历史" in prompt
     assert "iPhone 15有什么特点" in prompt
     assert "用户原始问题" in prompt
-    assert "它的价格呢" in prompt
+    assert "它的续航怎么样" in prompt
     assert "独立检索问题" in prompt
-    assert "iPhone 15的价格" in prompt
+    assert "iPhone 15的续航" in prompt
+
+
+def test_ask_routes_to_web_for_news(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute = AsyncMock(return_value=ToolTrace(
+        tool_name="web_search",
+        tool_input={"query": "今天的新闻"},
+        status="success",
+        output_preview="新闻标题",
+        latency_ms=100,
+    ))
+    mock_tools._run_web_search = AsyncMock(return_value={
+        "success": True,
+        "results": [
+            {"title": "新闻标题", "url": "https://example.com", "snippet": "新闻内容"},
+        ],
+    })
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        payload = {
+            "user_id": "test_user",
+            "question": "今天的新闻",
+        }
+        response = client.post("/ask", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+
+
+def test_ask_routes_to_tool_for_calculation(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute = AsyncMock(return_value=ToolTrace(
+        tool_name="calculator",
+        tool_input={"expression": "计算 2+3 等于多少"},
+        status="success",
+        output_preview="5",
+        latency_ms=10,
+    ))
+    mock_tools._run_calculator = AsyncMock(return_value={
+        "success": True,
+        "result": "5",
+    })
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        payload = {
+            "user_id": "test_user",
+            "question": "计算 2+3 等于多少",
+        }
+        response = client.post("/ask", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "tool"
+
+
+def test_ask_need_web_never_skips_search(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])):
+
+        payload = {
+            "user_id": "test_user",
+            "question": "今天天气",
+            "need_web": "never",
+        }
+        response = client.post("/ask", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "rag"
