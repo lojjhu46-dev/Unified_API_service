@@ -12,6 +12,7 @@ _ALLOWED_PATTERN = re.compile(r'^[\d\s+\-*/().,%πA-Za-z°℃℉^<>=!]+$')
 _TEMP_UNIT_PATTERN = re.compile(r'[°℃℉]')
 _TEMP_LABEL_PATTERN = re.compile(r'([\d.]+)\s*[°℃℉]?\s*([CFcf])\b')
 _IMPLICIT_MULT = re.compile(r'(\d)\(')
+_MATH_TOKEN_PATTERN = re.compile(r'[\dπpieE\s+\-*/().,%^<>=!]+')
 _MAX_EXPRESSION_LENGTH = 200
 _MAX_POWER_EXPONENT = 100
 _MAX_ABS_RESULT = 1e12
@@ -122,6 +123,42 @@ def _preprocess_expression(raw: str) -> str:
     expr = expr.replace("^", "**")
     expr = _IMPLICIT_MULT.sub(r'\1*(', expr)
     return expr
+
+
+def extract_math_expression(raw: str) -> str:
+    """从自然语言问题中提取可计算表达式"""
+    if not raw:
+        return ""
+
+    expr = raw.strip()
+    replacements = {
+        "加上": "+",
+        "加": "+",
+        "减去": "-",
+        "减": "-",
+        "乘以": "*",
+        "乘": "*",
+        "除以": "/",
+        "除": "/",
+        "等于": " ",
+        "是多少": " ",
+        "多少": " ",
+        "计算": " ",
+        "请": " ",
+        "帮我": " ",
+        "？": " ",
+        "?": " ",
+        "，": " ",
+        ",": " ",
+    }
+    for old, new in replacements.items():
+        expr = expr.replace(old, new)
+
+    matches = [m.group(0).strip() for m in _MATH_TOKEN_PATTERN.finditer(expr)]
+    candidates = [m for m in matches if any(ch.isdigit() for ch in m)]
+    if not candidates:
+        return ""
+    return max(candidates, key=len).strip()
 
 
 def calculate(expression: str) -> dict:

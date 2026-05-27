@@ -1,9 +1,8 @@
 """联网搜索工具"""
 
-import time
+import asyncio
 import httpx
 from typing import List
-from app.schemas import SourceItem
 from app.config import settings
 from app.observability.logging import get_logger
 
@@ -75,7 +74,7 @@ async def web_search(query: str) -> dict:
                 if resp.status_code == 429:
                     if attempt < settings.max_retries:
                         wait_time = 2 ** attempt
-                        time.sleep(wait_time)
+                        await asyncio.sleep(wait_time)
                         continue
                     return {
                         "success": False,

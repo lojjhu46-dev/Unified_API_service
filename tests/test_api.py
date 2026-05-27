@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from app.main import app
 from app.llm.gateway import LLMGatewayError
-from app.schemas import ToolTrace
+from app.schemas import SourceItem, ToolTrace
+from app.tools.registry import ToolExecution
 
 
 @pytest.fixture
@@ -333,6 +334,298 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     assert "iPhone 15的续航" in prompt
 
 
+def test_ask_routes_to_agentic_rag_for_news(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天的新闻"},
+            status="success",
+            output_preview="新闻标题",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "新闻标题", "url": "https://example.com", "snippet": "新闻内容"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        payload = {
+            "user_id": "test_user",
+            "question": "今天的新闻",
+        }
+        response = client.post("/ask", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    mock_tools.execute_with_result.assert_awaited_once()
+
+
+def test_ask_need_web_always_routes_to_web_before_calculation_words(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天北京气温多少"},
+            status="success",
+            output_preview="天气",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "天气", "url": "https://example.com", "snippet": "北京天气"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "今天北京气温多少",
+                "need_web": "always",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+
+
+def test_ask_web_route_calls_search_once(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "最新AI新闻"},
+            status="success",
+            output_preview="AI新闻",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "AI新闻", "url": "https://example.com", "snippet": "新闻内容"},
+            ],
+        },
+    ))
+    mock_tools._run_web_search = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "最新AI新闻", "need_web": "always"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+    mock_tools.execute_with_result.assert_awaited_once()
+    mock_tools._run_web_search.assert_not_called()
+
+
+def test_ask_agentic_rag_calls_search_once_and_includes_sources(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天AI新闻"},
+            status="success",
+            output_preview="AI新闻",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "AI新闻", "url": "https://example.com", "snippet": "联网内容"},
+            ],
+        },
+    ))
+    mock_tools._run_web_search = AsyncMock()
+    local_source = SourceItem(
+        title="本地文档",
+        source_type="knowledge_base",
+        snippet="本地内容",
+        score=0.9,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[local_source])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")) as mock_generate:
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "今天AI新闻"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    assert {s["source_type"] for s in data["sources"]} == {"knowledge_base", "web_search"}
+    prompt = mock_generate.call_args.args[0]
+    assert "本地知识库片段" in prompt
+    assert "联网搜索片段" in prompt
+    mock_tools.execute_with_result.assert_awaited_once()
+    mock_tools._run_web_search.assert_not_called()
+
+
+def test_ask_web_failure_falls_back_to_local_rag(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "最新产品价格"},
+            status="error",
+            output_preview="",
+            latency_ms=100,
+            error_message="搜索请求异常: ConnectError",
+        ),
+        result={"success": False, "error": "搜索请求异常: ConnectError", "results": []},
+    ))
+    local_source = SourceItem(
+        title="本地价格文档",
+        source_type="knowledge_base",
+        snippet="本地价格信息",
+        score=0.8,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[local_source])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="基于本地知识库回答")) as mock_generate:
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "最新产品价格", "need_web": "always"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+    assert data["answer"] == "基于本地知识库回答"
+    assert data["sources"][0]["source_type"] == "knowledge_base"
+    assert data["tool_trace"][0]["status"] == "error"
+    assert "联网搜索失败" in mock_generate.call_args.args[0]
+
+
+def test_ask_web_failure_without_local_rag_returns_friendly_answer(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "最新新闻"},
+            status="error",
+            output_preview="",
+            latency_ms=100,
+            error_message="搜索服务认证失败（HTTP 401），SERPER_API_KEY 无效",
+        ),
+        result={"success": False, "error": "搜索服务认证失败（HTTP 401），SERPER_API_KEY 无效", "results": []},
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="不应调用")) as mock_generate:
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "最新新闻", "need_web": "always"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+    assert "暂时无法获取联网搜索结果" in data["answer"]
+    assert "SERPER_API_KEY" not in data["answer"]
+    assert data["tool_trace"][0]["status"] == "error"
+    mock_generate.assert_not_called()
+
+
+def test_ask_auto_weather_question_does_not_route_to_tool(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天北京气温多少"},
+            status="success",
+            output_preview="天气",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "天气", "url": "https://example.com", "snippet": "北京天气"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "今天北京气温多少"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+
+
 def test_ask_routes_to_web_for_news(client):
     mock_memory = MagicMock()
     mock_memory.get_history = AsyncMock(return_value=[])
@@ -340,19 +633,21 @@ def test_ask_routes_to_web_for_news(client):
     mock_memory.append_turn = AsyncMock()
 
     mock_tools = MagicMock()
-    mock_tools.execute = AsyncMock(return_value=ToolTrace(
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
         tool_name="web_search",
         tool_input={"query": "今天的新闻"},
         status="success",
         output_preview="新闻标题",
         latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "新闻标题", "url": "https://example.com", "snippet": "新闻内容"},
+            ],
+        },
     ))
-    mock_tools._run_web_search = AsyncMock(return_value={
-        "success": True,
-        "results": [
-            {"title": "新闻标题", "url": "https://example.com", "snippet": "新闻内容"},
-        ],
-    })
 
     with patch("app.orchestrator.orchestrator.memory", mock_memory), \
          patch("app.orchestrator.orchestrator.tools", mock_tools), \
@@ -361,6 +656,7 @@ def test_ask_routes_to_web_for_news(client):
         payload = {
             "user_id": "test_user",
             "question": "今天的新闻",
+            "need_web": "always",
         }
         response = client.post("/ask", json=payload)
 
@@ -375,21 +671,7 @@ def test_ask_routes_to_tool_for_calculation(client):
     mock_memory.create_session = AsyncMock(return_value="test_session")
     mock_memory.append_turn = AsyncMock()
 
-    mock_tools = MagicMock()
-    mock_tools.execute = AsyncMock(return_value=ToolTrace(
-        tool_name="calculator",
-        tool_input={"expression": "计算 2+3 等于多少"},
-        status="success",
-        output_preview="5",
-        latency_ms=10,
-    ))
-    mock_tools._run_calculator = AsyncMock(return_value={
-        "success": True,
-        "result": "5",
-    })
-
     with patch("app.orchestrator.orchestrator.memory", mock_memory), \
-         patch("app.orchestrator.orchestrator.tools", mock_tools), \
          patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
 
         payload = {
@@ -401,6 +683,7 @@ def test_ask_routes_to_tool_for_calculation(client):
     assert response.status_code == 200
     data = response.json()
     assert data["route"] == "tool"
+    assert data["answer"] == "计算结果：5"
 
 
 def test_ask_need_web_never_skips_search(client):

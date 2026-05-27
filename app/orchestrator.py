@@ -1,12 +1,12 @@
 """编排器"""
 
+import asyncio
 import uuid
 import time
 from app.schemas import (
     AskRequest,
     AgentResponse,
     SourceItem,
-    ToolTrace,
     TimingInfo,
 )
 from app.llm.gateway import llm_gateway
@@ -15,6 +15,7 @@ from app.retrieval.retriever import retriever
 from app.memory.store import memory_store
 from app.memory.rewrite import _history_to_text, rewrite_question
 from app.tools.registry import tool_registry
+from app.tools.calculator import extract_math_expression
 from app.tools.search import format_search_results
 from app.observability.logging import get_logger
 
@@ -67,7 +68,7 @@ class Orchestrator:
             elif route == "rag":
                 result = await self._handle_rag(request, standalone_question, history)
             elif route == "web":
-                result = await self._handle_web(request, standalone_question)
+                result = await self._handle_web(request, standalone_question, history)
             elif route == "tool":
                 result = await self._handle_tool(request)
             elif route == "agentic_rag":
@@ -121,19 +122,29 @@ class Orchestrator:
         if question in direct_phrases:
             return "direct"
 
-        # 需要计算
-        if any(word in question for word in ["计算", "多少", "等于", "换算", "加", "减", "乘", "除"]):
-            return "tool"
-
-        # 需要联网搜索
+        # 显式联网优先级最高，避免被“多少”等词误判为计算。
         if request.need_web == "always":
             return "web"
         if request.need_web == "auto":
             if any(word in question for word in ["最新", "今天", "新闻", "天气", "价格", "股价", "汇率"]):
-                return "web"
+                return "agentic_rag"
+
+        # 需要计算。要求能提取出真实数学表达式，避免“今天气温多少”误入计算器。
+        if self._is_calculation_question(question):
+            return "tool"
 
         # 默认走 RAG
         return "rag"
+
+    def _is_calculation_question(self, question: str) -> bool:
+        """判断是否为可计算问题"""
+        expression = extract_math_expression(question)
+        if not expression:
+            return False
+        has_digit = any(ch.isdigit() for ch in expression)
+        has_operator = any(op in expression for op in ["+", "-", "*", "/", "%", "^", ">", "<", "="])
+        has_math_word = any(word in question for word in ["计算", "换算", "加", "减", "乘", "除", "等于"])
+        return has_digit and (has_operator or has_math_word)
 
     async def _handle_direct(self, request: AskRequest) -> dict:
         """处理直接问答"""
@@ -184,71 +195,133 @@ class Orchestrator:
             "llm_ms": llm_ms,
         }
 
-    async def _handle_web(self, request: AskRequest, standalone_question: str) -> dict:
+    def _web_sources_from_results(self, results: list[dict], limit: int | None = None) -> list[SourceItem]:
+        """将联网搜索结果转换为统一来源结构"""
+        selected = results[:limit] if limit else results
+        return [
+            SourceItem(
+                title=r.get("title", ""),
+                url=r.get("url", ""),
+                source_type="web_search",
+                snippet=r.get("snippet", ""),
+                score=1.0,
+            )
+            for r in selected
+        ]
+
+    def _build_enriched_question(
+        self,
+        request: AskRequest,
+        standalone_question: str,
+        history: list[dict],
+    ) -> str:
+        """构造带历史与独立问题的最终提问上下文"""
+        return (
+            f"最近对话历史：\n{_history_to_text(history)}\n\n"
+            f"用户原始问题：\n{request.question}\n\n"
+            f"独立检索问题：\n{standalone_question}"
+        )
+
+    async def _search_local_sources(
+        self,
+        request: AskRequest,
+        standalone_question: str,
+    ) -> tuple[list[SourceItem], float]:
+        """检索本地知识库并返回耗时"""
+        start = time.perf_counter()
+        sources = await self.retriever.search(
+            standalone_question,
+            request.top_k,
+            request.knowledge_scope,
+        )
+        retrieval_ms = (time.perf_counter() - start) * 1000
+        return sources, retrieval_ms
+
+    async def _handle_web(
+        self,
+        request: AskRequest,
+        standalone_question: str,
+        history: list[dict],
+    ) -> dict:
         """处理联网搜索"""
         tool_trace = []
-        sources = []
 
         # 执行搜索
-        trace = await self.tools.execute("web_search", {"query": standalone_question})
-        tool_trace.append(trace)
+        execution = await self.tools.execute_with_result("web_search", {"query": standalone_question})
+        tool_trace.append(execution.trace)
+        search_result = execution.result
 
-        if trace.status == "success":
-            # 解析搜索结果
-            search_result = await self.tools._run_web_search({"query": standalone_question})
-            if search_result.get("success"):
-                results = search_result.get("results", [])
-                for r in results:
-                    sources.append(SourceItem(
-                        title=r.get("title", ""),
-                        url=r.get("url", ""),
-                        source_type="web_search",
-                        snippet=r.get("snippet", ""),
-                        score=1.0,
-                    ))
+        if execution.trace.status == "success" and search_result.get("success"):
+            results = search_result.get("results", [])
+            sources = self._web_sources_from_results(results)
 
-                # 生成回答
-                search_text = format_search_results(results)
-                prompt = f"基于以下搜索结果回答问题：\n\n{search_text}\n\n问题：{request.question}"
-                system_prompt = "你是一个有用的中文助手。请基于搜索结果回答问题，并注明来源。"
+            search_text = format_search_results(results)
+            prompt = f"基于以下搜索结果回答问题：\n\n{search_text}\n\n问题：{request.question}"
+            system_prompt = "你是一个有用的中文助手。请基于搜索结果回答问题，并注明来源。"
 
-                start = time.perf_counter()
-                answer = await self.llm.generate(prompt, system_prompt=system_prompt)
-                llm_ms = (time.perf_counter() - start) * 1000
+            start = time.perf_counter()
+            answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+            llm_ms = (time.perf_counter() - start) * 1000
 
-                return {
-                    "answer": answer,
-                    "sources": sources,
-                    "tool_trace": tool_trace,
-                    "tool_ms": trace.latency_ms,
-                    "llm_ms": llm_ms,
-                }
+            return {
+                "answer": answer,
+                "sources": sources,
+                "tool_trace": tool_trace,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": llm_ms,
+            }
 
-        # 搜索失败，降级为直接回答
-        return await self._handle_direct(request)
+        # 搜索失败时只降级到本地 RAG，不直接让 LLM 编造时效信息。
+        local_sources, retrieval_ms = await self._search_local_sources(request, standalone_question)
+        if local_sources:
+            context = "\n\n".join([s.snippet for s in local_sources])
+            enriched_question = (
+                f"{self._build_enriched_question(request, standalone_question, history)}\n\n"
+                "联网搜索失败，请明确说明未能获取最新联网信息，并仅基于本地知识库回答。"
+            )
+            system_prompt, prompt = build_rag_prompt(enriched_question, context)
+
+            start = time.perf_counter()
+            answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+            llm_ms = (time.perf_counter() - start) * 1000
+
+            return {
+                "answer": answer,
+                "sources": local_sources,
+                "tool_trace": tool_trace,
+                "retrieval_ms": retrieval_ms,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": llm_ms,
+            }
+
+        return {
+            "answer": "暂时无法获取联网搜索结果，也没有找到可用的本地知识库内容，请稍后重试。",
+            "sources": [],
+            "tool_trace": tool_trace,
+            "retrieval_ms": retrieval_ms,
+            "tool_ms": execution.trace.latency_ms,
+            "llm_ms": 0,
+        }
 
     async def _handle_tool(self, request: AskRequest) -> dict:
         """处理工具调用"""
         tool_trace = []
 
         # 判断是否为计算问题
-        if any(word in request.question for word in ["计算", "多少", "等于", "换算"]):
-            # 提取表达式（简化处理）
-            expression = request.question
-            trace = await self.tools.execute("calculator", {"expression": expression})
-            tool_trace.append(trace)
+        expression = extract_math_expression(request.question)
+        if expression:
+            execution = await self.tools.execute_with_result("calculator", {"expression": expression})
+            tool_trace.append(execution.trace)
 
-            if trace.status == "success":
-                result = await self.tools._run_calculator({"expression": expression})
-                if result.get("success"):
-                    answer = f"计算结果：{result.get('result')}"
-                    return {
-                        "answer": answer,
-                        "sources": [],
-                        "tool_trace": tool_trace,
-                        "tool_ms": trace.latency_ms,
-                        "llm_ms": 0,
-                    }
+            if execution.trace.status == "success" and execution.result.get("success"):
+                answer = f"计算结果：{execution.result.get('result')}"
+                return {
+                    "answer": answer,
+                    "sources": [],
+                    "tool_trace": tool_trace,
+                    "tool_ms": execution.trace.latency_ms,
+                    "llm_ms": 0,
+                }
 
         # 降级为直接回答
         return await self._handle_direct(request)
@@ -264,41 +337,29 @@ class Orchestrator:
         sources = []
 
         # 并行执行 RAG 和搜索
-        import asyncio
+        rag_task = self._search_local_sources(request, standalone_question)
+        search_task = self.tools.execute_with_result("web_search", {"query": standalone_question})
 
-        rag_task = self.retriever.search(
-            standalone_question,
-            request.top_k,
-            request.knowledge_scope,
-        )
-        search_task = self.tools.execute("web_search", {"query": standalone_question})
-
-        rag_results, search_trace = await asyncio.gather(rag_task, search_task)
+        (rag_results, retrieval_ms), search_execution = await asyncio.gather(rag_task, search_task)
 
         # 处理 RAG 结果
         for r in rag_results:
             sources.append(r)
 
         # 处理搜索结果
-        tool_trace.append(search_trace)
-        if search_trace.status == "success":
-            search_result = await self.tools._run_web_search({"query": standalone_question})
-            if search_result.get("success"):
-                for r in search_result.get("results", [])[:3]:
-                    sources.append(SourceItem(
-                        title=r.get("title", ""),
-                        url=r.get("url", ""),
-                        source_type="web_search",
-                        snippet=r.get("snippet", ""),
-                        score=1.0,
-                    ))
+        tool_trace.append(search_execution.trace)
+        if search_execution.trace.status == "success" and search_execution.result.get("success"):
+            sources.extend(self._web_sources_from_results(search_execution.result.get("results", []), limit=3))
 
         # 生成综合回答
-        context = "\n\n".join([s.snippet for s in sources])
+        local_context = "\n\n".join([s.snippet for s in rag_results])
+        web_context = "\n\n".join([
+            s.snippet for s in sources if s.source_type == "web_search"
+        ])
+        context = f"本地知识库片段：\n{local_context or '无'}\n\n联网搜索片段：\n{web_context or '无'}"
         enriched_question = (
-            f"最近对话历史：\n{_history_to_text(history)}\n\n"
-            f"用户原始问题：\n{request.question}\n\n"
-            f"独立检索问题：\n{standalone_question}"
+            f"{self._build_enriched_question(request, standalone_question, history)}\n\n"
+            "请综合本地知识库片段和联网搜索片段回答；如果联网搜索失败或为空，需要明确说明。"
         )
         system_prompt, prompt = build_rag_prompt(enriched_question, context)
 
@@ -310,7 +371,8 @@ class Orchestrator:
             "answer": answer,
             "sources": sources,
             "tool_trace": tool_trace,
-            "tool_ms": search_trace.latency_ms,
+            "retrieval_ms": retrieval_ms,
+            "tool_ms": search_execution.trace.latency_ms,
             "llm_ms": llm_ms,
         }
 

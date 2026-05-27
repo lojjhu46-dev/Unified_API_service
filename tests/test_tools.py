@@ -2,7 +2,7 @@
 
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from app.tools.calculator import calculate, safe_eval
+from app.tools.calculator import calculate, extract_math_expression, safe_eval
 from app.tools.search import web_search, format_search_results
 from app.tools.registry import tool_registry
 
@@ -42,6 +42,10 @@ class TestCalculator:
         result = calculate("10 > 5")
         assert result["success"] is True
         assert result["result"] == "True"
+
+    def test_extract_expression_from_natural_language(self):
+        assert extract_math_expression("计算 2+3 等于多少") == "2+3"
+        assert extract_math_expression("请帮我算 8 乘以 7") == "8 * 7"
 
 
 class TestWebSearch:
@@ -94,6 +98,32 @@ class TestWebSearch:
             assert "429" in result["error"]
 
     @pytest.mark.asyncio
+    async def test_search_429_retry_uses_async_sleep(self):
+        first_response = MagicMock()
+        first_response.status_code = 429
+        second_response = MagicMock()
+        second_response.status_code = 200
+        second_response.json.return_value = {
+            "organic": [
+                {"title": "测试标题", "link": "https://example.com", "snippet": "测试摘要"},
+            ],
+        }
+        second_response.raise_for_status = MagicMock()
+
+        with patch("app.tools.search.settings") as mock_settings, \
+             patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=[first_response, second_response])), \
+             patch("app.tools.search.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            mock_settings.serper_api_key = "test_key"
+            mock_settings.serper_url = "https://google.serper.dev/search"
+            mock_settings.search_timeout = 10
+            mock_settings.max_retries = 1
+
+            result = await web_search("测试")
+
+        assert result["success"] is True
+        mock_sleep.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
     async def test_search_401(self):
         mock_response = MagicMock()
         mock_response.status_code = 401
@@ -129,6 +159,13 @@ class TestToolRegistry:
         trace = await tool_registry.execute("calculator", {"expression": "2 + 3"})
         assert trace.status == "success"
         assert "5" in trace.output_preview
+
+    @pytest.mark.asyncio
+    async def test_execute_with_result_returns_trace_and_result(self):
+        execution = await tool_registry.execute_with_result("calculator", {"expression": "2 + 3"})
+        assert execution.trace.status == "success"
+        assert execution.result["success"] is True
+        assert execution.result["result"] == "5"
 
     @pytest.mark.asyncio
     async def test_unknown_tool(self):
