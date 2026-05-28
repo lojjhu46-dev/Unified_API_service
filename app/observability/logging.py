@@ -1,10 +1,23 @@
 """日志模块"""
 
-import logging
 import json
+import logging
+import os
 import sys
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+
 from app.config import settings
+
+
+THIRD_PARTY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "huggingface_hub",
+    "sentence_transformers",
+    "chromadb",
+    "uvicorn.access",
+)
 
 
 class JSONFormatter(logging.Formatter):
@@ -24,20 +37,24 @@ class JSONFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             log_data["exception"] = self.formatException(record.exc_info)
 
-        if hasattr(record, "request_id"):
-            log_data["request_id"] = record.request_id
-
-        if hasattr(record, "user_id"):
-            log_data["user_id"] = record.user_id
-
-        if hasattr(record, "channel"):
-            log_data["channel"] = record.channel
-
-        if hasattr(record, "route"):
-            log_data["route"] = record.route
-
-        if hasattr(record, "latency_ms"):
-            log_data["latency_ms"] = record.latency_ms
+        for key in (
+            "request_id",
+            "user_id",
+            "channel",
+            "route",
+            "latency_ms",
+            "encrypted",
+            "event_type",
+            "type",
+            "body_keys",
+            "event_id",
+            "message_id",
+            "chat_type",
+            "dedupe_key",
+            "reply_ok",
+        ):
+            if hasattr(record, key):
+                log_data[key] = getattr(record, key)
 
         return json.dumps(log_data, ensure_ascii=False)
 
@@ -46,30 +63,23 @@ def setup_logging():
     """配置日志"""
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
-
-    # 清除现有处理器
     root_logger.handlers.clear()
 
-    # 控制台处理器
     console_handler = logging.StreamHandler(sys.stdout)
-    if settings.log_format == "json":
-        console_handler.setFormatter(JSONFormatter())
-    else:
-        console_handler.setFormatter(logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        ))
+    console_handler.setFormatter(_build_formatter())
     root_logger.addHandler(console_handler)
 
-    # 文件处理器
-    if settings.log_file:
-        file_handler = logging.FileHandler(settings.log_file, encoding="utf-8")
-        if settings.log_format == "json":
-            file_handler.setFormatter(JSONFormatter())
-        else:
-            file_handler.setFormatter(logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            ))
+    if settings.log_file and not _disable_file_logging():
+        file_handler = RotatingFileHandler(
+            settings.log_file,
+            maxBytes=settings.log_max_bytes,
+            backupCount=settings.log_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(_build_formatter())
         root_logger.addHandler(file_handler)
+
+    _configure_third_party_loggers()
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -77,5 +87,26 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
-# 初始化日志
+def _build_formatter() -> logging.Formatter:
+    if settings.log_format == "json":
+        return JSONFormatter()
+    return logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+
+def _disable_file_logging() -> bool:
+    if not settings.log_disable_file_in_tests:
+        return False
+    return (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or "pytest" in sys.modules
+        or "pytest" in os.path.basename(sys.argv[0])
+    )
+
+
+def _configure_third_party_loggers() -> None:
+    level = getattr(logging, settings.log_third_party_level.upper(), logging.WARNING)
+    for logger_name in THIRD_PARTY_LOGGERS:
+        logging.getLogger(logger_name).setLevel(level)
+
+
 setup_logging()

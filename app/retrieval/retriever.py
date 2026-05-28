@@ -14,10 +14,12 @@ class Retriever:
 
     def __init__(self):
         self._use_chroma = False
-        self.refresh()
+        # 不在服务启动/import 阶段加载 HuggingFace embedding，避免网络重试阻塞 /health 和飞书 challenge。
+        self._chroma_checked = False
 
     def refresh(self) -> bool:
         """刷新Chroma可用状态。上传成功后调用，确保后续查询优先使用真实向量库。"""
+        self._chroma_checked = True
         try:
             import chromadb
             from app.retrieval.vector_store import get_vector_store
@@ -37,7 +39,7 @@ class Retriever:
         knowledge_scope: List[str] = None,
     ) -> List[SourceItem]:
         """检索"""
-        if self._use_chroma or self.refresh():
+        if self._use_chroma or (not self._chroma_checked and self.refresh()):
             try:
                 return await self._chroma_search(query, top_k)
             except Exception as e:

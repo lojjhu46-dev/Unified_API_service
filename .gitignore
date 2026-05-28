@@ -8,3 +8,7 @@ logs/
 
 data/chroma/
 data/uploads/
+
+.env.toml
+.env
+reports/

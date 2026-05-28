@@ -1,7 +1,6 @@
 """向量存储适配器"""
 
 import asyncio
-from typing import List, Optional
 from functools import lru_cache
 from app.config import settings
 from app.observability.logging import get_logger
@@ -13,7 +12,10 @@ def _get_embeddings():
     """获取Embedding模型"""
     try:
         from langchain_community.embeddings import HuggingFaceEmbeddings
-        return HuggingFaceEmbeddings(model_name=settings.embedding_model_name)
+        return HuggingFaceEmbeddings(
+            model_name=settings.embedding_model_name,
+            model_kwargs={"local_files_only": True},
+        )
     except Exception as e:
         logger.error(f"加载Embedding模型失败: {e}")
         raise

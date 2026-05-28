@@ -5,11 +5,14 @@
 - 回复消息：https://open.feishu.cn/document/server-docs/im-v1/message/reply
 """
 
+import base64
 import hashlib
 import json
 import time
 import httpx
 from typing import Optional
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.config import settings
 from app.observability.logging import get_logger
 
@@ -45,6 +48,38 @@ class FeishuAdapter:
             return {"challenge": challenge}
 
         return None
+
+    def decrypt_event_body(self, body: dict) -> Optional[dict]:
+        if "encrypt" not in body:
+            return body
+
+        if not settings.feishu_encrypt_key:
+            logger.warning("收到飞书加密事件，但未配置 encrypt_key")
+            return None
+
+        try:
+            key = hashlib.sha256(settings.feishu_encrypt_key.encode("utf-8")).digest()
+            encrypted = base64.b64decode(body["encrypt"])
+            if len(encrypted) <= 16:
+                logger.warning("飞书加密事件密文长度无效")
+                return None
+            iv = encrypted[:16]
+            encrypted_event = encrypted[16:]
+            decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+            padded_data = decryptor.update(encrypted_event) + decryptor.finalize()
+            unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+            data = unpadder.update(padded_data) + unpadder.finalize()
+            decrypted_text = data.decode("utf-8")
+            start = decrypted_text.find("{")
+            end = decrypted_text.rfind("}")
+            if start >= 0 and end >= start:
+                decrypted_text = decrypted_text[start:end + 1]
+            decrypted_body = json.loads(decrypted_text)
+        except Exception as e:
+            logger.warning(f"飞书加密事件解密失败: {e}")
+            return None
+
+        return decrypted_body if isinstance(decrypted_body, dict) else None
 
     def verify_token(self, body: dict) -> bool:
         """验证飞书事件 token"""

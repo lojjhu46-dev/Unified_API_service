@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
     log_file: str = "./logs/app.log"
+    log_max_bytes: int = 5 * 1024 * 1024
+    log_backup_count: int = 3
+    log_third_party_level: str = "WARNING"
+    log_disable_file_in_tests: bool = True
 
 
 def get_settings() -> Settings:
@@ -93,7 +97,8 @@ settings = get_settings()
 def ensure_directories():
     os.makedirs(settings.upload_dir, exist_ok=True)
     os.makedirs(settings.chroma_persist_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
+    if settings.log_file:
+        os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
 
 
 ensure_directories()

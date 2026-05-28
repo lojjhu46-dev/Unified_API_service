@@ -1,10 +1,26 @@
 """飞书 Channel Adapter 测试"""
 
+import base64
+import hashlib
+import json
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.channels.feishu import FeishuAdapter
 from app.main import app
+
+
+def _encrypted_body(body: dict, encrypt_key: str) -> dict:
+    key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
+    iv = b"0123456789abcdef"
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    padder = padding.PKCS7(algorithms.AES.block_size).padder()
+    padded_data = padder.update(data) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    encrypted = encryptor.update(padded_data) + encryptor.finalize()
+    return {"encrypt": base64.b64encode(iv + encrypted).decode("utf-8")}
 
 
 def _message_event(
@@ -355,6 +371,25 @@ class TestFeishuEndpoint:
 
         assert response.status_code == 200
         assert response.json() == {"challenge": "challenge_1"}
+
+    def test_encrypted_challenge_returns_value_with_valid_token(self, client):
+        encrypt_key = "test_encrypt_key_123456789012345"
+        body = _encrypted_body(
+            {
+                "type": "url_verification",
+                "challenge": "challenge_encrypted",
+                "token": "expected_token",
+            },
+            encrypt_key,
+        )
+
+        with patch("app.channels.feishu.settings") as mock_settings:
+            mock_settings.feishu_verification_token = "expected_token"
+            mock_settings.feishu_encrypt_key = encrypt_key
+            response = client.post("/channels/feishu/events", json=body)
+
+        assert response.status_code == 200
+        assert response.json() == {"challenge": "challenge_encrypted"}
 
     def test_valid_message_runs_background_processing_once(self, client):
         with patch("app.channels.feishu.settings") as mock_settings, \

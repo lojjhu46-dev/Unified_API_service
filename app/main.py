@@ -158,6 +158,16 @@ async def process_feishu_message(event_data: dict) -> None:
     chat_id = event_data.get("chat_id")
     message_id = event_data.get("message_id")
     text = event_data.get("text")
+    dedupe_key = event_data.get("dedupe_key")
+
+    logger.info(
+        "Feishu message processing started",
+        extra={
+            "chat_type": event_data.get("chat_type"),
+            "message_id": message_id,
+            "dedupe_key": dedupe_key,
+        },
+    )
 
     try:
         session_id = feishu_adapter.generate_session_id(open_id, chat_id)
@@ -174,7 +184,15 @@ async def process_feishu_message(event_data: dict) -> None:
         answer = "抱歉，处理您的问题时出现错误，请稍后重试。"
 
     try:
-        await feishu_adapter.reply_message(message_id, answer)
+        reply_ok = await feishu_adapter.reply_message(message_id, answer)
+        logger.info(
+            "Feishu reply finished",
+            extra={
+                "message_id": message_id,
+                "dedupe_key": dedupe_key,
+                "reply_ok": reply_ok,
+            },
+        )
     except Exception as e:
         logger.error(f"飞书消息回复失败: {e}", exc_info=True)
 
@@ -195,25 +213,72 @@ async def feishu_events(request: Request, background_tasks: BackgroundTasks):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
 
+    encrypted_payload = "encrypt" in body
+    logger.info(
+        "Feishu callback received",
+        extra={
+            "encrypted": encrypted_payload,
+            "body_keys": sorted(body.keys()),
+        },
+    )
+
+    body = feishu_adapter.decrypt_event_body(body)
+    if body is None:
+        logger.warning("Feishu callback rejected: decrypt failed")
+        return JSONResponse(status_code=400, content={"error": "Invalid encrypted payload"})
+
     # 1. token 校验。challenge 也必须通过 token 校验后再返回。
     if not feishu_adapter.verify_token(body):
+        logger.warning(
+            "Feishu callback rejected: invalid token",
+            extra={
+                "encrypted": encrypted_payload,
+                "event_type": body.get("header", {}).get("event_type"),
+                "type": body.get("type"),
+            },
+        )
         return JSONResponse(status_code=403, content={"error": "Invalid token"})
 
     # 2. challenge 验证
     challenge_response = feishu_adapter.verify_challenge(body)
     if challenge_response:
+        logger.info("Feishu challenge responded", extra={"encrypted": encrypted_payload})
         return challenge_response
 
     # 3. 解析消息事件
     event_data = feishu_adapter.parse_event(body)
     if not event_data:
+        logger.info(
+            "Feishu callback acknowledged without processing",
+            extra={
+                "encrypted": encrypted_payload,
+                "event_type": body.get("header", {}).get("event_type"),
+                "type": body.get("type"),
+            },
+        )
         return {"code": 0}
 
     # 4. 幂等登记，重复事件直接确认，避免飞书重试造成重复回复。
     if not feishu_adapter.mark_event_seen(event_data.get("dedupe_key")):
+        logger.info(
+            "Feishu duplicate event acknowledged",
+            extra={
+                "dedupe_key": event_data.get("dedupe_key"),
+                "message_id": event_data.get("message_id"),
+            },
+        )
         return {"code": 0}
 
     # 5. 后台处理，确保回调入口快速返回。
+    logger.info(
+        "Feishu message event accepted",
+        extra={
+            "event_id": event_data.get("event_id"),
+            "message_id": event_data.get("message_id"),
+            "chat_type": event_data.get("chat_type"),
+            "dedupe_key": event_data.get("dedupe_key"),
+        },
+    )
     background_tasks.add_task(process_feishu_message, event_data)
     return {"code": 0}
 
