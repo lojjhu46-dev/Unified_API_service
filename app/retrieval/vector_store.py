@@ -62,6 +62,11 @@ async def async_similarity_search(query: str, k: int = 5) -> list:
     return await asyncio.to_thread(_sync_similarity_search, query, k)
 
 
+async def async_get_document_chunks(document_id: str) -> list[dict]:
+    """按文档ID读取已入库切块，用于补充命中切块的相邻上下文。"""
+    return await asyncio.to_thread(_sync_get_document_chunks, document_id)
+
+
 def _sync_similarity_search(query: str, k: int) -> list:
     """同步相似度搜索"""
     try:
@@ -71,3 +76,32 @@ def _sync_similarity_search(query: str, k: int) -> list:
     except Exception as e:
         logger.error(f"相似度搜索失败: {e}")
         raise
+
+
+def _sync_get_document_chunks(document_id: str) -> list[dict]:
+    """同步读取同一文档的所有切块。"""
+    try:
+        vector_store = get_vector_store()
+        result = vector_store.get(
+            where={"document_id": document_id},
+            include=["documents", "metadatas"],
+        )
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        chunks = []
+        for content, metadata in zip(documents, metadatas):
+            chunks.append({
+                "content": content or "",
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            })
+        return sorted(chunks, key=lambda item: _safe_chunk_index(item["metadata"]))
+    except Exception as e:
+        logger.error(f"读取文档切块失败: {e}")
+        raise
+
+
+def _safe_chunk_index(metadata: dict) -> int:
+    try:
+        return int(metadata.get("chunk_index", 0))
+    except (TypeError, ValueError):
+        return 0

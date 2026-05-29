@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     hybrid_vector_weight: float = 0.7
     hybrid_bm25_weight: float = 0.3
     global_max_chunks: int = 50
+    rag_neighbor_window: int = 1
+    rag_global_neighbor_window: int = 4
+    rag_context_max_chars: int = 8000
+    rag_display_snippet_chars: int = 200
 
     # 飞书配置
     feishu_app_id: Optional[str] = None

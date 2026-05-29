@@ -29,6 +29,8 @@ async def rewrite_question(question: str, history: List[dict]) -> str:
     system_prompt = (
         "你是对话式检索系统中的问题改写器。"
         "请根据历史对话理解代词、省略和指代关系，把用户本轮问题改写成一个可独立检索的问题。"
+        "遇到“它、他、这个、那、其、时代演变、主要内容、历史影响”等省略追问时，"
+        "必须结合最近用户主题补全核心对象。"
         "只输出改写后的问题，不要解释。"
     )
     user_prompt = (

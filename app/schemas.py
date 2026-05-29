@@ -32,6 +32,7 @@ class SourceItem(BaseModel):
     url: str = Field(default="", description="来源链接")
     source_type: str = Field(default="knowledge_base", description="来源类型")
     snippet: str = Field(default="", description="内容摘要")
+    content: str = Field(default="", exclude=True, description="内部完整上下文")
     score: float = Field(default=0.0, description="相关性分数")
     metadata: dict = Field(default_factory=dict, description="元数据")
 

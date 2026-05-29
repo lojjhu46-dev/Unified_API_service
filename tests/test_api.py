@@ -334,6 +334,193 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     assert "iPhone 15的续航" in prompt
 
 
+def test_rag_prompt_uses_full_internal_content_not_display_snippet(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="4.pdf",
+        snippet="5. 儒家大同思想的历史影响",
+        content="5. 儒家大同思想的历史影响\n先小康后大同。具有阶级特征。需要高度的生产力。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[source]),
+    ), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "儒家大同思想的历史影响"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "content" not in data["sources"][0]
+    prompt = mock_generate.call_args.args[0]
+    system_prompt = mock_generate.call_args.kwargs["system_prompt"]
+    assert "先小康后大同" in prompt
+    assert "阶级特征" in prompt
+    assert "高度的生产力" in prompt
+    assert "全局汇总任务" in system_prompt
+
+
+def test_pdf_follow_up_prompt_can_include_main_content_evidence(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "什么是儒家大同思想"},
+        {"role": "assistant", "content": "儒家大同思想是理想社会思想。"},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="4.pdf",
+        snippet="儒家大同思想的基本内容主要包括以下五个方面。",
+        content="儒家大同思想的基本内容主要包括以下五个方面：社会制度：全民公有；管理制度：选贤与能；人际关系：讲信修睦；社会保障：人人得其所；劳动态度：各尽其力。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.rewrite_question",
+        new=AsyncMock(return_value="儒家大同思想的主要内容"),
+    ), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[source]),
+    ) as mock_search, patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "简介他的主要内容"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["standalone_question"] == "儒家大同思想的主要内容"
+    mock_search.assert_awaited_once()
+    assert mock_search.await_args.args[0] == "儒家大同思想的主要内容"
+    prompt = mock_generate.call_args.args[0]
+    assert "全民公有" in prompt
+    assert "选贤与能" in prompt
+    assert "讲信修睦" in prompt
+    assert "人人得其所" in prompt
+    assert "各尽其力" in prompt
+
+
+def test_pdf_follow_up_prompt_can_include_historical_evolution(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "介绍儒家大同思想"},
+        {"role": "assistant", "content": "儒家大同思想源远流长。"},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="4.pdf",
+        snippet="儒家大同思想的历史演变分别经历了七个发展时期。",
+        content="儒家大同思想的历史演变分别经历了七个发展时期，分别是先秦孔子、汉代董仲舒与何休、宋代二程、太平天国时期洪秀全、康有为和孙中山、当代熊十力。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.rewrite_question",
+        new=AsyncMock(return_value="儒家大同思想的时代演变"),
+    ), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[source]),
+    ), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "那时代演变呢"},
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.args[0]
+    assert "先秦孔子" in prompt
+    assert "董仲舒与何休" in prompt
+    assert "宋代二程" in prompt
+    assert "洪秀全" in prompt
+    assert "康有为和孙中山" in prompt
+    assert "熊十力" in prompt
+
+
+def test_pdf_follow_up_prompt_can_include_background_relation(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "儒家大同思想产生的时代背景是什么"},
+        {"role": "assistant", "content": "它产生于社会制度剧烈变动的时期。"},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="4.pdf",
+        snippet="儒家大同社会产生的时代背景",
+        content="儒家大同社会产生的时代背景，和当时的经济、政治、文化关系密不可分。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.rewrite_question",
+        new=AsyncMock(return_value="儒家大同思想产生的时代背景和什么密不可分"),
+    ), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[source]),
+    ), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "那它和什么密不可分"},
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.args[0]
+    assert "经济、政治、文化关系密不可分" in prompt
+
+
+def test_pdf_question_prompt_can_include_utopia_evidence(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="4.pdf",
+        snippet="和西方国家的“乌托邦”大同小异。",
+        content="“大同”思想源远流长，最早源自孔子的《礼记·礼运》。它和西方国家的“乌托邦”大同小异。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[source]),
+    ), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "“大同”思想和西方国家什么思想大同小异"},
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.args[0]
+    assert "乌托邦" in prompt
+
+
 def test_ask_routes_to_agentic_rag_for_news(client):
     mock_memory = MagicMock()
     mock_memory.get_history = AsyncMock(return_value=[])
@@ -624,6 +811,85 @@ def test_ask_auto_weather_question_does_not_route_to_tool(client):
     assert response.status_code == 200
     data = response.json()
     assert data["route"] == "agentic_rag"
+
+
+def test_ask_auto_weather_question_calls_web_search(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天韶关天气怎么样"},
+            status="success",
+            output_preview="韶关天气",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "韶关天气", "url": "https://example.com", "snippet": "韶关天气信息"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="回答")):
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "今天韶关天气怎么样"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    mock_tools.execute_with_result.assert_awaited_once_with("web_search", {"query": "今天韶关天气怎么样"})
+
+
+def test_ask_auto_web_search_keyword_routes_to_agentic_rag(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "联网搜索北京"},
+            status="success",
+            output_preview="北京信息",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "北京", "url": "https://example.com", "snippet": "北京信息"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="联网回答")):
+
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "联网搜索北京"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    assert data["answer"] == "联网回答"
+    mock_tools.execute_with_result.assert_awaited_once_with("web_search", {"query": "联网搜索北京"})
 
 
 def test_ask_routes_to_web_for_news(client):

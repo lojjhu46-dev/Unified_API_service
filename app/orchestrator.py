@@ -17,6 +17,7 @@ from app.memory.rewrite import _history_to_text, rewrite_question
 from app.tools.registry import tool_registry
 from app.tools.calculator import extract_math_expression
 from app.tools.search import format_search_results
+from app.config import settings
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -126,7 +127,21 @@ class Orchestrator:
         if request.need_web == "always":
             return "web"
         if request.need_web == "auto":
-            if any(word in question for word in ["最新", "今天", "新闻", "天气", "价格", "股价", "汇率"]):
+            web_words = [
+                "联网",
+                "搜索",
+                "网上",
+                "查一下",
+                "最新",
+                "今天",
+                "新闻",
+                "天气",
+                "气温",
+                "价格",
+                "股价",
+                "汇率",
+            ]
+            if any(word in question for word in web_words):
                 return "agentic_rag"
 
         # 需要计算。要求能提取出真实数学表达式，避免“今天气温多少”误入计算器。
@@ -175,13 +190,17 @@ class Orchestrator:
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
 
-        context = "\n\n".join([s.snippet for s in sources])
+        context = self._build_sources_context(sources)
         enriched_question = (
             f"最近对话历史：\n{_history_to_text(history)}\n\n"
             f"用户原始问题：\n{request.question}\n\n"
             f"独立检索问题：\n{standalone_question}"
         )
-        system_prompt, prompt = build_rag_prompt(enriched_question, context)
+        system_prompt, prompt = build_rag_prompt(
+            enriched_question,
+            context,
+            is_global=self._is_global_question(request.question, standalone_question),
+        )
 
         start = time.perf_counter()
         answer = await self.llm.generate(prompt, system_prompt=system_prompt)
@@ -221,6 +240,30 @@ class Orchestrator:
             f"用户原始问题：\n{request.question}\n\n"
             f"独立检索问题：\n{standalone_question}"
         )
+
+    def _build_sources_context(self, sources: list[SourceItem]) -> str:
+        """构造给LLM使用的完整上下文，API展示摘要仍由 snippet 承担。"""
+        parts = []
+        total_chars = 0
+        for index, source in enumerate(sources, start=1):
+            body = source.content or source.snippet
+            if not body:
+                continue
+            title = source.title or f"来源{index}"
+            part = f"[{index}] {title}\n{body}"
+            remaining = settings.rag_context_max_chars - total_chars
+            if remaining <= 0:
+                break
+            if len(part) > remaining:
+                part = part[:remaining]
+            parts.append(part)
+            total_chars += len(part)
+        return "\n\n".join(parts)
+
+    def _is_global_question(self, question: str, standalone_question: str) -> bool:
+        text = f"{question}\n{standalone_question}"
+        keywords = ["主要内容", "时代演变", "历史影响", "有哪些", "列出", "简介", "概括"]
+        return any(keyword in text for keyword in keywords)
 
     async def _search_local_sources(
         self,
@@ -274,12 +317,16 @@ class Orchestrator:
         # 搜索失败时只降级到本地 RAG，不直接让 LLM 编造时效信息。
         local_sources, retrieval_ms = await self._search_local_sources(request, standalone_question)
         if local_sources:
-            context = "\n\n".join([s.snippet for s in local_sources])
+            context = self._build_sources_context(local_sources)
             enriched_question = (
                 f"{self._build_enriched_question(request, standalone_question, history)}\n\n"
                 "联网搜索失败，请明确说明未能获取最新联网信息，并仅基于本地知识库回答。"
             )
-            system_prompt, prompt = build_rag_prompt(enriched_question, context)
+            system_prompt, prompt = build_rag_prompt(
+                enriched_question,
+                context,
+                is_global=self._is_global_question(request.question, standalone_question),
+            )
 
             start = time.perf_counter()
             answer = await self.llm.generate(prompt, system_prompt=system_prompt)
@@ -352,7 +399,7 @@ class Orchestrator:
             sources.extend(self._web_sources_from_results(search_execution.result.get("results", []), limit=3))
 
         # 生成综合回答
-        local_context = "\n\n".join([s.snippet for s in rag_results])
+        local_context = self._build_sources_context(rag_results)
         web_context = "\n\n".join([
             s.snippet for s in sources if s.source_type == "web_search"
         ])
@@ -361,7 +408,11 @@ class Orchestrator:
             f"{self._build_enriched_question(request, standalone_question, history)}\n\n"
             "请综合本地知识库片段和联网搜索片段回答；如果联网搜索失败或为空，需要明确说明。"
         )
-        system_prompt, prompt = build_rag_prompt(enriched_question, context)
+        system_prompt, prompt = build_rag_prompt(
+            enriched_question,
+            context,
+            is_global=self._is_global_question(request.question, standalone_question),
+        )
 
         start = time.perf_counter()
         answer = await self.llm.generate(prompt, system_prompt=system_prompt)

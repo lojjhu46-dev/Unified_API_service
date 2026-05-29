@@ -105,3 +105,104 @@ async def test_chroma_exception_falls_back_to_mock():
 
     assert len(results) == 2
     assert all(item.source_type == "knowledge_base" for item in results)
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_keeps_full_content_for_llm_and_short_snippet():
+    retriever = Retriever()
+    long_content = "开头" * 120 + "先小康后大同 阶级特征 高度的生产力"
+    doc = MagicMock(
+        page_content=long_content,
+        metadata={"source": "4.pdf", "document_id": "doc1", "chunk_index": 0},
+    )
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(doc, 0)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search("历史影响", top_k=1)
+
+    assert len(results) == 1
+    assert results[0].snippet == long_content[:settings.rag_display_snippet_chars]
+    assert "先小康后大同" in results[0].content
+    assert "content" not in results[0].model_dump()
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_expands_neighbor_chunks():
+    retriever = Retriever()
+    doc = MagicMock(
+        page_content="5. 儒家大同思想的历史影响",
+        metadata={"source": "4.pdf", "document_id": "doc1", "chunk_index": 1},
+    )
+    chunks = [
+        {"content": "上一段", "metadata": {"chunk_index": 0}},
+        {"content": "5. 儒家大同思想的历史影响", "metadata": {"chunk_index": 1}},
+        {"content": "进步性、阶级特征、缺乏可实现途径", "metadata": {"chunk_index": 2}},
+    ]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(doc, 0)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=chunks),
+    ):
+        results = await retriever._chroma_search("历史影响", top_k=1)
+
+    assert "上一段" in results[0].content
+    assert "进步性、阶级特征、缺乏可实现途径" in results[0].content
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_expands_more_chunks_for_global_questions():
+    retriever = Retriever()
+    doc = MagicMock(
+        page_content="儒家大同思想的基本内容主要包括以下五个方面。",
+        metadata={"source": "4.pdf", "document_id": "doc1", "chunk_index": 5},
+    )
+    chunks = [
+        {"content": "社会制度：全民公有", "metadata": {"chunk_index": 5}},
+        {"content": "管理制度：选贤与能", "metadata": {"chunk_index": 6}},
+        {"content": "人际关系：讲信修睦", "metadata": {"chunk_index": 7}},
+        {"content": "社会保障：人人得其所", "metadata": {"chunk_index": 8}},
+        {"content": "劳动态度：各尽其力", "metadata": {"chunk_index": 9}},
+    ]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(doc, 0)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=chunks),
+    ):
+        results = await retriever._chroma_search("儒家大同思想的主要内容", top_k=1)
+
+    assert "全民公有" in results[0].content
+    assert "选贤与能" in results[0].content
+    assert "讲信修睦" in results[0].content
+    assert "人人得其所" in results[0].content
+    assert "各尽其力" in results[0].content
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_neighbor_failure_uses_original_chunk():
+    retriever = Retriever()
+    doc = MagicMock(
+        page_content="原始命中切块",
+        metadata={"source": "4.pdf", "document_id": "doc1", "chunk_index": 1},
+    )
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(doc, 0)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        results = await retriever._chroma_search("历史影响", top_k=1)
+
+    assert results[0].content == "原始命中切块"
