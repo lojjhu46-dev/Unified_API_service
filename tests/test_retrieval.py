@@ -3,6 +3,11 @@
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from app.retrieval.retriever import Retriever
+from app.retrieval.vector_store import (
+    _sync_keyword_search,
+    expand_search_terms,
+    normalize_search_text,
+)
 from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
@@ -116,6 +121,28 @@ def test_extract_query_terms_expands_code_targets():
     assert "ax.plot" in sine_terms
 
 
+def test_search_text_normalization_removes_function_words():
+    assert normalize_search_text("帮我查找关于大语言模型的训练的内容") == "大语言模型训练"
+
+
+def test_expand_search_terms_adds_llm_training_synonyms():
+    terms = expand_search_terms(["大模型训练"])
+
+    assert "大语言模型训练" in terms
+    assert "大语言模型的训练" in terms
+    assert "LLM" in terms
+
+
+def test_extract_query_terms_expands_llm_training_targets():
+    retriever = Retriever()
+
+    terms = retriever._extract_query_terms("帮我查找关于大模型训练的内容")
+
+    assert "大模型训练" in terms
+    assert "大语言模型训练" in terms
+    assert "大语言模型的训练" in terms
+
+
 def test_merge_search_results_keeps_better_duplicate_score():
     retriever = Retriever()
     doc = MagicMock(
@@ -126,6 +153,87 @@ def test_merge_search_results_keeps_better_duplicate_score():
     results = retriever._merge_search_results([(doc, 1.5)], [(doc, -20)])
 
     assert results == [(doc, -20)]
+
+
+def test_keyword_search_matches_llm_training_without_particle():
+    class FakeVectorStore:
+        def get(self, include=None, **kwargs):
+            return {
+                "documents": ["课程主题：大语言模型的训练，包括预训练和微调。"],
+                "metadatas": [{"source": "llm.txt", "knowledge_base_type": "enterprise"}],
+            }
+
+    with patch("app.retrieval.vector_store.get_vector_store", return_value=FakeVectorStore()):
+        results = _sync_keyword_search(["大语言模型训练"], k=5, metadata_filter={"knowledge_base_type": "enterprise"})
+
+    assert len(results) == 1
+    assert "大语言模型的训练" in results[0][0].page_content
+
+
+def test_keyword_search_matches_big_model_training_synonym():
+    class FakeVectorStore:
+        def get(self, include=None, **kwargs):
+            return {
+                "documents": ["课程主题：大语言模型的训练，包括预训练和微调。"],
+                "metadatas": [{"source": "llm.txt", "knowledge_base_type": "enterprise"}],
+            }
+
+    with patch("app.retrieval.vector_store.get_vector_store", return_value=FakeVectorStore()):
+        results = _sync_keyword_search(["帮我查找关于大模型训练的内容"], k=5, metadata_filter={"knowledge_base_type": "enterprise"})
+
+    assert len(results) == 1
+    assert "大语言模型的训练" in results[0][0].page_content
+
+
+def test_keyword_search_does_not_overmatch_unrelated_model_phrases():
+    class FakeVectorStore:
+        def get(self, include=None, **kwargs):
+            return {
+                "documents": ["课程主题：大语言模型的训练，包括预训练和微调。"],
+                "metadatas": [{"source": "llm.txt", "knowledge_base_type": "enterprise"}],
+            }
+
+    with patch("app.retrieval.vector_store.get_vector_store", return_value=FakeVectorStore()):
+        car_results = _sync_keyword_search(["模型车训练"], k=5, metadata_filter={"knowledge_base_type": "enterprise"})
+        exhibition_results = _sync_keyword_search(["大型模型展览"], k=5, metadata_filter={"knowledge_base_type": "enterprise"})
+
+    assert car_results == []
+    assert exhibition_results == []
+
+
+def test_keyword_search_keeps_personal_owner_filter_for_fuzzy_match():
+    class FakeVectorStore:
+        def get(self, include=None, **kwargs):
+            assert kwargs["where"] == {"owner_open_id": "ou_owner"}
+            return {
+                "documents": ["课程主题：大语言模型的训练。", "课程主题：大语言模型的训练。"],
+                "metadatas": [
+                    {"source": "mine.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_owner"},
+                    {"source": "other.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_other"},
+                ],
+            }
+
+    with patch("app.retrieval.vector_store.get_vector_store", return_value=FakeVectorStore()):
+        results = _sync_keyword_search(["大模型训练"], k=5, metadata_filter={"owner_open_id": "ou_owner"})
+
+    assert len(results) == 1
+    assert results[0][0].metadata["source"] == "mine.txt"
+
+
+def test_keyword_search_treats_legacy_enterprise_metadata_as_enterprise():
+    class FakeVectorStore:
+        def get(self, include=None, **kwargs):
+            assert "where" not in kwargs
+            return {
+                "documents": ["课程主题：大语言模型的训练。"],
+                "metadatas": [{"source": "legacy.txt"}],
+            }
+
+    with patch("app.retrieval.vector_store.get_vector_store", return_value=FakeVectorStore()):
+        results = _sync_keyword_search(["大模型训练"], k=5, metadata_filter={"knowledge_base_type": "enterprise"})
+
+    assert len(results) == 1
+    assert results[0][0].metadata["source"] == "legacy.txt"
 
 
 def test_save_uploaded_file_stays_inside_upload_dir(tmp_path):

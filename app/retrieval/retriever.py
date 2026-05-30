@@ -325,18 +325,28 @@ class Retriever:
         )
 
     def _lexical_relevance(self, query: str, source: SourceItem) -> float:
+        from app.retrieval.vector_store import expand_search_terms, normalize_search_text
+
         snippet_text = f"{source.title}\n{source.snippet}".lower()
         content_text = (source.content or "").lower()
         terms = self._extract_query_terms(query)
+        expanded_terms = expand_search_terms(terms)
         score = 0.0
         query_text = query.strip().lower()
+        normalized_snippet = normalize_search_text(snippet_text)
+        normalized_content = normalize_search_text(content_text)
+        normalized_query = normalize_search_text(query_text)
         is_code_request = self._is_code_request(query)
 
         if query_text and query_text in snippet_text:
             score += 30.0
         elif query_text and query_text in content_text:
             score += 8.0
-        for term in terms:
+        if normalized_query and normalized_query in normalized_snippet:
+            score += 12.0
+        elif normalized_query and normalized_query in normalized_content:
+            score += 4.0
+        for term in expanded_terms:
             if not term:
                 continue
             normalized_term = term.lower()
@@ -344,6 +354,12 @@ class Retriever:
                 score += min(len(term), 20)
             elif normalized_term in content_text:
                 score += min(len(term), 20) * 0.25
+            else:
+                compact_term = normalize_search_text(normalized_term)
+                if compact_term and compact_term in normalized_snippet:
+                    score += min(len(compact_term), 20) * 0.8
+                elif compact_term and compact_term in normalized_content:
+                    score += min(len(compact_term), 20) * 0.2
 
         if is_code_request:
             snippet_code_score = self._code_signal_score(snippet_text)
@@ -368,6 +384,14 @@ class Retriever:
             for term in ["正弦曲线", "np.sin", "sin(x)", "ax.plot", "plt.plot"]:
                 if term not in terms:
                     terms.append(term)
+        if "大模型" in query or "大语言模型" in query:
+            for term in ["大模型", "大语言模型", "LLM", "large language model"]:
+                if term not in terms:
+                    terms.append(term)
+            if "训练" in query:
+                for term in ["大模型训练", "大语言模型训练", "大语言模型的训练"]:
+                    if term not in terms:
+                        terms.append(term)
         if "圆点" in query and "动画" in query:
             for term in ["圆点", "坐标", "动画", "曲线", "FuncAnimation", "point", "coord_text"]:
                 if term not in terms:
@@ -390,11 +414,20 @@ class Retriever:
         return any(word in text for word in code_words)
 
     def _has_target_evidence(self, query: str, source: SourceItem) -> bool:
+        from app.retrieval.vector_store import expand_search_terms, normalize_search_text
+
         target_terms = self._target_terms(query)
         if not target_terms:
             return True
         text = f"{source.title}\n{source.snippet}\n{source.content}".lower()
-        return any(term.lower() in text for term in target_terms)
+        normalized_text = normalize_search_text(text)
+        for term in expand_search_terms(target_terms):
+            if term.lower() in text:
+                return True
+            normalized_term = normalize_search_text(term)
+            if normalized_term and normalized_term in normalized_text:
+                return True
+        return False
 
     def _target_terms(self, query: str) -> list[str]:
         generic_terms = {
@@ -437,18 +470,26 @@ class Retriever:
         return float(sum(1 for pattern in patterns if re.search(pattern, text)))
 
     def _build_snippet(self, text: str, query: str) -> str:
+        from app.retrieval.vector_store import expand_search_terms, normalize_search_text
+
         limit = settings.rag_display_snippet_chars
         if len(text) <= limit:
             return text
 
         lowered = text.lower()
         positions = []
-        for term in self._extract_query_terms(query):
+        for term in expand_search_terms(self._extract_query_terms(query)):
             if not term:
                 continue
             index = lowered.find(term.lower())
             if index >= 0:
                 positions.append(index)
+                continue
+            normalized_term = normalize_search_text(term)
+            if normalized_term and normalized_term in normalize_search_text(text):
+                raw_position = self._approximate_normalized_position(text, normalized_term)
+                if raw_position is not None:
+                    positions.append(raw_position)
         if self._is_code_request(query):
             for pattern in [r"\bdef\s+", r"\bimport\s+", r"\bfrom\s+", r"\bnp\.", r"\bplt\.", r"\bax\."]:
                 match = re.search(pattern, text)
@@ -465,6 +506,15 @@ class Retriever:
             end = len(text)
             start = max(end - limit, 0)
         return text[start:end]
+
+    def _approximate_normalized_position(self, text: str, normalized_term: str) -> int | None:
+        from app.retrieval.vector_store import normalize_search_text
+
+        for index in range(len(text)):
+            candidate = normalize_search_text(text[index:index + len(normalized_term) + 8])
+            if normalized_term in candidate:
+                return index
+        return None
 
     def _dedupe_sources(self, sources: List[SourceItem]) -> List[SourceItem]:
         """去重来源"""
