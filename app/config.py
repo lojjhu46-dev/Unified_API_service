@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     rag_global_neighbor_window: int = 4
     rag_context_max_chars: int = 8000
     rag_display_snippet_chars: int = 200
-    personal_kb_strict_owner_filter: bool = False
+    personal_kb_strict_owner_filter: bool = True
 
     # 飞书配置
     feishu_app_id: Optional[str] = None

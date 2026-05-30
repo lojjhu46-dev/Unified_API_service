@@ -234,6 +234,78 @@ def test_upload_docx(client):
     mock_refresh.assert_called_once()
 
 
+def test_upload_xlsx_defaults_to_enterprise(client):
+    with patch("app.main.ingest_file") as mock_ingest, patch(
+        "app.main.orchestrator.retriever.refresh"
+    ) as mock_refresh:
+        mock_ingest.return_value = {
+            "document_id": "xlsx123",
+            "filename": "test.xlsx",
+            "chunks": 6,
+        }
+        response = client.post(
+            "/documents/upload",
+            files={
+                "file": (
+                    "test.xlsx",
+                    b"xlsx content",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["filename"] == "test.xlsx"
+    assert data["chunks"] == 6
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "enterprise"
+    assert mock_ingest.call_args.kwargs["owner_open_id"] is None
+    assert mock_ingest.call_args.kwargs["channel"] == "api"
+    mock_refresh.assert_called_once()
+
+
+def test_upload_xlsx_to_personal_requires_owner(client):
+    response = client.post(
+        "/documents/upload",
+        data={"knowledge_base_type": "personal"},
+        files={
+            "file": (
+                "test.xlsx",
+                b"xlsx content",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "owner_open_id" in response.json()["detail"]
+
+
+def test_upload_xlsx_to_personal(client):
+    with patch("app.main.ingest_file") as mock_ingest:
+        mock_ingest.return_value = {
+            "document_id": "xlsx456",
+            "filename": "test.xlsx",
+            "chunks": 2,
+        }
+        response = client.post(
+            "/documents/upload",
+            data={"knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+            files={
+                "file": (
+                    "test.xlsx",
+                    b"xlsx content",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
+    assert mock_ingest.call_args.kwargs["owner_open_id"] == "ou_test123"
+    assert mock_ingest.call_args.kwargs["channel"] == "api"
+
+
 def test_upload_invalid_extension(client):
     response = client.post(
         "/documents/upload",
@@ -242,6 +314,7 @@ def test_upload_invalid_extension(client):
     assert response.status_code == 400
     assert "仅支持" in response.json()["detail"]
     assert "DOCX" in response.json()["detail"]
+    assert "XLSX" in response.json()["detail"]
 
 
 def test_upload_docm_is_rejected(client):

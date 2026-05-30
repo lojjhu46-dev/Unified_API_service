@@ -67,6 +67,11 @@ async def async_get_document_chunks(document_id: str) -> list[dict]:
     return await asyncio.to_thread(_sync_get_document_chunks, document_id)
 
 
+async def async_keyword_search(terms: list[str], k: int = 5, metadata_filter: dict | None = None) -> list:
+    """按关键词精确匹配已入库切块，补充向量召回遗漏。"""
+    return await asyncio.to_thread(_sync_keyword_search, terms, k, metadata_filter)
+
+
 def _sync_similarity_search(query: str, k: int, metadata_filter: dict | None = None) -> list:
     """同步相似度搜索"""
     try:
@@ -77,6 +82,58 @@ def _sync_similarity_search(query: str, k: int, metadata_filter: dict | None = N
     except Exception as e:
         logger.error(f"相似度搜索失败: {e}")
         raise
+
+
+def _sync_keyword_search(terms: list[str], k: int, metadata_filter: dict | None = None) -> list:
+    """同步关键词搜索。"""
+    try:
+        from langchain_core.documents import Document
+
+        normalized_terms = []
+        for term in terms or []:
+            normalized = str(term).strip().lower()
+            if len(normalized) >= 2 and normalized not in normalized_terms:
+                normalized_terms.append(normalized)
+        if not normalized_terms:
+            return []
+
+        vector_store = get_vector_store()
+        kwargs = {"where": metadata_filter} if metadata_filter and metadata_filter != {"knowledge_base_type": "enterprise"} else {}
+        result = vector_store.get(include=["documents", "metadatas"], **kwargs)
+        documents = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        matched = []
+        for content, metadata in zip(documents, metadatas):
+            safe_content = content or ""
+            safe_metadata = metadata if isinstance(metadata, dict) else {}
+            if not _metadata_matches_keyword_filter(safe_metadata, metadata_filter):
+                continue
+            search_text = f"{safe_metadata.get('original_filename', '')}\n{safe_content}".lower()
+            hit_terms = [term for term in normalized_terms if term in search_text]
+            if not hit_terms:
+                continue
+            distance = -sum(min(len(term), 20) for term in set(hit_terms))
+            matched.append((
+                Document(page_content=safe_content, metadata=safe_metadata),
+                distance,
+            ))
+
+        matched.sort(key=lambda item: item[1])
+        return matched[:k]
+    except Exception as e:
+        logger.error(f"关键词搜索失败: {e}")
+        raise
+
+
+def _metadata_matches_keyword_filter(metadata: dict, metadata_filter: dict | None) -> bool:
+    if not metadata_filter:
+        return True
+    if metadata_filter == {"knowledge_base_type": "enterprise"}:
+        return (metadata.get("knowledge_base_type") or "enterprise") == "enterprise"
+    for key, expected in metadata_filter.items():
+        if metadata.get(key) != expected:
+            return False
+    return True
 
 
 def _sync_get_document_chunks(document_id: str) -> list[dict]:

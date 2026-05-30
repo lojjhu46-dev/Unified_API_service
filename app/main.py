@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime
-from fastapi import BackgroundTasks, FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from app.config import settings
@@ -31,7 +31,7 @@ from app.observability.logging import get_logger
 logger = get_logger(__name__)
 
 pending_feishu_files: dict[str, dict] = {}
-SUPPORTED_PERSONAL_FILE_TEXT = "仅支持 PDF、DOCX 和 TXT 文件。"
+SUPPORTED_FILE_TEXT = "仅支持 PDF、DOCX、TXT 和 XLSX 文件。"
 
 app = FastAPI(
     title=settings.app_name,
@@ -96,10 +96,21 @@ async def ask(request: AskRequest):
 
 
 @app.post("/documents/upload", response_model=UploadResponse)
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    knowledge_base_type: str = Form("enterprise"),
+    owner_open_id: str | None = Form(None),
+):
     """上传文档到知识库"""
     if not validate_file_extension(file.filename):
-        raise HTTPException(status_code=400, detail="仅支持 PDF、TXT 和 DOCX 文件")
+        raise HTTPException(status_code=400, detail=SUPPORTED_FILE_TEXT)
+
+    knowledge_base_type = (knowledge_base_type or "enterprise").strip().lower()
+    owner_open_id = owner_open_id.strip() if owner_open_id else None
+    if knowledge_base_type not in {"enterprise", "personal"}:
+        raise HTTPException(status_code=400, detail="knowledge_base_type 仅支持 enterprise 或 personal")
+    if knowledge_base_type == "personal" and not owner_open_id:
+        raise HTTPException(status_code=400, detail="上传到个人知识库时必须提供 owner_open_id")
 
     content = await file.read()
     if len(content) > 10 * 1024 * 1024:  # 10MB限制
@@ -111,7 +122,8 @@ async def upload_document(file: UploadFile = File(...)):
         result = ingest_file(
             file_path,
             original_filename=safe_filename,
-            knowledge_base_type="enterprise",
+            knowledge_base_type=knowledge_base_type,
+            owner_open_id=owner_open_id if knowledge_base_type == "personal" else None,
             channel="api",
         )
         orchestrator.retriever.refresh()
@@ -224,24 +236,29 @@ async def process_feishu_message(event_data: dict) -> None:
 
 
 def decide_feishu_knowledge_scope(text: str) -> list[str]:
-    """飞书默认查企业知识库，明确提及时才查个人或组合知识库。"""
+    """飞书默认同时查企业知识库和当前用户个人知识库。"""
     question = text or ""
-    personal_words = ["个人知识库", "我的知识库", "我上传", "我上传的文件"]
-    combine_words = ["结合", "同时", "全部", "企业和个人", "个人和企业"]
-    wants_personal = any(word in question for word in personal_words)
-    wants_combine = wants_personal and any(word in question for word in combine_words)
+    enterprise_only_words = ["只查企业", "仅查企业", "只看企业", "企业知识库"]
+    personal_only_words = ["只查个人", "仅查个人", "只看个人", "个人知识库", "我的知识库", "我上传", "我上传的文件"]
+    combine_words = ["结合", "同时", "全部", "企业和个人", "个人和企业", "企业个人", "混合检索"]
+    wants_combine = any(word in question for word in combine_words)
     if wants_combine:
         return ["enterprise", "personal"]
-    if wants_personal:
+
+    wants_enterprise_only = any(word in question for word in enterprise_only_words)
+    wants_personal = any(word in question for word in personal_only_words)
+    if wants_personal and not wants_enterprise_only:
         return ["personal"]
-    return ["enterprise"]
+    if wants_enterprise_only and not wants_personal:
+        return ["enterprise"]
+    return ["enterprise", "personal"]
 
 
 async def process_feishu_file_event(event_data: dict) -> None:
     """处理飞书文件消息：先发确认卡片，不直接入库。"""
     raw_filename = event_data.get("file_name")
     if not validate_file_extension(raw_filename):
-        await feishu_adapter.reply_message(event_data.get("message_id"), SUPPORTED_PERSONAL_FILE_TEXT)
+        await feishu_adapter.reply_message(event_data.get("message_id"), SUPPORTED_FILE_TEXT)
         return
 
     filename = sanitize_filename(raw_filename)
@@ -260,18 +277,24 @@ def build_personal_file_confirm_card(filename: str, pending_id: str) -> dict:
         "config": {"wide_screen_mode": True},
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": "保存到个人知识库"},
+            "title": {"tag": "plain_text", "content": "保存到知识库"},
         },
         "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"是否将 `{filename}` 保存到你的个人知识库？"}},
+            {"tag": "div", "text": {"tag": "lark_md", "content": f"请选择将 `{filename}` 保存到哪个知识库。"}},
             {
                 "tag": "action",
                 "actions": [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": "保存"},
+                        "text": {"tag": "plain_text", "content": "保存到个人知识库"},
                         "type": "primary",
                         "value": {"action": "confirm_save_personal_file", "pending_id": pending_id},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "保存到企业知识库"},
+                        "type": "default",
+                        "value": {"action": "confirm_save_enterprise_file", "pending_id": pending_id},
                     },
                     {
                         "tag": "button",
@@ -300,7 +323,7 @@ async def process_feishu_card_action(action_data: dict) -> None:
         if chat_id:
             await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
         return
-    if action_data.get("open_id") and action_data.get("open_id") != pending.get("open_id"):
+    if not action_data.get("open_id") or action_data.get("open_id") != pending.get("open_id"):
         await feishu_adapter.send_message(pending.get("chat_id"), "只有上传文件的用户可以确认保存。")
         return
 
@@ -309,11 +332,14 @@ async def process_feishu_card_action(action_data: dict) -> None:
         await feishu_adapter.send_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。")
         return
 
-    if action != "confirm_save_personal_file":
+    if action not in {"confirm_save_personal_file", "confirm_save_enterprise_file"}:
         return
 
     pending_feishu_files.pop(pending_id, None)
-    await save_feishu_file_to_personal_knowledge(pending)
+    if action == "confirm_save_enterprise_file":
+        await save_feishu_file_to_enterprise_knowledge(pending)
+    else:
+        await save_feishu_file_to_personal_knowledge(pending)
 
 
 async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
@@ -347,6 +373,40 @@ async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
         )
     except Exception as e:
         logger.error(f"飞书文件保存到个人知识库失败: {e}", exc_info=True)
+        await feishu_adapter.send_message(chat_id, "文件保存失败，请稍后重试。")
+
+
+async def save_feishu_file_to_enterprise_knowledge(pending: dict) -> None:
+    filename = pending.get("file_name")
+    chat_id = pending.get("chat_id")
+    try:
+        content = await feishu_adapter.download_message_resource(
+            pending.get("message_id"),
+            pending.get("file_key"),
+        )
+        if not content:
+            await feishu_adapter.send_message(chat_id, "文件下载失败，请稍后重试。")
+            return
+        if len(content) > 10 * 1024 * 1024:
+            await feishu_adapter.send_message(chat_id, "文件大小不能超过10MB。")
+            return
+
+        file_path = save_uploaded_file(content, filename, upload_dir=settings.upload_dir)
+        result = ingest_file(
+            file_path,
+            original_filename=filename,
+            knowledge_base_type="enterprise",
+            owner_open_id=None,
+            chat_id=chat_id,
+            channel="feishu",
+        )
+        orchestrator.retriever.refresh()
+        await feishu_adapter.send_message(
+            chat_id,
+            f"已保存到企业知识库：{result['filename']}，共 {result['chunks']} 个切块。",
+        )
+    except Exception as e:
+        logger.error(f"飞书文件保存到企业知识库失败: {e}", exc_info=True)
         await feishu_adapter.send_message(chat_id, "文件保存失败，请稍后重试。")
 
 
@@ -528,8 +588,12 @@ def parse_feishu_card_action(body: dict) -> dict | None:
     action = event.get("action", {})
     value = action.get("value") or {}
     operator = event.get("operator", {})
-    operator_id = operator.get("operator_id", {})
-    open_id = operator_id.get("open_id")
+    open_id = (
+        operator.get("operator_id", {}).get("open_id")
+        or operator.get("user_id", {}).get("open_id")
+        or operator.get("open_id")
+        or event.get("user_id", {}).get("open_id")
+    )
     return {
         "action": value.get("action"),
         "pending_id": value.get("pending_id"),

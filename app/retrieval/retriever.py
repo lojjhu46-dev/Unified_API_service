@@ -57,18 +57,23 @@ class Retriever:
         owner_open_id: str | None = None,
     ) -> List[SourceItem]:
         """Chroma检索"""
-        from app.retrieval.vector_store import async_get_document_chunks, async_similarity_search
+        from app.retrieval.vector_store import async_get_document_chunks, async_keyword_search, async_similarity_search
 
         scopes = self._normalize_scopes(knowledge_scope)
         query_variants = self._build_query_variants(query)
         search_groups = []
         chunk_cache = {}
         neighbor_window = self._neighbor_window_for_query(query)
+        if self._is_code_request(query):
+            neighbor_window = max(neighbor_window, 2)
 
         for query_variant in query_variants:
+            ranking_query = self._ranking_query(query_variant, query)
+            query_terms = self._extract_query_terms(ranking_query)
             search_plan = self._build_search_plan(scopes, owner_open_id)
             per_filter_k = self._candidate_k(top_k, len(search_plan), len(query_variants))
             for scope, metadata_filter in search_plan:
+                keyword_metadata_filter = self._keyword_metadata_filter(scope, metadata_filter)
                 filter_results, allow_owner_mismatch = await self._search_with_owner_fallback(
                     async_similarity_search,
                     query_variant,
@@ -76,6 +81,23 @@ class Retriever:
                     scope,
                     metadata_filter,
                 )
+                if scope == "personal" and filter_results and metadata_filter:
+                    keyword_results = await async_keyword_search(
+                        query_terms,
+                        k=per_filter_k,
+                        metadata_filter=keyword_metadata_filter,
+                    )
+                    keyword_allow_owner_mismatch = False
+                else:
+                    keyword_results, keyword_allow_owner_mismatch = await self._search_with_owner_fallback(
+                        async_keyword_search,
+                        query_terms,
+                        per_filter_k,
+                        scope,
+                        keyword_metadata_filter,
+                    )
+                allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
+                filter_results = self._merge_search_results(filter_results, keyword_results)
                 sources = []
 
                 for doc, score in filter_results:
@@ -93,16 +115,25 @@ class Retriever:
                         title=metadata.get("source", "未知来源"),
                         url="",
                         source_type="knowledge_base",
-                        snippet=doc.page_content[:settings.rag_display_snippet_chars],
+                        snippet=self._build_snippet(doc.page_content, ranking_query),
                         content=content,
                         score=self._normalize_distance_score(score),
                         metadata=metadata,
                     ))
 
+                deduped_sources = self._dedupe_sources(sources)
+                if self._is_code_request(ranking_query):
+                    target_sources = [
+                        source for source in deduped_sources
+                        if self._has_target_evidence(ranking_query, source)
+                    ]
+                    if target_sources:
+                        deduped_sources = target_sources
+
                 search_groups.append({
-                    "query": query_variant,
+                    "query": ranking_query,
                     "scope": scope,
-                    "sources": self._rank_sources_for_query(query_variant, self._dedupe_sources(sources)),
+                    "sources": self._rank_sources_for_query(ranking_query, deduped_sources),
                 })
 
         if len(search_groups) == 1:
@@ -122,6 +153,16 @@ class Retriever:
         if "personal" in scopes:
             plan.append(("personal", {"owner_open_id": owner_open_id or ""}))
         return plan or [("enterprise", None)]
+
+    def _keyword_metadata_filter(self, scope: str, metadata_filter: dict | None) -> dict | None:
+        if scope == "enterprise":
+            return {"knowledge_base_type": "enterprise"}
+        return metadata_filter
+
+    def _ranking_query(self, query_variant: str, original_query: str) -> str:
+        if query_variant != original_query and self._is_code_request(original_query) and not self._is_code_request(query_variant):
+            return f"{query_variant} python 代码片段"
+        return query_variant
 
     def _build_query_variants(self, query: str) -> list[str]:
         """组合问题优先拆分引号内目标，避免单个长 query 被第一个目标主导。"""
@@ -177,6 +218,26 @@ class Retriever:
         if fallback_results:
             logger.info("个人知识库按 owner 未命中，已降级为个人库宽松检索")
         return fallback_results, True
+
+    def _merge_search_results(self, primary_results: list, supplement_results: list) -> list:
+        merged = []
+        positions = {}
+        for doc, score in list(primary_results or []) + list(supplement_results or []):
+            metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
+            key = (
+                metadata.get("document_id"),
+                metadata.get("chunk_index"),
+                metadata.get("source"),
+                doc.page_content[:80],
+            )
+            if key in positions:
+                index = positions[key]
+                if self._safe_float(score) < self._safe_float(merged[index][1]):
+                    merged[index] = (doc, score)
+                continue
+            positions[key] = len(merged)
+            merged.append((doc, score))
+        return merged
 
     def _build_metadata_filters(self, scopes: List[str], owner_open_id: str | None = None) -> list[dict | None]:
         if "personal" in scopes and "enterprise" in scopes:
@@ -264,19 +325,33 @@ class Retriever:
         )
 
     def _lexical_relevance(self, query: str, source: SourceItem) -> float:
-        text = f"{source.title}\n{source.snippet}\n{source.content}".lower()
+        snippet_text = f"{source.title}\n{source.snippet}".lower()
+        content_text = (source.content or "").lower()
         terms = self._extract_query_terms(query)
         score = 0.0
         query_text = query.strip().lower()
+        is_code_request = self._is_code_request(query)
 
-        if query_text and query_text in text:
+        if query_text and query_text in snippet_text:
             score += 30.0
+        elif query_text and query_text in content_text:
+            score += 8.0
         for term in terms:
-            if term and term.lower() in text:
+            if not term:
+                continue
+            normalized_term = term.lower()
+            if normalized_term in snippet_text:
                 score += min(len(term), 20)
+            elif normalized_term in content_text:
+                score += min(len(term), 20) * 0.25
 
-        if ("代码" in query or "python" in query.lower()) and re.search(r"\b(def|class|import|return)\b", text):
-            score += 3.0
+        if is_code_request:
+            snippet_code_score = self._code_signal_score(snippet_text)
+            content_code_score = self._code_signal_score(content_text)
+            score += snippet_code_score * 8.0
+            score += min(content_code_score, 6.0)
+            if snippet_code_score <= 0 and content_code_score <= 0:
+                score -= 6.0
         return score
 
     def _extract_query_terms(self, query: str) -> list[str]:
@@ -285,15 +360,111 @@ class Retriever:
             if term not in terms:
                 terms.append(term)
 
-        if "快速排序" in query:
-            for term in ["快速排序", "quick_sort", "quicksort"]:
+        if "排序算法" in query or "快速排序" in query:
+            for term in ["排序算法", "快速排序", "quick_sort", "quicksort"]:
+                if term not in terms:
+                    terms.append(term)
+        if "正弦曲线" in query:
+            for term in ["正弦曲线", "np.sin", "sin(x)", "ax.plot", "plt.plot"]:
                 if term not in terms:
                     terms.append(term)
         if "圆点" in query and "动画" in query:
             for term in ["圆点", "坐标", "动画", "曲线", "FuncAnimation", "point", "coord_text"]:
                 if term not in terms:
                     terms.append(term)
+        focus_terms = [
+            "天气",
+            "毕业选题",
+            "毕设选题",
+            "历年",
+            "选题",
+        ]
+        for term in focus_terms:
+            if term in query and term not in terms:
+                terms.append(term)
         return terms
+
+    def _is_code_request(self, query: str) -> bool:
+        text = (query or "").lower()
+        code_words = ["python", "代码", "代码片段", "实现", "算法", "函数", "示例代码"]
+        return any(word in text for word in code_words)
+
+    def _has_target_evidence(self, query: str, source: SourceItem) -> bool:
+        target_terms = self._target_terms(query)
+        if not target_terms:
+            return True
+        text = f"{source.title}\n{source.snippet}\n{source.content}".lower()
+        return any(term.lower() in text for term in target_terms)
+
+    def _target_terms(self, query: str) -> list[str]:
+        generic_terms = {
+            "python",
+            "代码",
+            "代码片段",
+            "示例代码",
+            "函数",
+            "实现",
+            "找出",
+            "检索",
+            "知识库",
+            "个人知识库",
+            "企业知识库",
+            "企业和个人知识库结合检索",
+        }
+        terms = []
+        for term in self._extract_query_terms(query):
+            normalized = term.strip()
+            if not normalized or normalized.lower() in generic_terms or normalized in generic_terms:
+                continue
+            if normalized not in terms:
+                terms.append(normalized)
+        return terms
+
+    def _code_signal_score(self, text: str) -> float:
+        patterns = [
+            r"\bdef\s+[A-Za-z_][A-Za-z0-9_]*\s*\(",
+            r"\bclass\s+[A-Za-z_][A-Za-z0-9_]*",
+            r"\bimport\s+[A-Za-z_][A-Za-z0-9_]*",
+            r"\bfrom\s+[A-Za-z_][A-Za-z0-9_.]*\s+import\b",
+            r"\breturn\b",
+            r"\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b",
+            r"\bif\s+.+:",
+            r"\bnp\.",
+            r"\bplt\.",
+            r"\bax\.",
+            r"\bFuncAnimation\b",
+        ]
+        return float(sum(1 for pattern in patterns if re.search(pattern, text)))
+
+    def _build_snippet(self, text: str, query: str) -> str:
+        limit = settings.rag_display_snippet_chars
+        if len(text) <= limit:
+            return text
+
+        lowered = text.lower()
+        positions = []
+        for term in self._extract_query_terms(query):
+            if not term:
+                continue
+            index = lowered.find(term.lower())
+            if index >= 0:
+                positions.append(index)
+        if self._is_code_request(query):
+            for pattern in [r"\bdef\s+", r"\bimport\s+", r"\bfrom\s+", r"\bnp\.", r"\bplt\.", r"\bax\."]:
+                match = re.search(pattern, text)
+                if match:
+                    positions.append(match.start())
+
+        if not positions:
+            return text[:limit]
+
+        anchor = min(positions)
+        start = max(anchor - limit // 4, 0)
+        end = start + limit
+        if end > len(text):
+            end = len(text)
+            start = max(end - limit, 0)
+        return text[start:end]
 
     def _dedupe_sources(self, sources: List[SourceItem]) -> List[SourceItem]:
         """去重来源"""
@@ -325,10 +496,15 @@ class Retriever:
                     if group["query"] != query or group["scope"] != scope:
                         continue
                     for source in group["sources"]:
+                        lexical_score = self._lexical_relevance(query, source)
+                        if self._is_code_request(query) and (
+                            lexical_score <= 0 or not self._has_target_evidence(query, source)
+                        ):
+                            continue
                         key = (source.snippet[:50], source.title)
                         if key in seen:
                             continue
-                        rank = (self._lexical_relevance(query, source), source.score)
+                        rank = (lexical_score, source.score)
                         if best_rank is None or rank > best_rank:
                             best_source = source
                             best_rank = rank
@@ -345,6 +521,11 @@ class Retriever:
                 sources = group["sources"]
                 if index < len(sources):
                     source = sources[index]
+                    if self._is_code_request(group["query"]) and (
+                        self._lexical_relevance(group["query"], source) <= 0
+                        or not self._has_target_evidence(group["query"], source)
+                    ):
+                        continue
                     key = (source.snippet[:50], source.title)
                     if key in seen:
                         continue

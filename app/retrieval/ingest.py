@@ -10,7 +10,7 @@ from app.observability.logging import get_logger
 logger = get_logger(__name__)
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
+_ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".xlsx"}
 
 
 def load_document(file_path: str) -> list:
@@ -25,6 +25,8 @@ def load_document(file_path: str) -> list:
             loader = TextLoader(file_path, encoding="utf-8")
         elif ext == ".docx":
             loader = Docx2txtLoader(file_path)
+        elif ext == ".xlsx":
+            return load_xlsx_document(file_path)
         else:
             raise ValueError(f"不支持的文件格式: {ext}")
 
@@ -32,6 +34,31 @@ def load_document(file_path: str) -> list:
     except Exception as e:
         logger.error(f"加载文档失败: {e}")
         raise
+
+
+def load_xlsx_document(file_path: str) -> list:
+    """将XLSX按工作表抽取为文本Document。"""
+    from langchain_core.documents import Document
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(file_path, data_only=True, read_only=True)
+    documents = []
+    try:
+        for sheet in workbook.worksheets:
+            lines = []
+            for row in sheet.iter_rows(values_only=True):
+                values = ["" if value is None else str(value) for value in row]
+                if any(value.strip() for value in values):
+                    lines.append("\t".join(values).rstrip())
+            content = "\n".join(lines).strip()
+            if content:
+                documents.append(Document(
+                    page_content=content,
+                    metadata={"source": file_path, "sheet": sheet.title},
+                ))
+    finally:
+        workbook.close()
+    return documents
 
 
 def split_documents(documents: list) -> list:

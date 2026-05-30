@@ -7,6 +7,7 @@ from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
     load_document,
+    load_xlsx_document,
     sanitize_filename,
     save_uploaded_file,
     validate_file_extension,
@@ -22,6 +23,12 @@ def mock_retriever():
     return retriever
 
 
+@pytest.fixture(autouse=True)
+def mock_keyword_search_by_default():
+    with patch("app.retrieval.vector_store.async_keyword_search", new=AsyncMock(return_value=[])):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_mock_search(mock_retriever):
     results = await mock_retriever.search("测试问题", top_k=3)
@@ -34,15 +41,17 @@ def test_validate_file_extension():
     assert validate_file_extension("test.pdf") is True
     assert validate_file_extension("test.txt") is True
     assert validate_file_extension("test.docx") is True
+    assert validate_file_extension("test.xlsx") is True
     assert validate_file_extension("test.doc") is False
     assert validate_file_extension("test.docm") is False
-    assert validate_file_extension("test.xlsx") is False
+    assert validate_file_extension("test.xls") is False
 
 
 def test_sanitize_filename_removes_paths_and_invalid_chars():
     assert sanitize_filename("../evil.txt") == "evil.txt"
     assert sanitize_filename(r"C:\tmp\evil.txt") == "evil.txt"
     assert sanitize_filename("../evil.docx") == "evil.docx"
+    assert sanitize_filename("../bad.xlsx") == "bad.xlsx"
     assert sanitize_filename('bad:name?.pdf') == "bad_name_.pdf"
 
 
@@ -55,6 +64,68 @@ def test_load_document_uses_docx_loader():
 
     mock_loader.assert_called_once_with("test.docx")
     assert result == ["doc"]
+
+
+def test_load_document_uses_xlsx_loader():
+    with patch("app.retrieval.ingest.load_xlsx_document", return_value=["sheet doc"]) as mock_loader:
+        result = load_document("test.xlsx")
+
+    mock_loader.assert_called_once_with("test.xlsx")
+    assert result == ["sheet doc"]
+
+
+def test_load_xlsx_document_extracts_sheet_text(tmp_path):
+    from openpyxl import Workbook
+
+    path = tmp_path / "sample.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "SheetA"
+    sheet.append(["名称", "数量"])
+    sheet.append(["苹果", 3])
+    workbook.save(path)
+
+    docs = load_xlsx_document(str(path))
+
+    assert len(docs) == 1
+    assert "名称\t数量" in docs[0].page_content
+    assert "苹果\t3" in docs[0].page_content
+    assert docs[0].metadata["sheet"] == "SheetA"
+
+
+def test_extract_query_terms_keeps_weather_focus_term():
+    retriever = Retriever()
+
+    terms = retriever._extract_query_terms("查找关于天气的历年毕业选题")
+
+    assert "天气" in terms
+    assert "历年" in terms
+    assert "毕业选题" in terms
+
+
+def test_extract_query_terms_expands_code_targets():
+    retriever = Retriever()
+
+    sort_terms = retriever._extract_query_terms("排序算法的python代码片段")
+    sine_terms = retriever._extract_query_terms("绘制一条正弦曲线，曲线的样式是默认的")
+
+    assert "快速排序" in sort_terms
+    assert "quick_sort" in sort_terms
+    assert "quicksort" in sort_terms
+    assert "np.sin" in sine_terms
+    assert "ax.plot" in sine_terms
+
+
+def test_merge_search_results_keeps_better_duplicate_score():
+    retriever = Retriever()
+    doc = MagicMock(
+        page_content="以下是Python实现快速排序算法的示例代码：\ndef quick_sort(arr):\n    return arr",
+        metadata={"source": "quick.txt", "document_id": "doc1", "chunk_index": 0},
+    )
+
+    results = retriever._merge_search_results([(doc, 1.5)], [(doc, -20)])
+
+    assert results == [(doc, -20)]
 
 
 def test_save_uploaded_file_stays_inside_upload_dir(tmp_path):
@@ -388,6 +459,46 @@ async def test_personal_scope_reranks_exact_code_hit_before_vector_noise():
 
 
 @pytest.mark.asyncio
+async def test_personal_sort_algorithm_returns_quick_sort_before_unrelated_chunks():
+    retriever = Retriever()
+    noise_doc = MagicMock(
+        page_content="用户：安装复杂吗？需要专业人员吗？\n客服：基础安装非常简单。",
+        metadata={"source": "personal_noise.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+    quick_sort_doc = MagicMock(
+        page_content="以下是Python实现快速排序算法的示例代码：\n\ndef quick_sort(arr):\n    if len(arr) <= 1:\n        return arr",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+
+    async def fake_similarity_search(_query, k=5, metadata_filter=None):
+        return [(noise_doc, 0), (quick_sort_doc, 1.5)]
+
+    async def fake_keyword_search(terms, k=5, metadata_filter=None):
+        assert "quick_sort" in terms
+        return [(quick_sort_doc, -20)]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_similarity_search),
+    ), patch(
+        "app.retrieval.vector_store.async_keyword_search",
+        new=AsyncMock(side_effect=fake_keyword_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "“排序算法”的python代码片段",
+            top_k=3,
+            knowledge_scope=["personal"],
+            owner_open_id="ou_test123",
+        )
+
+    assert results[0].title == "personal_quick_sort.txt"
+    assert "def quick_sort" in results[0].snippet
+
+
+@pytest.mark.asyncio
 async def test_personal_scope_strict_owner_filter_disables_fallback():
     retriever = Retriever()
     personal_doc = MagicMock(
@@ -583,3 +694,47 @@ async def test_combined_scope_preserves_one_result_per_quoted_target_before_top_
     assert len(results) == 2
     assert any(title.startswith("animation_") for title in titles)
     assert "personal_quick_sort.txt" in titles
+
+
+@pytest.mark.asyncio
+async def test_enterprise_keyword_search_recalls_weather_xlsx_chunk():
+    retriever = Retriever()
+    noise_doc = MagicMock(
+        page_content="Matplotlib绘图代码和人工智能伦理问题",
+        metadata={"source": "noise.txt", "knowledge_base_type": "enterprise"},
+    )
+    weather_doc = MagicMock(
+        page_content="郑丽华\t20125081042\t基于推荐算法的电子商城设计与实现\t基于BP神经网络的碳排放数据分析系统的设计与实现\t基于机器学习的天气数据分析与预测系统的实现",
+        metadata={
+            "source": "weather.xlsx",
+            "knowledge_base_type": "enterprise",
+            "document_id": "xlsx1",
+            "chunk_index": 0,
+        },
+    )
+
+    async def fake_similarity_search(_query, k=5, metadata_filter=None):
+        return [(noise_doc, 0)]
+
+    async def fake_keyword_search(terms, k=5, metadata_filter=None):
+        assert "天气" in terms
+        return [(weather_doc, -10)]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_similarity_search),
+    ), patch(
+        "app.retrieval.vector_store.async_keyword_search",
+        new=AsyncMock(side_effect=fake_keyword_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "查找关于天气的历年毕业选题",
+            top_k=3,
+            knowledge_scope=["enterprise"],
+        )
+
+    assert results[0].title == "weather.xlsx"
+    assert "天气数据分析" in results[0].snippet

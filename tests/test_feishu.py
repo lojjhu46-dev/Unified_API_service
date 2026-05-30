@@ -546,18 +546,21 @@ class TestFeishuPersonalKnowledgeFiles:
     def teardown_method(self):
         pending_feishu_files.clear()
 
-    def test_decide_feishu_knowledge_scope_defaults_to_enterprise(self):
-        assert decide_feishu_knowledge_scope("儒家大同思想是什么") == ["enterprise"]
+    def test_decide_feishu_knowledge_scope_defaults_to_combined(self):
+        assert decide_feishu_knowledge_scope("儒家大同思想是什么") == ["enterprise", "personal"]
+
+    def test_decide_feishu_knowledge_scope_enterprise_only(self):
+        assert decide_feishu_knowledge_scope("只查企业知识库里的内容") == ["enterprise"]
 
     def test_decide_feishu_knowledge_scope_personal(self):
-        assert decide_feishu_knowledge_scope("查一下我的知识库里的内容") == ["personal"]
+        assert decide_feishu_knowledge_scope("只查我的知识库里的内容") == ["personal"]
 
     def test_decide_feishu_knowledge_scope_combined(self):
         assert decide_feishu_knowledge_scope("结合企业和个人知识库回答") == ["enterprise", "personal"]
 
     @pytest.mark.asyncio
     async def test_file_event_sends_confirm_card_without_ingest(self):
-        event_data = FeishuAdapter().parse_event(_file_event(file_name="资料.docx"))
+        event_data = FeishuAdapter().parse_event(_file_event(file_name="资料.xlsx"))
 
         with patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock(return_value=True)) as mock_card, \
              patch("app.main.ingest_file") as mock_ingest, \
@@ -566,9 +569,15 @@ class TestFeishuPersonalKnowledgeFiles:
 
         assert len(pending_feishu_files) == 1
         pending = next(iter(pending_feishu_files.values()))
-        assert pending["file_name"] == "资料.docx"
+        assert pending["file_name"] == "资料.xlsx"
         assert pending["file_key"] == "file_key_1"
         mock_card.assert_awaited_once()
+        card = mock_card.await_args.args[1]
+        actions = card["elements"][1]["actions"]
+        values = [action["value"]["action"] for action in actions]
+        assert "confirm_save_personal_file" in values
+        assert "confirm_save_enterprise_file" in values
+        assert "cancel_save_personal_file" in values
         mock_ingest.assert_not_called()
         mock_download.assert_not_awaited()
 
@@ -622,6 +631,43 @@ class TestFeishuPersonalKnowledgeFiles:
         assert "pending_1" not in pending_feishu_files
 
     @pytest.mark.asyncio
+    async def test_confirm_card_downloads_and_ingests_enterprise_file(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "message_id": "om_file456",
+            "file_key": "file_key_1",
+            "file_name": "资料.xlsx",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock(return_value=b"hello")) as mock_download, \
+             patch("app.main.save_uploaded_file", return_value="D:/LLM/Unified_API_service/data/uploads/stored.xlsx") as mock_save, \
+             patch("app.main.ingest_file") as mock_ingest, \
+             patch("app.main.orchestrator.retriever.refresh") as mock_refresh, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            mock_ingest.return_value = {"document_id": "doc1", "filename": "资料.xlsx", "chunks": 2}
+
+            await process_feishu_card_action({
+                "action": "confirm_save_enterprise_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_download.assert_awaited_once_with("om_file456", "file_key_1")
+        mock_save.assert_called_once()
+        assert mock_save.call_args.kwargs["upload_dir"] == settings.upload_dir
+        mock_ingest.assert_called_once()
+        assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "enterprise"
+        assert mock_ingest.call_args.kwargs["owner_open_id"] is None
+        assert mock_ingest.call_args.kwargs["chat_id"] == "oc_test789"
+        assert mock_ingest.call_args.kwargs["channel"] == "feishu"
+        mock_refresh.assert_called_once()
+        assert "已保存到企业知识库" in mock_send.await_args.args[1]
+        assert "pending_1" not in pending_feishu_files
+
+    @pytest.mark.asyncio
     async def test_cancel_card_does_not_download_or_ingest(self):
         pending_feishu_files["pending_1"] = {
             "open_id": "ou_test123",
@@ -664,6 +710,24 @@ class TestFeishuPersonalKnowledgeFiles:
         assert "只有上传文件的用户" in mock_send.await_args.args[1]
 
     @pytest.mark.asyncio
+    async def test_missing_open_id_cannot_consume_pending_confirmation(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_owner",
+            "chat_id": "oc_test789",
+            "file_name": "资料.pdf",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "confirm_save_personal_file",
+                "pending_id": "pending_1",
+            })
+
+        assert "pending_1" in pending_feishu_files
+        assert "只有上传文件的用户" in mock_send.await_args.args[1]
+
+    @pytest.mark.asyncio
     async def test_expired_pending_is_removed_and_not_downloaded(self):
         pending_feishu_files["pending_1"] = {
             "open_id": "ou_test123",
@@ -693,6 +757,23 @@ class TestFeishuPersonalKnowledgeFiles:
             "open_id": "ou_test123",
             "chat_id": "oc_test789",
         }
+
+    def test_parse_card_action_operator_open_id_fallback(self):
+        body = _card_action("pending_1")
+        body["event"]["operator"] = {"open_id": "ou_operator"}
+
+        action = parse_feishu_card_action(body)
+
+        assert action["open_id"] == "ou_operator"
+
+    def test_parse_card_action_event_user_id_fallback(self):
+        body = _card_action("pending_1")
+        body["event"]["operator"] = {}
+        body["event"]["user_id"] = {"open_id": "ou_event_user"}
+
+        action = parse_feishu_card_action(body)
+
+        assert action["open_id"] == "ou_event_user"
 
 
 class TestFeishuEndpoint:
