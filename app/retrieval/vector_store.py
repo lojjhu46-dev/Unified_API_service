@@ -57,9 +57,9 @@ def add_documents(documents: list) -> int:
         raise
 
 
-async def async_similarity_search(query: str, k: int = 5) -> list:
+async def async_similarity_search(query: str, k: int = 5, metadata_filter: dict | None = None) -> list:
     """异步相似度搜索"""
-    return await asyncio.to_thread(_sync_similarity_search, query, k)
+    return await asyncio.to_thread(_sync_similarity_search, query, k, metadata_filter)
 
 
 async def async_get_document_chunks(document_id: str) -> list[dict]:
@@ -67,11 +67,12 @@ async def async_get_document_chunks(document_id: str) -> list[dict]:
     return await asyncio.to_thread(_sync_get_document_chunks, document_id)
 
 
-def _sync_similarity_search(query: str, k: int) -> list:
+def _sync_similarity_search(query: str, k: int, metadata_filter: dict | None = None) -> list:
     """同步相似度搜索"""
     try:
         vector_store = get_vector_store()
-        results = vector_store.similarity_search_with_score(query, k=k)
+        kwargs = {"filter": metadata_filter} if metadata_filter else {}
+        results = vector_store.similarity_search_with_score(query, k=k, **kwargs)
         return results
     except Exception as e:
         logger.error(f"相似度搜索失败: {e}")

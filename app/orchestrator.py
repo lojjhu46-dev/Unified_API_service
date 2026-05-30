@@ -187,6 +187,7 @@ class Orchestrator:
             standalone_question,
             request.top_k,
             request.knowledge_scope,
+            owner_open_id=request.user_id if request.channel == "feishu" else None,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
 
@@ -276,6 +277,7 @@ class Orchestrator:
             standalone_question,
             request.top_k,
             request.knowledge_scope,
+            owner_open_id=request.user_id if request.channel == "feishu" else None,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
         return sources, retrieval_ms

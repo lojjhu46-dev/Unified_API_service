@@ -114,16 +114,18 @@ class FeishuAdapter:
         message = event.get("message", {})
         sender = event.get("sender", {})
 
-        message_type = message.get("message_type")
-        if message_type != "text":
-            return None
-
         chat_type = message.get("chat_type")  # p2p 或 group
         chat_id = message.get("chat_id")
         message_id = message.get("message_id")
 
         sender_id = sender.get("sender_id", {})
         open_id = sender_id.get("open_id")
+
+        message_type = message.get("message_type")
+        if message_type == "file":
+            return self._parse_file_message_event_v2(message, header, open_id, chat_id, chat_type, message_id)
+        if message_type != "text":
+            return None
 
         # 解析消息内容
         content_str = message.get("content", "{}")
@@ -158,6 +160,41 @@ class FeishuAdapter:
             "chat_type": chat_type,
             "message_id": message_id,
             "text": text,
+            "event_id": event_id,
+            "uuid": uuid,
+            "dedupe_key": self.get_dedupe_key(event_id, uuid, message_id),
+        }
+
+    def _parse_file_message_event_v2(
+        self,
+        message: dict,
+        header: dict,
+        open_id: Optional[str],
+        chat_id: Optional[str],
+        chat_type: Optional[str],
+        message_id: Optional[str],
+    ) -> Optional[dict]:
+        content_str = message.get("content", "{}")
+        try:
+            content_obj = json.loads(content_str)
+        except json.JSONDecodeError:
+            content_obj = {}
+
+        file_key = content_obj.get("file_key")
+        file_name = content_obj.get("file_name") or content_obj.get("name") or "uploaded_file"
+        if not open_id or not chat_id or not message_id or not file_key:
+            return None
+
+        event_id = header.get("event_id")
+        uuid = header.get("uuid")
+        return {
+            "event_kind": "file",
+            "open_id": open_id,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "message_id": message_id,
+            "file_key": file_key,
+            "file_name": file_name,
             "event_id": event_id,
             "uuid": uuid,
             "dedupe_key": self.get_dedupe_key(event_id, uuid, message_id),
@@ -333,6 +370,54 @@ class FeishuAdapter:
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
             return False
+
+    async def send_interactive_card(self, chat_id: str, card: dict) -> bool:
+        token = await self.get_tenant_access_token()
+        if not token:
+            return False
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{FEISHU_API_BASE}/im/v1/messages",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"receive_id_type": "chat_id"},
+                    json={
+                        "receive_id": chat_id,
+                        "content": json.dumps(card, ensure_ascii=False),
+                        "msg_type": "interactive",
+                    },
+                )
+                data = resp.json()
+                if data.get("code") == 0:
+                    return True
+                if self._is_auth_error(data.get("code")):
+                    self.clear_tenant_access_token()
+                logger.error(f"发送卡片失败: {data}")
+                return False
+        except Exception as e:
+            logger.error(f"发送卡片异常: {e}")
+            return False
+
+    async def download_message_resource(self, message_id: str, file_key: str, resource_type: str = "file") -> Optional[bytes]:
+        token = await self.get_tenant_access_token()
+        if not token:
+            return None
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"type": resource_type},
+                )
+                if resp.status_code == 200:
+                    return resp.content
+                logger.error(f"下载飞书文件失败: status={resp.status_code}, body={resp.text[:300]}")
+                return None
+        except Exception as e:
+            logger.error(f"下载飞书文件异常: {e}")
+            return None
 
 
 feishu_adapter = FeishuAdapter()

@@ -10,19 +10,21 @@ from app.observability.logging import get_logger
 logger = get_logger(__name__)
 
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-_ALLOWED_EXTENSIONS = {".pdf", ".txt"}
+_ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx"}
 
 
 def load_document(file_path: str) -> list:
     """加载文档"""
     try:
-        from langchain_community.document_loaders import PyPDFLoader, TextLoader
+        from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
 
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
             loader = PyPDFLoader(file_path)
         elif ext == ".txt":
             loader = TextLoader(file_path, encoding="utf-8")
+        elif ext == ".docx":
+            loader = Docx2txtLoader(file_path)
         else:
             raise ValueError(f"不支持的文件格式: {ext}")
 
@@ -48,7 +50,14 @@ def split_documents(documents: list) -> list:
         raise
 
 
-def ingest_file(file_path: str, original_filename: str | None = None) -> dict:
+def ingest_file(
+    file_path: str,
+    original_filename: str | None = None,
+    knowledge_base_type: str = "enterprise",
+    owner_open_id: str | None = None,
+    chat_id: str | None = None,
+    channel: str = "api",
+) -> dict:
     """摄取文件到向量存储"""
     from app.retrieval.vector_store import add_documents
 
@@ -67,6 +76,10 @@ def ingest_file(file_path: str, original_filename: str | None = None) -> dict:
             "original_filename": safe_original_filename,
             "stored_filename": stored_filename,
             "chunk_index": index,
+            "knowledge_base_type": knowledge_base_type,
+            "owner_open_id": owner_open_id or "",
+            "chat_id": chat_id or "",
+            "channel": channel,
         }
     chunk_count = add_documents(chunks)
 
@@ -101,14 +114,14 @@ def sanitize_filename(filename: str | None) -> str:
     return f"{stem}{ext}"
 
 
-def save_uploaded_file(content: bytes, filename: str) -> str:
+def save_uploaded_file(content: bytes, filename: str, upload_dir: str | None = None) -> str:
     """保存上传的文件"""
-    upload_dir = Path(settings.upload_dir).resolve()
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(upload_dir or settings.upload_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_filename = sanitize_filename(filename)
-    file_path = (upload_dir / f"{uuid.uuid4()}_{safe_filename}").resolve()
-    if upload_dir not in file_path.parents:
+    file_path = (target_dir / f"{uuid.uuid4()}_{safe_filename}").resolve()
+    if target_dir not in file_path.parents:
         raise ValueError("上传文件路径非法")
 
     with open(file_path, "wb") as f:

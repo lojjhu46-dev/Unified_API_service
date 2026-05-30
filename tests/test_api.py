@@ -184,6 +184,8 @@ def test_upload_pdf(client):
     data = response.json()
     assert data["status"] == "success"
     assert data["chunks"] == 5
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "enterprise"
+    assert mock_ingest.call_args.kwargs["channel"] == "api"
     mock_refresh.assert_called_once()
 
 
@@ -204,6 +206,34 @@ def test_upload_txt(client):
     assert data["status"] == "success"
 
 
+def test_upload_docx(client):
+    with patch("app.main.ingest_file") as mock_ingest, patch(
+        "app.main.orchestrator.retriever.refresh"
+    ) as mock_refresh:
+        mock_ingest.return_value = {
+            "document_id": "test789",
+            "filename": "test.docx",
+            "chunks": 4,
+        }
+        response = client.post(
+            "/documents/upload",
+            files={
+                "file": (
+                    "test.docx",
+                    b"docx content",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+    assert data["filename"] == "test.docx"
+    assert data["chunks"] == 4
+    mock_refresh.assert_called_once()
+
+
 def test_upload_invalid_extension(client):
     response = client.post(
         "/documents/upload",
@@ -211,6 +241,15 @@ def test_upload_invalid_extension(client):
     )
     assert response.status_code == 400
     assert "仅支持" in response.json()["detail"]
+    assert "DOCX" in response.json()["detail"]
+
+
+def test_upload_docm_is_rejected(client):
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("test.docm", b"docm content", "application/vnd.ms-word.document.macroEnabled.12")},
+    )
+    assert response.status_code == 400
 
 
 def test_upload_too_large(client):

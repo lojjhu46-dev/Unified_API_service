@@ -6,6 +6,7 @@ from app.retrieval.retriever import Retriever
 from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
+    load_document,
     sanitize_filename,
     save_uploaded_file,
     validate_file_extension,
@@ -32,14 +33,28 @@ async def test_mock_search(mock_retriever):
 def test_validate_file_extension():
     assert validate_file_extension("test.pdf") is True
     assert validate_file_extension("test.txt") is True
+    assert validate_file_extension("test.docx") is True
     assert validate_file_extension("test.doc") is False
+    assert validate_file_extension("test.docm") is False
     assert validate_file_extension("test.xlsx") is False
 
 
 def test_sanitize_filename_removes_paths_and_invalid_chars():
     assert sanitize_filename("../evil.txt") == "evil.txt"
     assert sanitize_filename(r"C:\tmp\evil.txt") == "evil.txt"
+    assert sanitize_filename("../evil.docx") == "evil.docx"
     assert sanitize_filename('bad:name?.pdf') == "bad_name_.pdf"
+
+
+def test_load_document_uses_docx_loader():
+    with patch("langchain_community.document_loaders.Docx2txtLoader") as mock_loader:
+        instance = mock_loader.return_value
+        instance.load.return_value = ["doc"]
+
+        result = load_document("test.docx")
+
+    mock_loader.assert_called_once_with("test.docx")
+    assert result == ["doc"]
 
 
 def test_save_uploaded_file_stays_inside_upload_dir(tmp_path):
@@ -77,6 +92,35 @@ def test_ingest_file(mock_load, mock_split, mock_add):
     assert chunk2.metadata["chunk_index"] == 1
     assert chunk1.metadata["original_filename"] == "test.pdf"
     assert chunk1.metadata["stored_filename"] == "stored.pdf"
+    assert chunk1.metadata["knowledge_base_type"] == "enterprise"
+    assert chunk1.metadata["owner_open_id"] == ""
+    assert chunk1.metadata["chat_id"] == ""
+    assert chunk1.metadata["channel"] == "api"
+
+
+@patch("app.retrieval.vector_store.add_documents")
+@patch("app.retrieval.ingest.split_documents")
+@patch("app.retrieval.ingest.load_document")
+def test_ingest_file_personal_metadata(mock_load, mock_split, mock_add):
+    mock_load.return_value = [MagicMock()]
+    chunk = MagicMock(metadata={})
+    mock_split.return_value = [chunk]
+    mock_add.return_value = 1
+
+    result = ingest_file(
+        "/tmp/stored.txt",
+        original_filename="我的资料.txt",
+        knowledge_base_type="personal",
+        owner_open_id="ou_test123",
+        chat_id="oc_test789",
+        channel="feishu",
+    )
+
+    assert result["chunks"] == 1
+    assert chunk.metadata["knowledge_base_type"] == "personal"
+    assert chunk.metadata["owner_open_id"] == "ou_test123"
+    assert chunk.metadata["chat_id"] == "oc_test789"
+    assert chunk.metadata["channel"] == "feishu"
 
 
 @pytest.mark.asyncio
@@ -206,3 +250,336 @@ async def test_chroma_search_neighbor_failure_uses_original_chunk():
         results = await retriever._chroma_search("历史影响", top_k=1)
 
     assert results[0].content == "原始命中切块"
+
+
+@pytest.mark.asyncio
+async def test_enterprise_scope_excludes_personal_sources():
+    retriever = Retriever()
+    enterprise_doc = MagicMock(
+        page_content="企业知识",
+        metadata={"source": "enterprise.txt", "knowledge_base_type": "enterprise"},
+    )
+    legacy_doc = MagicMock(
+        page_content="旧企业知识",
+        metadata={"source": "legacy.txt"},
+    )
+    personal_doc = MagicMock(
+        page_content="个人知识",
+        metadata={"source": "personal.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(enterprise_doc, 0), (legacy_doc, 0.1), (personal_doc, 0.2)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search("测试", top_k=5, knowledge_scope=["enterprise"])
+
+    titles = [item.title for item in results]
+    assert "enterprise.txt" in titles
+    assert "legacy.txt" in titles
+    assert "personal.txt" not in titles
+
+
+@pytest.mark.asyncio
+async def test_personal_scope_only_returns_matching_owner():
+    retriever = Retriever()
+    owner_doc = MagicMock(
+        page_content="当前用户个人知识",
+        metadata={"source": "mine.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+    other_doc = MagicMock(
+        page_content="其他用户个人知识",
+        metadata={"source": "other.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_other"},
+    )
+    enterprise_doc = MagicMock(
+        page_content="企业知识",
+        metadata={"source": "enterprise.txt", "knowledge_base_type": "enterprise"},
+    )
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[(owner_doc, 0), (other_doc, 0.1), (enterprise_doc, 0.2)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "测试",
+            top_k=5,
+            knowledge_scope=["personal"],
+            owner_open_id="ou_test123",
+        )
+
+    assert [item.title for item in results] == ["mine.txt"]
+
+
+@pytest.mark.asyncio
+async def test_personal_scope_falls_back_when_owner_filter_misses():
+    retriever = Retriever()
+    personal_doc = MagicMock(
+        page_content="Python实现快速排序算法\ndef quick_sort(arr):\n    return arr",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_ingest_owner"},
+    )
+
+    async def fake_search(_query, k=5, metadata_filter=None):
+        if metadata_filter == {"owner_open_id": "ou_request_user"}:
+            return []
+        if metadata_filter == {"knowledge_base_type": "personal"}:
+            return [(personal_doc, 0)]
+        return []
+
+    with patch.object(settings, "personal_kb_strict_owner_filter", False), patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "Python实现快速排序算法",
+            top_k=5,
+            knowledge_scope=["personal"],
+            owner_open_id="ou_request_user",
+        )
+
+    assert [item.title for item in results] == ["personal_quick_sort.txt"]
+
+
+@pytest.mark.asyncio
+async def test_personal_scope_reranks_exact_code_hit_before_vector_noise():
+    retriever = Retriever()
+    noise_docs = [
+        MagicMock(
+            page_content=f"个人知识库无关内容 {index}",
+            metadata={"source": f"noise_{index}.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_ingest_owner"},
+        )
+        for index in range(3)
+    ]
+    quick_sort_doc = MagicMock(
+        page_content="以下是Python实现快速排序算法的示例代码：\ndef quick_sort(arr):\n    return arr",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_ingest_owner"},
+    )
+
+    async def fake_search(_query, k=5, metadata_filter=None):
+        if metadata_filter == {"owner_open_id": "ou_request_user"}:
+            return []
+        if metadata_filter == {"knowledge_base_type": "personal"}:
+            return [(doc, index * 0.01) for index, doc in enumerate(noise_docs)] + [(quick_sort_doc, 1.5)]
+        return []
+
+    with patch.object(settings, "personal_kb_strict_owner_filter", False), patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "个人知识库检索，找出“Python实现快速排序算法”的python代码片段",
+            top_k=3,
+            knowledge_scope=["personal"],
+            owner_open_id="ou_request_user",
+        )
+
+    assert results[0].title == "personal_quick_sort.txt"
+
+
+@pytest.mark.asyncio
+async def test_personal_scope_strict_owner_filter_disables_fallback():
+    retriever = Retriever()
+    personal_doc = MagicMock(
+        page_content="Python实现快速排序算法",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_ingest_owner"},
+    )
+
+    async def fake_search(_query, k=5, metadata_filter=None):
+        if metadata_filter == {"owner_open_id": "ou_request_user"}:
+            return []
+        if metadata_filter == {"knowledge_base_type": "personal"}:
+            return [(personal_doc, 0)]
+        return []
+
+    with patch.object(settings, "personal_kb_strict_owner_filter", True), patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "Python实现快速排序算法",
+            top_k=5,
+            knowledge_scope=["personal"],
+            owner_open_id="ou_request_user",
+        )
+
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_combined_scope_merges_enterprise_and_current_owner_personal():
+    retriever = Retriever()
+    enterprise_doc = MagicMock(
+        page_content="企业知识",
+        metadata={"source": "enterprise.txt", "knowledge_base_type": "enterprise"},
+    )
+    owner_doc = MagicMock(
+        page_content="当前用户个人知识",
+        metadata={"source": "mine.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+    other_doc = MagicMock(
+        page_content="其他用户个人知识",
+        metadata={"source": "other.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_other"},
+    )
+
+    async def fake_search(_query, k=5, metadata_filter=None):
+        if metadata_filter:
+            return [(owner_doc, 0), (other_doc, 0.1)]
+        return [(enterprise_doc, 0.2), (other_doc, 0.3)]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "测试",
+            top_k=5,
+            knowledge_scope=["enterprise", "personal"],
+            owner_open_id="ou_test123",
+        )
+
+    titles = [item.title for item in results]
+    assert "enterprise.txt" in titles
+    assert "mine.txt" in titles
+    assert "other.txt" not in titles
+
+
+@pytest.mark.asyncio
+async def test_combined_scope_keeps_personal_result_when_enterprise_scores_dominate():
+    retriever = Retriever()
+    enterprise_docs = [
+        MagicMock(
+            page_content=f"绘制一条正弦曲线 企业片段 {index}",
+            metadata={"source": f"enterprise_{index}.txt", "knowledge_base_type": "enterprise"},
+        )
+        for index in range(6)
+    ]
+    personal_doc = MagicMock(
+        page_content="Python实现快速排序算法\ndef quick_sort(arr):\n    return arr",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+
+    async def fake_search(_query, k=5, metadata_filter=None):
+        if metadata_filter:
+            return [(personal_doc, 0.9)]
+        return [(doc, index * 0.01) for index, doc in enumerate(enterprise_docs)]
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "绘制一条正弦曲线 Python实现快速排序算法",
+            top_k=5,
+            knowledge_scope=["enterprise", "personal"],
+            owner_open_id="ou_test123",
+        )
+
+    titles = [item.title for item in results]
+    assert "personal_quick_sort.txt" in titles
+    assert any(title.startswith("enterprise_") for title in titles)
+
+
+@pytest.mark.asyncio
+async def test_combined_scope_searches_quoted_targets_separately():
+    retriever = Retriever()
+    animation_doc = MagicMock(
+        page_content="制作一个圆点沿曲线运动的动画，并时刻显示圆点的坐标位置\n\ndef update(frame):\n    return point, coord_text",
+        metadata={"source": "enterprise_animation.txt", "knowledge_base_type": "enterprise"},
+    )
+    quick_sort_doc = MagicMock(
+        page_content="Python实现快速排序算法\ndef quick_sort(arr):\n    return quick_sort(left) + middle + quick_sort(right)",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+    irrelevant_personal_doc = MagicMock(
+        page_content="个人库无关内容",
+        metadata={"source": "personal_other.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_test123"},
+    )
+
+    async def fake_search(query, k=5, metadata_filter=None):
+        if "快速排序" in query and metadata_filter:
+            return [(quick_sort_doc, 0)]
+        if "圆点沿曲线运动" in query and metadata_filter is None:
+            return [(animation_doc, 0)]
+        if metadata_filter:
+            return [(irrelevant_personal_doc, 1.5)]
+        return []
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "企业知识库和个人知识库结合检索，找出“制作一个圆点沿曲线运动的动画，并时刻显示圆点的坐标位置”和“Python实现快速排序算法”的python代码片段",
+            top_k=5,
+            knowledge_scope=["enterprise", "personal"],
+            owner_open_id="ou_test123",
+        )
+
+    titles = [item.title for item in results]
+    assert "enterprise_animation.txt" in titles
+    assert "personal_quick_sort.txt" in titles
+
+
+@pytest.mark.asyncio
+async def test_combined_scope_preserves_one_result_per_quoted_target_before_top_k_cutoff():
+    retriever = Retriever()
+    animation_docs = [
+        MagicMock(
+            page_content=f"制作一个圆点沿曲线运动的动画 片段 {index}",
+            metadata={"source": f"animation_{index}.txt", "knowledge_base_type": "enterprise"},
+        )
+        for index in range(5)
+    ]
+    quick_sort_doc = MagicMock(
+        page_content="Python实现快速排序算法\ndef quick_sort(arr):\n    return arr",
+        metadata={"source": "personal_quick_sort.txt", "knowledge_base_type": "personal", "owner_open_id": "ou_request_user"},
+    )
+
+    async def fake_search(query, k=5, metadata_filter=None):
+        if "圆点沿曲线运动" in query and metadata_filter is None:
+            return [(doc, index * 0.01) for index, doc in enumerate(animation_docs)]
+        if "快速排序" in query and metadata_filter:
+            return [(quick_sort_doc, 0.8)]
+        return []
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "找出“制作一个圆点沿曲线运动的动画”和“Python实现快速排序算法”的python代码片段",
+            top_k=2,
+            knowledge_scope=["enterprise", "personal"],
+            owner_open_id="ou_request_user",
+        )
+
+    titles = [item.title for item in results]
+    assert len(results) == 2
+    assert any(title.startswith("animation_") for title in titles)
+    assert "personal_quick_sort.txt" in titles

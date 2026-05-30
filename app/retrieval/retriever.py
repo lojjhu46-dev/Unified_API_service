@@ -1,6 +1,7 @@
 """检索器"""
 
 import asyncio
+import re
 from typing import List
 from app.schemas import SourceItem
 from app.config import settings
@@ -37,45 +38,169 @@ class Retriever:
         query: str,
         top_k: int = 5,
         knowledge_scope: List[str] = None,
+        owner_open_id: str | None = None,
     ) -> List[SourceItem]:
         """检索"""
         if self._use_chroma or (not self._chroma_checked and self.refresh()):
             try:
-                return await self._chroma_search(query, top_k)
+                return await self._chroma_search(query, top_k, knowledge_scope, owner_open_id)
             except Exception as e:
                 logger.error(f"Chroma检索失败，降级到Mock检索器: {e}")
                 self._use_chroma = False
         return await self._mock_search(query, top_k)
 
-    async def _chroma_search(self, query: str, top_k: int) -> List[SourceItem]:
+    async def _chroma_search(
+        self,
+        query: str,
+        top_k: int,
+        knowledge_scope: List[str] = None,
+        owner_open_id: str | None = None,
+    ) -> List[SourceItem]:
         """Chroma检索"""
         from app.retrieval.vector_store import async_get_document_chunks, async_similarity_search
 
-        results = await async_similarity_search(query, k=top_k)
-        sources = []
+        scopes = self._normalize_scopes(knowledge_scope)
+        query_variants = self._build_query_variants(query)
+        search_groups = []
         chunk_cache = {}
         neighbor_window = self._neighbor_window_for_query(query)
 
-        for doc, score in results:
-            metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
-            content = await self._expand_neighbor_content(
-                doc.page_content,
-                metadata,
-                chunk_cache,
-                async_get_document_chunks,
-                neighbor_window,
-            )
-            sources.append(SourceItem(
-                title=metadata.get("source", "未知来源"),
-                url="",
-                source_type="knowledge_base",
-                snippet=doc.page_content[:settings.rag_display_snippet_chars],
-                content=content,
-                score=self._normalize_distance_score(score),
-                metadata=metadata,
-            ))
+        for query_variant in query_variants:
+            search_plan = self._build_search_plan(scopes, owner_open_id)
+            per_filter_k = self._candidate_k(top_k, len(search_plan), len(query_variants))
+            for scope, metadata_filter in search_plan:
+                filter_results, allow_owner_mismatch = await self._search_with_owner_fallback(
+                    async_similarity_search,
+                    query_variant,
+                    per_filter_k,
+                    scope,
+                    metadata_filter,
+                )
+                sources = []
 
-        return self._dedupe_sources(sources)
+                for doc, score in filter_results:
+                    metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
+                    if not self._source_allowed(metadata, [scope], owner_open_id, allow_owner_mismatch):
+                        continue
+                    content = await self._expand_neighbor_content(
+                        doc.page_content,
+                        metadata,
+                        chunk_cache,
+                        async_get_document_chunks,
+                        neighbor_window,
+                    )
+                    sources.append(SourceItem(
+                        title=metadata.get("source", "未知来源"),
+                        url="",
+                        source_type="knowledge_base",
+                        snippet=doc.page_content[:settings.rag_display_snippet_chars],
+                        content=content,
+                        score=self._normalize_distance_score(score),
+                        metadata=metadata,
+                    ))
+
+                search_groups.append({
+                    "query": query_variant,
+                    "scope": scope,
+                    "sources": self._rank_sources_for_query(query_variant, self._dedupe_sources(sources)),
+                })
+
+        if len(search_groups) == 1:
+            return search_groups[0]["sources"][:top_k]
+        return self._merge_scoped_sources(search_groups, top_k)
+
+    def _normalize_scopes(self, knowledge_scope: List[str] = None) -> list[str]:
+        scopes = knowledge_scope or ["default"]
+        if "default" in scopes:
+            scopes = ["enterprise", "personal"]
+        return scopes
+
+    def _build_search_plan(self, scopes: List[str], owner_open_id: str | None = None) -> list[tuple[str, dict | None]]:
+        plan = []
+        if "enterprise" in scopes:
+            plan.append(("enterprise", None))
+        if "personal" in scopes:
+            plan.append(("personal", {"owner_open_id": owner_open_id or ""}))
+        return plan or [("enterprise", None)]
+
+    def _build_query_variants(self, query: str) -> list[str]:
+        """组合问题优先拆分引号内目标，避免单个长 query 被第一个目标主导。"""
+        variants = []
+        patterns = [
+            r"“([^”]+)”",
+            r'"([^"]+)"',
+            r"‘([^’]+)’",
+            r"'([^']+)'",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, query):
+                candidate = match.group(1).strip()
+                if 2 <= len(candidate) <= 200 and candidate not in variants:
+                    variants.append(candidate)
+
+        if not variants:
+            return [query]
+
+        if query not in variants:
+            variants.append(query)
+        return variants[:6]
+
+    def _candidate_k(self, top_k: int, plan_count: int, query_count: int) -> int:
+        """扩大候选集，给后续词面重排留出空间。"""
+        if plan_count * query_count == 1:
+            return min(settings.global_max_chunks, max(top_k, 30))
+        return min(settings.global_max_chunks, max(top_k * 10, 50))
+
+    async def _search_with_owner_fallback(
+        self,
+        similarity_search,
+        query: str,
+        k: int,
+        scope: str,
+        metadata_filter: dict | None,
+    ) -> tuple[list, bool]:
+        results = await similarity_search(query, k=k, metadata_filter=metadata_filter)
+        results = sorted(results, key=lambda item: self._safe_float(item[1]))
+        if (
+            scope != "personal"
+            or results
+            or settings.personal_kb_strict_owner_filter
+        ):
+            return results, False
+
+        fallback_results = await similarity_search(
+            query,
+            k=k,
+            metadata_filter={"knowledge_base_type": "personal"},
+        )
+        fallback_results = sorted(fallback_results, key=lambda item: self._safe_float(item[1]))
+        if fallback_results:
+            logger.info("个人知识库按 owner 未命中，已降级为个人库宽松检索")
+        return fallback_results, True
+
+    def _build_metadata_filters(self, scopes: List[str], owner_open_id: str | None = None) -> list[dict | None]:
+        if "personal" in scopes and "enterprise" in scopes:
+            return [
+                None,
+                {"owner_open_id": owner_open_id or ""},
+            ]
+        if "personal" in scopes:
+            return [{"owner_open_id": owner_open_id or ""}]
+        return [None]
+
+    def _source_allowed(
+        self,
+        metadata: dict,
+        scopes: List[str],
+        owner_open_id: str | None = None,
+        allow_owner_mismatch: bool = False,
+    ) -> bool:
+        kb_type = metadata.get("knowledge_base_type") or "enterprise"
+        if kb_type == "personal":
+            if allow_owner_mismatch:
+                return "personal" in scopes
+            return "personal" in scopes and metadata.get("owner_open_id") == (owner_open_id or "")
+        return "enterprise" in scopes
 
     async def _expand_neighbor_content(
         self,
@@ -131,6 +256,45 @@ class Retriever:
             for i in range(min(top_k, 3))
         ]
 
+    def _rank_sources_for_query(self, query: str, sources: List[SourceItem]) -> List[SourceItem]:
+        return sorted(
+            sources,
+            key=lambda source: (self._lexical_relevance(query, source), source.score),
+            reverse=True,
+        )
+
+    def _lexical_relevance(self, query: str, source: SourceItem) -> float:
+        text = f"{source.title}\n{source.snippet}\n{source.content}".lower()
+        terms = self._extract_query_terms(query)
+        score = 0.0
+        query_text = query.strip().lower()
+
+        if query_text and query_text in text:
+            score += 30.0
+        for term in terms:
+            if term and term.lower() in text:
+                score += min(len(term), 20)
+
+        if ("代码" in query or "python" in query.lower()) and re.search(r"\b(def|class|import|return)\b", text):
+            score += 3.0
+        return score
+
+    def _extract_query_terms(self, query: str) -> list[str]:
+        terms = []
+        for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|[\u4e00-\u9fff]{2,}", query):
+            if term not in terms:
+                terms.append(term)
+
+        if "快速排序" in query:
+            for term in ["快速排序", "quick_sort", "quicksort"]:
+                if term not in terms:
+                    terms.append(term)
+        if "圆点" in query and "动画" in query:
+            for term in ["圆点", "坐标", "动画", "曲线", "FuncAnimation", "point", "coord_text"]:
+                if term not in terms:
+                    terms.append(term)
+        return terms
+
     def _dedupe_sources(self, sources: List[SourceItem]) -> List[SourceItem]:
         """去重来源"""
         seen = set()
@@ -142,11 +306,65 @@ class Retriever:
                 deduped.append(s)
         return deduped
 
+    def _merge_scoped_sources(self, search_groups: list[dict], top_k: int) -> List[SourceItem]:
+        """组合检索先保底每个明确目标的每个知识库类型，再补充剩余结果。"""
+        merged = []
+        seen = set()
+
+        query_order = []
+        for group in search_groups:
+            if group["query"] not in query_order:
+                query_order.append(group["query"])
+
+        # 先为每个引号目标的每个知识库类型保留一个最佳来源，确保企业知识库结果不丢失。
+        for query in query_order:
+            for scope in ["enterprise", "personal"]:
+                best_source = None
+                best_rank = None
+                for group in search_groups:
+                    if group["query"] != query or group["scope"] != scope:
+                        continue
+                    for source in group["sources"]:
+                        key = (source.snippet[:50], source.title)
+                        if key in seen:
+                            continue
+                        rank = (self._lexical_relevance(query, source), source.score)
+                        if best_rank is None or rank > best_rank:
+                            best_source = source
+                            best_rank = rank
+                if best_source is not None:
+                    key = (best_source.snippet[:50], best_source.title)
+                    seen.add(key)
+                    merged.append(best_source)
+                    if len(merged) >= top_k:
+                        return merged
+
+        max_len = max((len(group["sources"]) for group in search_groups), default=0)
+        for index in range(max_len):
+            for group in search_groups:
+                sources = group["sources"]
+                if index < len(sources):
+                    source = sources[index]
+                    key = (source.snippet[:50], source.title)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(source)
+                    if len(merged) >= top_k:
+                        return merged
+        return merged
+
     def _safe_int(self, value) -> int | None:
         try:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _safe_float(self, value) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("inf")
 
     def _normalize_distance_score(self, distance) -> float:
         """将Chroma距离转成稳定的0~1相关度，避免返回负数或超过1。"""

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # 文档处理配置
     upload_dir: str = "./data/uploads"
+    personal_upload_dir: str = "./data/personal_uploads"
     chunk_size: int = 500
     chunk_overlap: int = 50
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -64,12 +65,18 @@ class Settings(BaseSettings):
     rag_global_neighbor_window: int = 4
     rag_context_max_chars: int = 8000
     rag_display_snippet_chars: int = 200
+    personal_kb_strict_owner_filter: bool = False
 
     # 飞书配置
     feishu_app_id: Optional[str] = None
     feishu_app_secret: Optional[str] = None
     feishu_verification_token: Optional[str] = None
     feishu_encrypt_key: Optional[str] = None
+    feishu_heartbeat_enabled: bool = True
+    feishu_heartbeat_initial_delay_seconds: int = 5
+    feishu_heartbeat_interval_seconds: int = 20
+    feishu_heartbeat_max_count: int = 12
+    feishu_pending_file_ttl_seconds: int = 30 * 60
 
     # 安全配置
     api_key: Optional[str] = None
@@ -100,6 +107,7 @@ settings = get_settings()
 
 def ensure_directories():
     os.makedirs(settings.upload_dir, exist_ok=True)
+    os.makedirs(settings.personal_upload_dir, exist_ok=True)
     os.makedirs(settings.chroma_persist_dir, exist_ok=True)
     if settings.log_file:
         os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)

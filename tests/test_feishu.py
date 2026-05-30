@@ -1,5 +1,6 @@
 """飞书 Channel Adapter 测试"""
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -9,7 +10,17 @@ from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.channels.feishu import FeishuAdapter
-from app.main import app
+from app.config import settings
+from app.main import (
+    app,
+    decide_feishu_knowledge_scope,
+    parse_feishu_card_action,
+    pending_feishu_files,
+    process_feishu_card_action,
+    process_feishu_file_event,
+    process_feishu_message,
+    send_feishu_processing_heartbeat,
+)
 
 
 def _encrypted_body(body: dict, encrypt_key: str) -> dict:
@@ -47,6 +58,40 @@ def _message_event(
                 "message_type": "text",
                 "content": f'{{"text": "{text}"}}',
             },
+        },
+    }
+
+
+def _file_event(
+    event_id: str = "file_event_1",
+    message_id: str = "om_file456",
+    file_name: str = "资料.pdf",
+    file_key: str = "file_key_1",
+) -> dict:
+    body = _message_event(event_id=event_id, message_id=message_id)
+    body["event"]["message"]["message_type"] = "file"
+    body["event"]["message"]["content"] = json.dumps(
+        {"file_key": file_key, "file_name": file_name},
+        ensure_ascii=False,
+    )
+    return body
+
+
+def _card_action(
+    pending_id: str,
+    action: str = "confirm_save_personal_file",
+    open_id: str = "ou_test123",
+) -> dict:
+    return {
+        "header": {
+            "event_type": "card.action.trigger",
+            "token": "expected_token",
+            "event_id": f"card_{pending_id}",
+        },
+        "event": {
+            "operator": {"operator_id": {"open_id": open_id}},
+            "context": {"open_chat_id": "oc_test789"},
+            "action": {"value": {"action": action, "pending_id": pending_id}},
         },
     }
 
@@ -218,6 +263,17 @@ class TestEventParsing:
         result = adapter.parse_event(body)
         assert result is None
 
+    def test_parse_file_message_event_v2(self, adapter):
+        result = adapter.parse_event(_file_event())
+        assert result is not None
+        assert result["event_kind"] == "file"
+        assert result["open_id"] == "ou_test123"
+        assert result["chat_id"] == "oc_test789"
+        assert result["message_id"] == "om_file456"
+        assert result["file_key"] == "file_key_1"
+        assert result["file_name"] == "资料.pdf"
+        assert result["dedupe_key"] == "file_event_1"
+
 
 class TestSessionId:
     """Session ID 生成测试"""
@@ -344,6 +400,301 @@ class TestSendMessage:
             assert result is False
 
 
+class TestFeishuHeartbeat:
+    """飞书长耗时处理心跳测试"""
+
+    @pytest.mark.asyncio
+    async def test_fast_processing_before_initial_delay_does_not_send_heartbeat(self):
+        with patch.object(settings, "feishu_heartbeat_enabled", True), \
+             patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 5), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 20), \
+             patch.object(settings, "feishu_heartbeat_max_count", 12), \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            mock_process.return_value.answer = "机器人回答"
+
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_test456",
+                "text": "你好",
+                "dedupe_key": "event_fast",
+            })
+
+        mock_send.assert_not_awaited()
+        mock_reply.assert_awaited_once_with("om_test456", "机器人回答")
+
+    @pytest.mark.asyncio
+    async def test_slow_processing_sends_heartbeat_then_final_reply(self):
+        async def slow_process(_request):
+            await asyncio.sleep(0.01)
+            response = MagicMock()
+            response.answer = "机器人回答"
+            return response
+
+        with patch.object(settings, "feishu_heartbeat_enabled", True), \
+             patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_max_count", 1), \
+             patch("app.main.orchestrator.process", new=AsyncMock(side_effect=slow_process)), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_test456",
+                "text": "你好",
+                "dedupe_key": "event_slow",
+            })
+
+        assert mock_send.await_args_list[0].args == ("oc_test789", "正在处理，请稍候...")
+        mock_reply.assert_awaited_once_with("om_test456", "机器人回答")
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_failure_does_not_block_final_reply(self):
+        async def slow_process(_request):
+            await asyncio.sleep(0.01)
+            response = MagicMock()
+            response.answer = "机器人回答"
+            return response
+
+        with patch.object(settings, "feishu_heartbeat_enabled", True), \
+             patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_max_count", 1), \
+             patch("app.main.orchestrator.process", new=AsyncMock(side_effect=slow_process)), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(side_effect=RuntimeError("send failed"))), \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_test456",
+                "text": "你好",
+                "dedupe_key": "event_heartbeat_failed",
+            })
+
+        mock_reply.assert_awaited_once_with("om_test456", "机器人回答")
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_error_still_replies_friendly_message_with_heartbeat_enabled(self):
+        async def slow_error(_request):
+            await asyncio.sleep(0.01)
+            raise RuntimeError("boom")
+
+        with patch.object(settings, "feishu_heartbeat_enabled", True), \
+             patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_max_count", 1), \
+             patch("app.main.orchestrator.process", new=AsyncMock(side_effect=slow_error)), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)), \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_test456",
+                "text": "你好",
+                "dedupe_key": "event_error_with_heartbeat",
+            })
+
+        mock_reply.assert_awaited_once_with("om_test456", "抱歉，处理您的问题时出现错误，请稍后重试。")
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_max_count_sends_long_processing_notice(self):
+        with patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 0), \
+             patch.object(settings, "feishu_heartbeat_max_count", 2), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+
+            await send_feishu_processing_heartbeat("oc_test789", "event_max")
+
+        assert mock_send.await_args_list[0].args == ("oc_test789", "正在处理，请稍候...")
+        assert mock_send.await_args_list[1].args == ("oc_test789", "还在检索和整理资料，请稍候...")
+        assert mock_send.await_args_list[2].args == ("oc_test789", "处理时间较长，我会继续尝试完成回答。")
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_uses_five_second_initial_delay_then_twenty_second_interval(self):
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        with patch.object(settings, "feishu_heartbeat_initial_delay_seconds", 5), \
+             patch.object(settings, "feishu_heartbeat_interval_seconds", 20), \
+             patch.object(settings, "feishu_heartbeat_max_count", 2), \
+             patch("app.main.asyncio.sleep", new=AsyncMock(side_effect=fake_sleep)), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)):
+
+            await send_feishu_processing_heartbeat("oc_test789", "event_delay")
+
+        assert sleep_calls == [5, 20]
+
+
+class TestFeishuPersonalKnowledgeFiles:
+    """飞书个人知识库文件保存流程测试"""
+
+    def setup_method(self):
+        pending_feishu_files.clear()
+
+    def teardown_method(self):
+        pending_feishu_files.clear()
+
+    def test_decide_feishu_knowledge_scope_defaults_to_enterprise(self):
+        assert decide_feishu_knowledge_scope("儒家大同思想是什么") == ["enterprise"]
+
+    def test_decide_feishu_knowledge_scope_personal(self):
+        assert decide_feishu_knowledge_scope("查一下我的知识库里的内容") == ["personal"]
+
+    def test_decide_feishu_knowledge_scope_combined(self):
+        assert decide_feishu_knowledge_scope("结合企业和个人知识库回答") == ["enterprise", "personal"]
+
+    @pytest.mark.asyncio
+    async def test_file_event_sends_confirm_card_without_ingest(self):
+        event_data = FeishuAdapter().parse_event(_file_event(file_name="资料.docx"))
+
+        with patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock(return_value=True)) as mock_card, \
+             patch("app.main.ingest_file") as mock_ingest, \
+             patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock()) as mock_download:
+            await process_feishu_file_event(event_data)
+
+        assert len(pending_feishu_files) == 1
+        pending = next(iter(pending_feishu_files.values()))
+        assert pending["file_name"] == "资料.docx"
+        assert pending["file_key"] == "file_key_1"
+        mock_card.assert_awaited_once()
+        mock_ingest.assert_not_called()
+        mock_download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_file_event_rejects_unsupported_extension(self):
+        event_data = FeishuAdapter().parse_event(_file_event(file_name="宏文件.docm"))
+
+        with patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply, \
+             patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock()) as mock_card:
+            await process_feishu_file_event(event_data)
+
+        mock_reply.assert_awaited_once()
+        assert "仅支持" in mock_reply.await_args.args[1]
+        mock_card.assert_not_awaited()
+        assert pending_feishu_files == {}
+
+    @pytest.mark.asyncio
+    async def test_confirm_card_downloads_and_ingests_personal_file(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "message_id": "om_file456",
+            "file_key": "file_key_1",
+            "file_name": "资料.txt",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock(return_value=b"hello")) as mock_download, \
+             patch("app.main.save_uploaded_file", return_value="D:/LLM/Unified_API_service/data/personal_uploads/stored.txt") as mock_save, \
+             patch("app.main.ingest_file") as mock_ingest, \
+             patch("app.main.orchestrator.retriever.refresh") as mock_refresh, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            mock_ingest.return_value = {"document_id": "doc1", "filename": "资料.txt", "chunks": 2}
+
+            await process_feishu_card_action({
+                "action": "confirm_save_personal_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_download.assert_awaited_once_with("om_file456", "file_key_1")
+        mock_save.assert_called_once()
+        mock_ingest.assert_called_once()
+        assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
+        assert mock_ingest.call_args.kwargs["owner_open_id"] == "ou_test123"
+        assert mock_ingest.call_args.kwargs["chat_id"] == "oc_test789"
+        assert mock_ingest.call_args.kwargs["channel"] == "feishu"
+        mock_refresh.assert_called_once()
+        assert "已保存到个人知识库" in mock_send.await_args.args[1]
+        assert "pending_1" not in pending_feishu_files
+
+    @pytest.mark.asyncio
+    async def test_cancel_card_does_not_download_or_ingest(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "file_name": "资料.pdf",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock()) as mock_download, \
+             patch("app.main.ingest_file") as mock_ingest, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "cancel_save_personal_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_test123",
+            })
+
+        mock_download.assert_not_awaited()
+        mock_ingest.assert_not_called()
+        assert "已取消保存" in mock_send.await_args.args[1]
+        assert "pending_1" not in pending_feishu_files
+
+    @pytest.mark.asyncio
+    async def test_wrong_user_cannot_consume_pending_confirmation(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_owner",
+            "chat_id": "oc_test789",
+            "file_name": "资料.pdf",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "confirm_save_personal_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_other",
+            })
+
+        assert "pending_1" in pending_feishu_files
+        assert "只有上传文件的用户" in mock_send.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_expired_pending_is_removed_and_not_downloaded(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "file_name": "资料.pdf",
+            "expires_at": 0,
+        }
+
+        with patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock()) as mock_download, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "confirm_save_personal_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_download.assert_not_awaited()
+        assert "文件确认已过期" in mock_send.await_args.args[1]
+        assert "pending_1" not in pending_feishu_files
+
+    def test_parse_card_action(self):
+        action = parse_feishu_card_action(_card_action("pending_1"))
+        assert action == {
+            "action": "confirm_save_personal_file",
+            "pending_id": "pending_1",
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+        }
+
+
 class TestFeishuEndpoint:
     """飞书回调入口集成测试"""
 
@@ -454,3 +805,38 @@ class TestFeishuEndpoint:
 
         assert response.status_code == 200
         assert response.json() == {"code": 0}
+
+    def test_file_message_endpoint_sends_card_not_orchestrator(self, client):
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock(return_value=True)) as mock_card, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process:
+            mock_settings.feishu_verification_token = "expected_token"
+            response = client.post("/channels/feishu/events", json=_file_event(event_id="event_file_endpoint"))
+
+        assert response.status_code == 200
+        assert response.json() == {"code": 0}
+        mock_card.assert_awaited_once()
+        mock_process.assert_not_awaited()
+        pending_feishu_files.clear()
+
+    def test_card_action_endpoint_acknowledges_and_schedules_processing(self, client):
+        pending_feishu_files["pending_endpoint"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "file_name": "资料.txt",
+            "expires_at": 9999999999,
+        }
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            mock_settings.feishu_verification_token = "expected_token"
+            response = client.post(
+                "/channels/feishu/events",
+                json=_card_action("pending_endpoint", action="cancel_save_personal_file"),
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["code"] == 0
+        assert data["toast"]["content"] == "已收到操作，正在处理。"
+        assert "已取消保存" in mock_send.await_args.args[1]
+        assert "pending_endpoint" not in pending_feishu_files
