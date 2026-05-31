@@ -67,6 +67,19 @@ class Settings(BaseSettings):
     rag_display_snippet_chars: int = 200
     personal_kb_strict_owner_filter: bool = True
 
+    # OpenSearch 检索配置
+    opensearch_enabled: bool = False
+    opensearch_url: str = "http://localhost:9201"
+    opensearch_index_name: str = "unified_kb_chunks"
+    opensearch_username: Optional[str] = None
+    opensearch_password: Optional[str] = None
+    opensearch_timeout_seconds: int = 3
+    opensearch_lexical_top_k: int = 80
+    opensearch_rrf_k: int = 60
+    opensearch_use_ssl: bool = False
+    opensearch_verify_certs: bool = False
+    opensearch_use_ik_analyzer: bool = True
+
     # 飞书配置
     feishu_app_id: Optional[str] = None
     feishu_app_secret: Optional[str] = None

@@ -8,6 +8,7 @@ from app.retrieval.vector_store import (
     expand_search_terms,
     normalize_search_text,
 )
+from app.retrieval.opensearch_store import build_index_body, _metadata_filters
 from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
@@ -155,6 +156,25 @@ def test_merge_search_results_keeps_better_duplicate_score():
     assert results == [(doc, -20)]
 
 
+def test_opensearch_index_body_uses_synonym_graph():
+    body = build_index_body(use_ik_analyzer=False)
+
+    filters = body["settings"]["analysis"]["filter"]
+    content_mapping = body["mappings"]["properties"]["content"]
+
+    assert filters["rag_synonyms"]["type"] == "synonym_graph"
+    assert any("大模型" in synonym for synonym in filters["rag_synonyms"]["synonyms"])
+    assert content_mapping["analyzer"] == "rag_index_analyzer"
+    assert content_mapping["search_analyzer"] == "rag_search_analyzer"
+
+
+def test_opensearch_personal_filter_requires_owner_and_personal_scope():
+    filters = _metadata_filters({"owner_open_id": "ou_owner"})
+
+    assert {"term": {"knowledge_base_type": "personal"}} in filters
+    assert {"term": {"owner_open_id": "ou_owner"}} in filters
+
+
 def test_keyword_search_matches_llm_training_without_particle():
     class FakeVectorStore:
         def get(self, include=None, **kwargs):
@@ -300,6 +320,23 @@ def test_ingest_file_personal_metadata(mock_load, mock_split, mock_add):
     assert chunk.metadata["owner_open_id"] == "ou_test123"
     assert chunk.metadata["chat_id"] == "oc_test789"
     assert chunk.metadata["channel"] == "feishu"
+
+
+@patch("app.retrieval.opensearch_store.index_documents")
+@patch("app.retrieval.vector_store.add_documents")
+@patch("app.retrieval.ingest.split_documents")
+@patch("app.retrieval.ingest.load_document")
+def test_ingest_file_updates_opensearch_index(mock_load, mock_split, mock_add, mock_index):
+    mock_load.return_value = [MagicMock()]
+    chunk = MagicMock(metadata={})
+    mock_split.return_value = [chunk]
+    mock_add.return_value = 1
+    mock_index.return_value = 1
+
+    result = ingest_file("/tmp/stored.txt", original_filename="stored.txt")
+
+    assert result["chunks"] == 1
+    mock_index.assert_called_once_with([chunk])
 
 
 @pytest.mark.asyncio
@@ -677,6 +714,40 @@ async def test_combined_scope_merges_enterprise_and_current_owner_personal():
     assert "enterprise.txt" in titles
     assert "mine.txt" in titles
     assert "other.txt" not in titles
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_merges_opensearch_lexical_results():
+    retriever = Retriever()
+    lexical_doc = MagicMock(
+        page_content="大语言模型的训练通常分为预训练和微调两个阶段",
+        metadata={
+            "source": "llm.txt",
+            "knowledge_base_type": "enterprise",
+            "document_id": "doc_os",
+            "chunk_index": 0,
+        },
+    )
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "app.retrieval.opensearch_store.async_opensearch_search",
+        new=AsyncMock(return_value=[(lexical_doc, 0.01)]),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "大模型训练",
+            top_k=1,
+            knowledge_scope=["enterprise"],
+        )
+
+    assert len(results) == 1
+    assert results[0].title == "llm.txt"
+    assert "大语言模型的训练" in results[0].snippet
 
 
 @pytest.mark.asyncio

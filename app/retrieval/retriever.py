@@ -57,6 +57,7 @@ class Retriever:
         owner_open_id: str | None = None,
     ) -> List[SourceItem]:
         """Chroma检索"""
+        from app.retrieval.opensearch_store import async_opensearch_search
         from app.retrieval.vector_store import async_get_document_chunks, async_keyword_search, async_similarity_search
 
         scopes = self._normalize_scopes(knowledge_scope)
@@ -97,7 +98,13 @@ class Retriever:
                         keyword_metadata_filter,
                     )
                 allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
-                filter_results = self._merge_search_results(filter_results, keyword_results)
+                opensearch_results = await async_opensearch_search(
+                    ranking_query,
+                    query_terms,
+                    k=max(per_filter_k, settings.opensearch_lexical_top_k),
+                    metadata_filter=keyword_metadata_filter,
+                )
+                filter_results = self._merge_hybrid_results(filter_results, keyword_results, opensearch_results)
                 sources = []
 
                 for doc, score in filter_results:
@@ -238,6 +245,41 @@ class Retriever:
             positions[key] = len(merged)
             merged.append((doc, score))
         return merged
+
+    def _merge_hybrid_results(self, *ranked_result_lists: list) -> list:
+        combined = {}
+        rrf_k = max(self._safe_int(settings.opensearch_rrf_k) or 60, 1)
+        for result_list in ranked_result_lists:
+            ordered_results = sorted(result_list or [], key=lambda item: self._safe_float(item[1]))
+            for rank, (doc, score) in enumerate(ordered_results, start=1):
+                metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
+                key = self._result_key(doc, metadata)
+                entry = combined.setdefault(key, {
+                    "doc": doc,
+                    "best_distance": self._safe_float(score),
+                    "rrf_score": 0.0,
+                })
+                if self._safe_float(score) < entry["best_distance"]:
+                    entry["doc"] = doc
+                    entry["best_distance"] = self._safe_float(score)
+                entry["rrf_score"] += 1.0 / (rrf_k + rank)
+
+        merged = sorted(
+            combined.values(),
+            key=lambda item: (-item["rrf_score"], item["best_distance"]),
+        )
+        return [
+            (item["doc"], max(0.0, 1.0 - min(item["rrf_score"] * rrf_k, 1.0)))
+            for item in merged
+        ]
+
+    def _result_key(self, doc, metadata: dict) -> tuple:
+        return (
+            metadata.get("document_id"),
+            metadata.get("chunk_index"),
+            metadata.get("source"),
+            doc.page_content[:80],
+        )
 
     def _build_metadata_filters(self, scopes: List[str], owner_open_id: str | None = None) -> list[dict | None]:
         if "personal" in scopes and "enterprise" in scopes:

@@ -32,6 +32,7 @@ chromadb>=0.4.22
 
 # BM25 检索（后续阶段使用）
 rank-bm25>=0.2.2
+opensearch-py>=2.4.0
 
 # 文档加载（后续阶段使用）
 pypdf>=4.0.0

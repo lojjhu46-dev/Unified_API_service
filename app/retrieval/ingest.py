@@ -87,6 +87,7 @@ def ingest_file(
 ) -> dict:
     """摄取文件到向量存储"""
     from app.retrieval.vector_store import add_documents
+    from app.retrieval.opensearch_store import index_documents
 
     document_id = str(uuid.uuid4())[:12]
     stored_filename = os.path.basename(file_path)
@@ -109,6 +110,9 @@ def ingest_file(
             "channel": channel,
         }
     chunk_count = add_documents(chunks)
+    opensearch_count = index_documents(chunks)
+    if opensearch_count:
+        logger.info(f"OpenSearch index updated: {opensearch_count}个切块")
 
     logger.info(f"文档摄取完成: {safe_original_filename}, {chunk_count}个切块")
 
