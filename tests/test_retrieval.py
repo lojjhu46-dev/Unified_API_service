@@ -8,7 +8,7 @@ from app.retrieval.vector_store import (
     expand_search_terms,
     normalize_search_text,
 )
-from app.retrieval.opensearch_store import build_index_body, _metadata_filters
+from app.retrieval.opensearch_store import OpenSearchSearchResult, build_index_body, _metadata_filters
 from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
@@ -173,6 +173,83 @@ def test_opensearch_personal_filter_requires_owner_and_personal_scope():
 
     assert {"term": {"knowledge_base_type": "personal"}} in filters
     assert {"term": {"owner_open_id": "ou_owner"}} in filters
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_skips_local_fuzzy_when_opensearch_succeeds():
+    from langchain_core.documents import Document
+
+    retriever = Retriever()
+    vector_doc = Document(
+        page_content="向量命中内容",
+        metadata={"source": "vector.txt", "knowledge_base_type": "enterprise", "document_id": "v1", "chunk_index": 0},
+    )
+    os_doc = Document(
+        page_content="OpenSearch 命中内容",
+        metadata={"source": "os.txt", "knowledge_base_type": "enterprise", "document_id": "o1", "chunk_index": 0},
+    )
+
+    with patch("app.retrieval.vector_store.async_similarity_search", new=AsyncMock(return_value=[(vector_doc, 0.2)])), \
+         patch("app.retrieval.vector_store.async_get_document_chunks", new=AsyncMock(return_value=[])), \
+         patch("app.retrieval.vector_store.async_keyword_search", new=AsyncMock(return_value=[])) as mock_keyword, \
+         patch(
+             "app.retrieval.opensearch_store.async_opensearch_search_with_status",
+             new=AsyncMock(return_value=OpenSearchSearchResult(results=[(os_doc, 0.1)], available=True, succeeded=True)),
+         ):
+        results = await retriever._chroma_search("人工智能特点", top_k=5, knowledge_scope=["enterprise"])
+
+    assert results
+    mock_keyword.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_skips_local_fuzzy_when_opensearch_succeeds_with_empty_results():
+    from langchain_core.documents import Document
+
+    retriever = Retriever()
+    vector_doc = Document(
+        page_content="向量命中内容",
+        metadata={"source": "vector.txt", "knowledge_base_type": "enterprise", "document_id": "v1", "chunk_index": 0},
+    )
+
+    with patch("app.retrieval.vector_store.async_similarity_search", new=AsyncMock(return_value=[(vector_doc, 0.2)])), \
+         patch("app.retrieval.vector_store.async_get_document_chunks", new=AsyncMock(return_value=[])), \
+         patch("app.retrieval.vector_store.async_keyword_search", new=AsyncMock(return_value=[])) as mock_keyword, \
+         patch(
+             "app.retrieval.opensearch_store.async_opensearch_search_with_status",
+             new=AsyncMock(return_value=OpenSearchSearchResult(results=[], available=True, succeeded=True)),
+         ):
+        results = await retriever._chroma_search("人工智能特点", top_k=5, knowledge_scope=["enterprise"])
+
+    assert results
+    mock_keyword.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chroma_search_uses_local_fuzzy_when_opensearch_unavailable():
+    from langchain_core.documents import Document
+
+    retriever = Retriever()
+    vector_doc = Document(
+        page_content="向量命中内容",
+        metadata={"source": "vector.txt", "knowledge_base_type": "enterprise", "document_id": "v1", "chunk_index": 0},
+    )
+    keyword_doc = Document(
+        page_content="本地 fuzzy 命中内容",
+        metadata={"source": "keyword.txt", "knowledge_base_type": "enterprise", "document_id": "k1", "chunk_index": 0},
+    )
+
+    with patch("app.retrieval.vector_store.async_similarity_search", new=AsyncMock(return_value=[(vector_doc, 0.2)])), \
+         patch("app.retrieval.vector_store.async_get_document_chunks", new=AsyncMock(return_value=[])), \
+         patch("app.retrieval.vector_store.async_keyword_search", new=AsyncMock(return_value=[(keyword_doc, -1.0)])) as mock_keyword, \
+         patch(
+             "app.retrieval.opensearch_store.async_opensearch_search_with_status",
+             new=AsyncMock(return_value=OpenSearchSearchResult(results=[], available=False, succeeded=False, error="unavailable")),
+         ):
+        results = await retriever._chroma_search("人工智能特点", top_k=5, knowledge_scope=["enterprise"])
+
+    assert results
+    mock_keyword.assert_awaited_once()
 
 
 def test_keyword_search_matches_llm_training_without_particle():
@@ -733,8 +810,8 @@ async def test_chroma_search_merges_opensearch_lexical_results():
         "app.retrieval.vector_store.async_similarity_search",
         new=AsyncMock(return_value=[]),
     ), patch(
-        "app.retrieval.opensearch_store.async_opensearch_search",
-        new=AsyncMock(return_value=[(lexical_doc, 0.01)]),
+        "app.retrieval.opensearch_store.async_opensearch_search_with_status",
+        new=AsyncMock(return_value=OpenSearchSearchResult(results=[(lexical_doc, 0.01)], available=True, succeeded=True)),
     ), patch(
         "app.retrieval.vector_store.async_get_document_chunks",
         new=AsyncMock(return_value=[]),

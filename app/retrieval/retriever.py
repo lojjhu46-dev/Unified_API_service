@@ -57,7 +57,7 @@ class Retriever:
         owner_open_id: str | None = None,
     ) -> List[SourceItem]:
         """Chroma检索"""
-        from app.retrieval.opensearch_store import async_opensearch_search
+        from app.retrieval.opensearch_store import async_opensearch_search_with_status
         from app.retrieval.vector_store import async_get_document_chunks, async_keyword_search, async_similarity_search
 
         scopes = self._normalize_scopes(knowledge_scope)
@@ -82,28 +82,50 @@ class Retriever:
                     scope,
                     metadata_filter,
                 )
-                if scope == "personal" and filter_results and metadata_filter:
-                    keyword_results = await async_keyword_search(
-                        query_terms,
-                        k=per_filter_k,
-                        metadata_filter=keyword_metadata_filter,
-                    )
-                    keyword_allow_owner_mismatch = False
-                else:
-                    keyword_results, keyword_allow_owner_mismatch = await self._search_with_owner_fallback(
-                        async_keyword_search,
-                        query_terms,
-                        per_filter_k,
-                        scope,
-                        keyword_metadata_filter,
-                    )
-                allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
-                opensearch_results = await async_opensearch_search(
+                opensearch_status = await async_opensearch_search_with_status(
                     ranking_query,
                     query_terms,
                     k=max(per_filter_k, settings.opensearch_lexical_top_k),
                     metadata_filter=keyword_metadata_filter,
                 )
+                opensearch_results = opensearch_status.results
+                keyword_results = []
+                keyword_allow_owner_mismatch = False
+                if opensearch_status.succeeded:
+                    logger.info(
+                        "OpenSearch keyword retrieval succeeded; local fuzzy skipped",
+                        extra={
+                            "keyword_backend": "opensearch",
+                            "local_fuzzy_skipped": True,
+                            "opensearch_result_count": len(opensearch_results),
+                        },
+                    )
+                else:
+                    fallback_reason = "opensearch_unavailable" if not opensearch_status.available else "opensearch_error"
+                    logger.info(
+                        "OpenSearch keyword retrieval unavailable; using local fuzzy fallback",
+                        extra={
+                            "keyword_backend": "local_fuzzy",
+                            "local_fuzzy_skipped": False,
+                            "fallback_reason": fallback_reason,
+                            "opensearch_error": opensearch_status.error,
+                        },
+                    )
+                    if scope == "personal" and filter_results and metadata_filter:
+                        keyword_results = await async_keyword_search(
+                            query_terms,
+                            k=per_filter_k,
+                            metadata_filter=keyword_metadata_filter,
+                        )
+                    else:
+                        keyword_results, keyword_allow_owner_mismatch = await self._search_with_owner_fallback(
+                            async_keyword_search,
+                            query_terms,
+                            per_filter_k,
+                            scope,
+                            keyword_metadata_filter,
+                        )
+                    allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
                 filter_results = self._merge_hybrid_results(filter_results, keyword_results, opensearch_results)
                 sources = []
 

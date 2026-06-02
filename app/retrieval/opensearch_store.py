@@ -1,6 +1,7 @@
 """OpenSearch keyword index adapter."""
 
 import asyncio
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -8,6 +9,14 @@ from app.config import settings
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class OpenSearchSearchResult:
+    results: list
+    available: bool
+    succeeded: bool
+    error: str | None = None
 
 
 def build_index_body(use_ik_analyzer: bool | None = None) -> dict:
@@ -166,7 +175,17 @@ async def async_opensearch_search(
     k: int = 5,
     metadata_filter: dict | None = None,
 ) -> list:
-    return await asyncio.to_thread(_sync_opensearch_search, query, terms, k, metadata_filter)
+    status = await async_opensearch_search_with_status(query, terms, k, metadata_filter)
+    return status.results
+
+
+async def async_opensearch_search_with_status(
+    query: str,
+    terms: list[str],
+    k: int = 5,
+    metadata_filter: dict | None = None,
+) -> OpenSearchSearchResult:
+    return await asyncio.to_thread(_sync_opensearch_search_with_status, query, terms, k, metadata_filter)
 
 
 def _sync_opensearch_search(
@@ -175,9 +194,23 @@ def _sync_opensearch_search(
     k: int,
     metadata_filter: dict | None = None,
 ) -> list:
+    return _sync_opensearch_search_with_status(query, terms, k, metadata_filter).results
+
+
+def _sync_opensearch_search_with_status(
+    query: str,
+    terms: list[str],
+    k: int,
+    metadata_filter: dict | None = None,
+) -> OpenSearchSearchResult:
     client = get_opensearch_client()
     if client is None:
-        return []
+        return OpenSearchSearchResult(
+            results=[],
+            available=False,
+            succeeded=False,
+            error="opensearch_client_unavailable",
+        )
     try:
         from langchain_core.documents import Document
 
@@ -195,10 +228,19 @@ def _sync_opensearch_search(
             content = source.get("content") or ""
             metadata = _source_metadata(source)
             results.append((Document(page_content=content, metadata=metadata), _score_to_distance(hit.get("_score"))))
-        return results
+        return OpenSearchSearchResult(
+            results=results,
+            available=True,
+            succeeded=True,
+        )
     except Exception as e:
         logger.warning(f"OpenSearch search failed: {e}")
-        return []
+        return OpenSearchSearchResult(
+            results=[],
+            available=True,
+            succeeded=False,
+            error=str(e),
+        )
 
 
 def _build_query(query: str, terms: list[str], metadata_filter: dict | None) -> dict:
