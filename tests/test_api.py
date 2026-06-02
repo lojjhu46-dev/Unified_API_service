@@ -3,24 +3,71 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
-from app.main import app
+from app.config import settings
+from app.channels.event_dedupe import InMemoryEventDedupeStore
+from app.channels.pending_store import InMemoryPendingFileStore
+from app.channels.token_cache import InMemoryFeishuTokenCache
+from app.main import app, feishu_adapter
+from app.memory.store import InMemoryStore
+from app.orchestrator import orchestrator as app_orchestrator
+from app.security import rate_limit as rate_limit_module
+from app.security.rate_limit import InMemoryRateLimitBackend, RateLimiter
 from app.llm.gateway import LLMGatewayError
-from app.schemas import SourceItem, ToolTrace
+from app.schemas import AgentResponse, SourceItem, ToolTrace
 from app.tools.registry import ToolExecution
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    with patch.object(settings, "api_key", None), patch.object(settings, "llm_provider", "mock"):
+        yield TestClient(app)
 
 
-def test_health(client):
-    response = client.get("/health")
+def _auth_response() -> AgentResponse:
+    return AgentResponse(
+        request_id="req_auth",
+        session_id="session_auth",
+        route="direct",
+        answer="ok",
+    )
+
+
+@pytest.fixture
+def isolated_rate_limiter(monkeypatch):
+    limiter = RateLimiter(InMemoryRateLimitBackend())
+    monkeypatch.setattr(rate_limit_module, "rate_limiter", limiter)
+    with patch.object(settings, "rate_limit_per_minute", 1), patch.object(
+        settings, "rate_limit_per_hour", 100
+    ):
+        yield limiter
+
+
+def test_health(client, monkeypatch):
+    import app.main as main_module
+
+    original_store = feishu_adapter._event_dedupe_store
+    original_token_cache = feishu_adapter._tenant_token_cache
+    feishu_adapter._event_dedupe_store = InMemoryEventDedupeStore(feishu_adapter._processed_events)
+    feishu_adapter._tenant_token_cache = InMemoryFeishuTokenCache()
+    monkeypatch.setattr(main_module, "pending_file_store", InMemoryPendingFileStore())
+    monkeypatch.setattr(main_module.orchestrator, "memory", InMemoryStore())
+    monkeypatch.setattr(rate_limit_module, "rate_limiter", RateLimiter(InMemoryRateLimitBackend()))
+    try:
+        response = client.get("/health")
+    finally:
+        feishu_adapter._event_dedupe_store = original_store
+        feishu_adapter._tenant_token_cache = original_token_cache
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
     assert "version" in data
     assert "timestamp" in data
+    assert data["components"]["memory_store"]["backend"] == "memory"
+    assert data["components"]["feishu_pending_store"]["backend"] == "memory"
+    assert data["components"]["feishu_event_dedupe"]["backend"] == "memory"
+    assert data["components"]["rate_limiter"]["backend"] == "memory"
+    assert data["components"]["feishu_token_cache"]["backend"] == "memory"
+    assert data["components"]["feishu_event_dedupe"]["ttl_seconds"] == 24 * 60 * 60
 
 
 def test_root(client):
@@ -30,6 +77,17 @@ def test_root(client):
     assert "service" in data
     assert "version" in data
     assert data["docs"] == "/docs"
+
+
+def test_cors_defaults_are_not_wildcard_with_credentials():
+    cors_middleware = next(
+        middleware for middleware in app.user_middleware if middleware.cls.__name__ == "CORSMiddleware"
+    )
+
+    assert not (
+        cors_middleware.kwargs["allow_origins"] == ["*"]
+        and cors_middleware.kwargs["allow_credentials"] is True
+    )
 
 
 def test_ask_direct(client):
@@ -54,7 +112,11 @@ def test_ask_mixed_greeting_routes_to_rag(client):
         "user_id": "test_user",
         "question": "你好，什么是机器学习？",
     }
-    response = client.post("/ask", json=payload)
+    with patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="基于文档的回答"),
+    ):
+        response = client.post("/ask", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["route"] == "rag"
@@ -65,7 +127,11 @@ def test_ask_rag(client):
         "user_id": "test_user",
         "question": "什么是机器学习",
     }
-    response = client.post("/ask", json=payload)
+    with patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="基于文档的回答"),
+    ):
+        response = client.post("/ask", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert "request_id" in data
@@ -82,10 +148,25 @@ def test_ask_with_session(client):
         "session_id": "custom_session_123",
         "question": "测试问题",
     }
-    response = client.post("/ask", json=payload)
+    with patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="基于文档的回答"),
+    ):
+        response = client.post("/ask", json=payload)
     assert response.status_code == 200
     data = response.json()
     assert data["session_id"] == "custom_session_123"
+
+
+def test_ask_rag_rejects_mock_llm_for_document_answer(client):
+    payload = {
+        "user_id": "test_user",
+        "question": "从知识库找排序算法代码",
+    }
+    response = client.post("/ask", json=payload)
+
+    assert response.status_code == 503
+    assert "mock LLM" in response.json()["detail"]
 
 
 def test_ask_validation_error(client):
@@ -112,6 +193,146 @@ def test_ask_missing_user_id(client):
     }
     response = client.post("/ask", json=payload)
     assert response.status_code == 422
+
+
+def test_ask_requires_api_key_when_configured(client):
+    payload = {
+        "user_id": "test_user",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post("/ask", json=payload)
+
+    assert response.status_code == 401
+    mock_process.assert_not_called()
+
+
+def test_ask_rejects_invalid_api_key(client):
+    payload = {
+        "user_id": "test_user",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post(
+            "/ask",
+            json=payload,
+            headers={"Authorization": "Bearer wrong-key", "X-User-Id": "real_user"},
+        )
+
+    assert response.status_code == 401
+    mock_process.assert_not_called()
+
+
+def test_ask_requires_trusted_user_identity_when_api_key_configured(client):
+    payload = {
+        "user_id": "test_user",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post(
+            "/ask",
+            json=payload,
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 401
+    mock_process.assert_not_called()
+
+
+def test_ask_accepts_valid_api_key_and_trusted_identity(client):
+    payload = {
+        "user_id": "body_user",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post(
+            "/ask",
+            json=payload,
+            headers={"Authorization": "Bearer test-key", "X-User-Id": "real_user"},
+        )
+
+    assert response.status_code == 200
+    trusted_request = mock_process.call_args.args[0]
+    assert trusted_request.user_id == "real_user"
+    assert trusted_request.channel == "api"
+
+
+def test_ask_overrides_forged_body_identity_with_trusted_headers(client):
+    payload = {
+        "channel": "feishu",
+        "user_id": "victim",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post(
+            "/ask",
+            json=payload,
+            headers={
+                "X-API-Key": "test-key",
+                "X-User-Id": "real_user",
+                "X-Channel": "api",
+            },
+        )
+
+    assert response.status_code == 200
+    trusted_request = mock_process.call_args.args[0]
+    assert trusted_request.user_id == "real_user"
+    assert trusted_request.channel == "api"
+
+
+def test_ask_rejects_invalid_trusted_channel(client):
+    payload = {
+        "user_id": "test_user",
+        "question": "你好",
+    }
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        response = client.post(
+            "/ask",
+            json=payload,
+            headers={
+                "Authorization": "Bearer test-key",
+                "X-User-Id": "real_user",
+                "X-Channel": "admin",
+            },
+        )
+
+    assert response.status_code == 400
+    mock_process.assert_not_called()
+
+
+def test_ask_rate_limit_returns_429(client, isolated_rate_limiter):
+    payload = {
+        "user_id": "test_user",
+        "question": "你好",
+    }
+    with patch(
+        "app.main.orchestrator.process",
+        new=AsyncMock(return_value=_auth_response()),
+    ) as mock_process:
+        first = client.post("/ask", json=payload)
+        second = client.post("/ask", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert mock_process.await_count == 1
 
 
 def test_ask_llm_gateway_error_returns_clear_response(client):
@@ -306,6 +527,129 @@ def test_upload_xlsx_to_personal(client):
     assert mock_ingest.call_args.kwargs["channel"] == "api"
 
 
+def test_upload_requires_api_key_when_configured(client):
+    with patch.object(settings, "api_key", "test-key"), patch("app.main.ingest_file") as mock_ingest:
+        response = client.post(
+            "/documents/upload",
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 401
+    mock_ingest.assert_not_called()
+
+
+def test_upload_rejects_invalid_api_key(client):
+    with patch.object(settings, "api_key", "test-key"), patch("app.main.ingest_file") as mock_ingest:
+        response = client.post(
+            "/documents/upload",
+            headers={"Authorization": "Bearer wrong-key", "X-User-Id": "real_user"},
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 401
+    mock_ingest.assert_not_called()
+
+
+def test_upload_requires_trusted_user_identity_when_api_key_configured(client):
+    with patch.object(settings, "api_key", "test-key"), patch("app.main.ingest_file") as mock_ingest:
+        response = client.post(
+            "/documents/upload",
+            headers={"Authorization": "Bearer test-key"},
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 401
+    mock_ingest.assert_not_called()
+
+
+def test_upload_enterprise_accepts_valid_api_key(client):
+    with patch.object(settings, "api_key", "test-key"), patch(
+        "app.main.ingest_file"
+    ) as mock_ingest, patch("app.main.orchestrator.retriever.refresh") as mock_refresh:
+        mock_ingest.return_value = {
+            "document_id": "doc_enterprise",
+            "filename": "test.txt",
+            "chunks": 1,
+        }
+        response = client.post(
+            "/documents/upload",
+            headers={"Authorization": "Bearer test-key", "X-User-Id": "real_user"},
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 200
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "enterprise"
+    assert mock_ingest.call_args.kwargs["owner_open_id"] is None
+    assert mock_ingest.call_args.kwargs["channel"] == "api"
+    mock_refresh.assert_called_once()
+
+
+def test_upload_personal_uses_trusted_header_owner_when_api_key_configured(client):
+    with patch.object(settings, "api_key", "test-key"), patch("app.main.ingest_file") as mock_ingest:
+        mock_ingest.return_value = {
+            "document_id": "doc_personal",
+            "filename": "test.xlsx",
+            "chunks": 1,
+        }
+        response = client.post(
+            "/documents/upload",
+            headers={"X-API-Key": "test-key", "X-User-Id": "real_user"},
+            data={"knowledge_base_type": "personal", "owner_open_id": "victim"},
+            files={
+                "file": (
+                    "test.xlsx",
+                    b"xlsx content",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
+    assert mock_ingest.call_args.kwargs["owner_open_id"] == "real_user"
+    assert mock_ingest.call_args.kwargs["channel"] == "api"
+
+
+def test_upload_personal_does_not_require_form_owner_when_api_key_configured(client):
+    with patch.object(settings, "api_key", "test-key"), patch("app.main.ingest_file") as mock_ingest:
+        mock_ingest.return_value = {
+            "document_id": "doc_personal",
+            "filename": "test.txt",
+            "chunks": 1,
+        }
+        response = client.post(
+            "/documents/upload",
+            headers={"Authorization": "Bearer test-key", "X-User-Id": "real_user"},
+            data={"knowledge_base_type": "personal"},
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert response.status_code == 200
+    assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
+    assert mock_ingest.call_args.kwargs["owner_open_id"] == "real_user"
+
+
+def test_upload_rate_limit_returns_429_before_ingest(client, isolated_rate_limiter):
+    with patch("app.main.ingest_file") as mock_ingest:
+        mock_ingest.return_value = {
+            "document_id": "doc1",
+            "filename": "test.txt",
+            "chunks": 1,
+        }
+        first = client.post(
+            "/documents/upload",
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+        second = client.post(
+            "/documents/upload",
+            files={"file": ("test.txt", b"text content", "text/plain")},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    mock_ingest.assert_called_once()
+
+
 def test_upload_invalid_extension(client):
     response = client.post(
         "/documents/upload",
@@ -413,6 +757,255 @@ def test_ask_with_standalone_question(client):
         assert response.status_code == 200
         data = response.json()
         assert data["standalone_question"] == "iPhone 15的价格"
+
+
+def test_rag_reuses_recent_answer_without_retrieval(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "请帮我绘制一条默认样式的正弦曲线"},
+        {"role": "assistant", "content": "下面是绘图代码。"},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="should_not_use")) as mock_rewrite, \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock()) as mock_search, \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock()) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "请帮我绘制一条默认样式的正弦曲线",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "rag"
+    assert data["answer"] == "下面是绘图代码。"
+    assert data["sources"] == []
+    assert data["timing"]["rewrite_ms"] == 0
+    assert data["timing"]["retrieval_ms"] == 0
+    assert data["timing"]["llm_ms"] == 0
+    mock_rewrite.assert_not_awaited()
+    mock_search.assert_not_awaited()
+    mock_generate.assert_not_awaited()
+    mock_memory.append_turn.assert_awaited_once_with("test_session", "请帮我绘制一条默认样式的正弦曲线", "下面是绘图代码。")
+
+
+def test_web_route_does_not_reuse_recent_answer(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[
+        {"role": "user", "content": "今天的 Python 新闻"},
+        {"role": "assistant", "content": "旧联网答案"},
+    ])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+    search_execution = ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "今天的 Python 新闻"},
+            status="success",
+            output_preview="",
+            latency_ms=1.0,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {
+                    "title": "Python News",
+                    "url": "https://example.com/python",
+                    "snippet": "最新 Python 新闻",
+                }
+            ],
+        },
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="今天的 Python 新闻")), \
+         patch("app.orchestrator.orchestrator.tools.execute_with_result", new=AsyncMock(return_value=search_execution)) as mock_tool, \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="新联网答案")) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "今天的 Python 新闻",
+                "need_web": "always",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "web"
+    assert data["answer"] == "新联网答案"
+    mock_tool.assert_awaited_once()
+    mock_generate.assert_awaited_once()
+    mock_memory.append_turn.assert_awaited_once_with("test_session", "今天的 Python 新闻", "新联网答案")
+
+
+class TestRecentAnswerReuse:
+    def test_exact_question_matches_latest_turn(self):
+        history = [
+            {"role": "user", "content": "A"},
+            {"role": "assistant", "content": "A answer"},
+            {"role": "user", "content": "B"},
+            {"role": "assistant", "content": "B answer"},
+        ]
+
+        result = app_orchestrator._find_recent_answer_reuse("B", history)
+
+        assert result is not None
+        assert result["answer"] == "B answer"
+        assert result["turn_offset"] == 0
+        assert result["similarity"] == 1.0
+
+    def test_similar_question_matches_above_threshold(self):
+        history = [
+            {"role": "user", "content": "请帮我绘制一条默认样式的正弦曲线"},
+            {"role": "assistant", "content": "下面是绘图代码。"},
+        ]
+
+        result = app_orchestrator._find_recent_answer_reuse("帮我绘制一条默认样式的正弦曲线", history)
+
+        assert result is not None
+        assert result["answer"] == "下面是绘图代码。"
+        assert result["similarity"] > settings.recent_answer_reuse_similarity_threshold
+
+    def test_below_threshold_does_not_match(self):
+        history = [
+            {"role": "user", "content": "绘制正弦曲线"},
+            {"role": "assistant", "content": "代码A"},
+        ]
+
+        assert app_orchestrator._find_recent_answer_reuse("排序算法", history) is None
+
+    def test_short_question_requires_exact_match(self):
+        history = [
+            {"role": "user", "content": "您好"},
+            {"role": "assistant", "content": "你好，有什么可以帮你"},
+        ]
+
+        assert app_orchestrator._find_recent_answer_reuse("你好", history) is None
+        result = app_orchestrator._find_recent_answer_reuse("您好", history)
+        assert result is not None
+        assert result["answer"] == "你好，有什么可以帮你"
+
+    def test_turn_without_answer_is_ignored(self):
+        history = [
+            {"role": "user", "content": "绘制正弦曲线"},
+            {"role": "user", "content": "排序算法"},
+            {"role": "assistant", "content": "后者答案"},
+        ]
+
+        result = app_orchestrator._find_recent_answer_reuse("绘制正弦曲线", history)
+
+        assert result is None
+
+    def test_non_reusable_mock_retrieval_answer_is_ignored(self):
+        history = [
+            {"role": "user", "content": "企业与个人知识库结合查询，查找创意写作与描述性文本"},
+            {
+                "role": "assistant",
+                "content": "根据提供的文档片段，所有内容均为模拟检索结果，因此无法从文档中找到依据。",
+            },
+        ]
+
+        decision = app_orchestrator._evaluate_recent_answer_reuse(
+            "企业与个人知识库结合查询，查找创意写作与描述性文本",
+            history,
+        )
+
+        assert app_orchestrator._find_recent_answer_reuse(
+            "企业与个人知识库结合查询，查找创意写作与描述性文本",
+            history,
+        ) is None
+        assert decision["hit"] is False
+        assert decision["miss_reason"] == "non_reusable_answer"
+        assert decision["candidate_count"] == 0
+
+    def test_prefers_most_recent_matching_turn(self):
+        history = [
+            {"role": "user", "content": "绘制正弦曲线"},
+            {"role": "assistant", "content": "旧答案"},
+            {"role": "user", "content": "排序算法"},
+            {"role": "assistant", "content": "排序答案"},
+            {"role": "user", "content": "绘制正弦曲线"},
+            {"role": "assistant", "content": "新答案"},
+        ]
+
+        result = app_orchestrator._find_recent_answer_reuse("绘制正弦曲线", history)
+
+        assert result is not None
+        assert result["answer"] == "新答案"
+        assert result["turn_offset"] == 0
+
+    def test_miss_reason_is_reported_in_logs(self, client, caplog):
+        mock_memory = MagicMock()
+        mock_memory.get_history = AsyncMock(return_value=[
+            {"role": "user", "content": "请帮我绘制默认样式的正弦曲线"},
+            {"role": "assistant", "content": "代码A"},
+        ])
+        mock_memory.create_session = AsyncMock(return_value="test_session")
+        mock_memory.append_turn = AsyncMock()
+
+        with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+             patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="请解释快速排序算法")), \
+             patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+             patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="新答案")):
+            with caplog.at_level("INFO", logger="app.orchestrator"):
+                response = client.post(
+                    "/ask",
+                    json={
+                        "user_id": "test_user",
+                        "question": "请解释快速排序算法",
+                    },
+                )
+
+        assert response.status_code == 200
+        miss_records = [
+            record
+            for record in caplog.records
+            if getattr(record, "recent_answer_reuse_miss_reason", None)
+        ]
+        assert miss_records
+        assert miss_records[-1].recent_answer_reuse_miss_reason == "similarity_below_threshold"
+        assert miss_records[-1].recent_answer_reuse_hit is False
+
+    def test_non_reusable_answer_miss_reason_is_reported_in_logs(self, client, caplog):
+        mock_memory = MagicMock()
+        mock_memory.get_history = AsyncMock(return_value=[
+            {"role": "user", "content": "人工智能有什么特点"},
+            {"role": "assistant", "content": "根据提供的文档片段，这些内容均为模拟检索结果，无法从文档中找到依据。"},
+        ])
+        mock_memory.create_session = AsyncMock(return_value="test_session")
+        mock_memory.append_turn = AsyncMock()
+
+        with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+             patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="人工智能有什么特点")), \
+             patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])) as mock_search, \
+             patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="新答案")) as mock_generate:
+            with caplog.at_level("INFO", logger="app.orchestrator"):
+                response = client.post(
+                    "/ask",
+                    json={
+                        "user_id": "test_user",
+                        "question": "人工智能有什么特点",
+                    },
+                )
+
+        assert response.status_code == 200
+        assert response.json()["answer"] == "新答案"
+        mock_search.assert_awaited_once()
+        mock_generate.assert_awaited_once()
+        miss_records = [
+            record
+            for record in caplog.records
+            if getattr(record, "recent_answer_reuse_miss_reason", None)
+        ]
+        assert miss_records
+        assert miss_records[-1].recent_answer_reuse_miss_reason == "non_reusable_answer"
+        assert miss_records[-1].recent_answer_reuse_hit is False
 
 
 def test_rag_prompt_includes_history_original_and_standalone_question(client):
@@ -1002,6 +1595,136 @@ def test_ask_auto_web_search_keyword_routes_to_agentic_rag(client):
     assert data["route"] == "agentic_rag"
     assert data["answer"] == "联网回答"
     mock_tools.execute_with_result.assert_awaited_once_with("web_search", {"query": "联网搜索北京"})
+
+
+def test_ask_site_query_passes_domains_to_web_search(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "dataclasses official docs", "domains": ["docs.python.org"]},
+            status="success",
+            output_preview="Python docs",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "Docs", "url": "https://docs.python.org/3/", "snippet": "Python docs"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="site answer")) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "site:docs.python.org dataclasses official docs",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    mock_tools.execute_with_result.assert_awaited_once_with(
+        "web_search",
+        {"query": "dataclasses official docs", "domains": ["docs.python.org"]},
+    )
+    prompt = mock_generate.call_args.args[0]
+    assert "联网搜索片段" in prompt
+    assert "本地知识库片段" in prompt
+
+
+def test_ask_bare_domain_query_passes_domains_to_web_search(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "find dataclasses", "domains": ["docs.python.org"]},
+            status="success",
+            output_preview="Python docs",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "Docs", "url": "https://docs.python.org/3/", "snippet": "Python docs"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="site answer")):
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "docs.python.org find dataclasses",
+            },
+        )
+
+    assert response.status_code == 200
+    mock_tools.execute_with_result.assert_awaited_once_with(
+        "web_search",
+        {"query": "find dataclasses", "domains": ["docs.python.org"]},
+    )
+
+
+def test_ask_forum_question_routes_to_web_first(client):
+    mock_memory = MagicMock()
+    mock_memory.get_history = AsyncMock(return_value=[])
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    mock_tools = MagicMock()
+    mock_tools.execute_with_result = AsyncMock(return_value=ToolExecution(
+        trace=ToolTrace(
+            tool_name="web_search",
+            tool_input={"query": "reddit python issue"},
+            status="success",
+            output_preview="reddit result",
+            latency_ms=100,
+        ),
+        result={
+            "success": True,
+            "results": [
+                {"title": "Reddit", "url": "https://reddit.com/r/python", "snippet": "Forum result"},
+            ],
+        },
+    ))
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.orchestrator.tools", mock_tools), \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[])), \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="forum answer")):
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "reddit python issue",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "agentic_rag"
+    mock_tools.execute_with_result.assert_awaited_once_with("web_search", {"query": "reddit python issue"})
 
 
 def test_ask_routes_to_web_for_news(client):

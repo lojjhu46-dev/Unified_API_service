@@ -4,6 +4,7 @@
 # Web 框架
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
 
 # 数据验证和序列化
 pydantic>=2.5.0
@@ -14,6 +15,9 @@ python-dotenv>=1.0.0
 
 # HTTP 客户端（后续阶段使用）
 httpx>=0.26.0
+
+# 飞书事件加解密
+cryptography>=42.0.0
 
 # Redis 客户端（后续阶段使用）
 redis>=5.0.0

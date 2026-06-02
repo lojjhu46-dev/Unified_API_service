@@ -84,7 +84,7 @@ class ToolRegistry:
     async def _run_web_search(self, tool_input: dict) -> dict:
         """执行联网搜索"""
         query = tool_input.get("query", "")
-        return await web_search(query)
+        return await web_search(query, domains=tool_input.get("domains"))
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具列表"""

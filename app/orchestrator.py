@@ -1,8 +1,11 @@
 """编排器"""
 
 import asyncio
+import re
 import uuid
 import time
+import unicodedata
+from difflib import SequenceMatcher
 from app.schemas import (
     AskRequest,
     AgentResponse,
@@ -10,7 +13,7 @@ from app.schemas import (
     TimingInfo,
 )
 from app.llm.gateway import llm_gateway
-from app.llm.prompts import build_direct_prompt, build_rag_prompt
+from app.llm.prompts import build_direct_prompt, build_rag_prompt, build_web_search_prompt
 from app.retrieval.retriever import retriever
 from app.memory.store import memory_store
 from app.memory.rewrite import _history_to_text, rewrite_question
@@ -21,6 +24,21 @@ from app.config import settings
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
+
+_NON_REUSABLE_RECENT_ANSWER_MARKERS = (
+    "[MOCK回答]",
+    "模拟检索结果",
+    "Mock检索",
+    "mock检索",
+    "使用Mock检索器",
+    "无法从文档中找到依据",
+    "没有找到依据",
+    "文档片段中没有找到",
+    "未包含关于",
+    "检索失败",
+    "加载Embedding模型失败",
+    "获取向量存储失败",
+)
 
 
 class Orchestrator:
@@ -52,16 +70,86 @@ class Orchestrator:
             # 读取历史
             history = await self.memory.get_history(session_id)
 
-            # 追问改写
+            # 决定路由
+            route = self._decide_route(request)
             standalone_question = request.question
             rewrite_ms = 0
-            if history:
+
+            if route == "rag":
+                reuse_decision = self._evaluate_recent_answer_reuse(request.question, history)
+                if reuse_decision["hit"]:
+                    result = {
+                        "answer": reuse_decision["answer"],
+                        "sources": [],
+                        "tool_trace": [],
+                        "retrieval_ms": 0,
+                        "tool_ms": 0,
+                        "llm_ms": 0,
+                    }
+                    logger.info(
+                        "Recent answer reuse hit",
+                        extra={
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "route": route,
+                            "recent_answer_reuse_hit": True,
+                            "recent_answer_reuse_similarity": reuse_decision["similarity"],
+                            "recent_answer_reuse_turn_offset": reuse_decision["turn_offset"],
+                            "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
+                            "recent_answer_reuse_threshold": reuse_decision["threshold"],
+                            "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
+                        },
+                    )
+                    await self.memory.append_turn(session_id, request.question, result["answer"])
+                    total_ms = (time.perf_counter() - start_time) * 1000
+                    return AgentResponse(
+                        request_id=request_id,
+                        session_id=session_id,
+                        route=route,
+                        answer=result.get("answer", ""),
+                        sources=result.get("sources", []),
+                        tool_trace=result.get("tool_trace", []),
+                        timing=TimingInfo(
+                            rewrite_ms=0,
+                            retrieval_ms=0,
+                            tool_ms=0,
+                            llm_ms=0,
+                            total_ms=total_ms,
+                        ),
+                        standalone_question=request.question,
+                    )
+                logger.info(
+                    "Recent answer reuse miss",
+                    extra={
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "route": route,
+                        "recent_answer_reuse_hit": False,
+                        "recent_answer_reuse_miss_reason": reuse_decision["miss_reason"],
+                        "recent_answer_reuse_best_similarity": reuse_decision["best_similarity"],
+                        "recent_answer_reuse_turn_offset": reuse_decision["best_turn_offset"],
+                        "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
+                        "recent_answer_reuse_threshold": reuse_decision["threshold"],
+                        "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
+                    },
+                )
+            elif history:
+                logger.info(
+                    "Recent answer reuse skipped",
+                    extra={
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "route": route,
+                        "recent_answer_reuse_hit": False,
+                        "recent_answer_reuse_miss_reason": "route_not_rag",
+                    },
+                )
+
+            # 追问改写
+            if history and route in {"rag", "web", "agentic_rag"}:
                 start = time.perf_counter()
                 standalone_question = await rewrite_question(request.question, history)
                 rewrite_ms = (time.perf_counter() - start) * 1000
-
-            # 决定路由
-            route = self._decide_route(request)
 
             # 执行对应路由
             if route == "direct":
@@ -106,6 +194,147 @@ class Orchestrator:
             )
             raise
 
+    def _normalize_recent_answer_text(self, text: str) -> str:
+        """归一化最近答案复用的比较文本。"""
+        normalized = unicodedata.normalize("NFKC", text or "").casefold()
+        return "".join(
+            char
+            for char in normalized
+            if unicodedata.category(char)[0] not in {"P", "Z", "S"}
+        )
+
+    def _iter_recent_turns(self, history: list[dict]) -> list[dict]:
+        """从消息历史中重建问答轮次。"""
+        turns = []
+        current_question = None
+        for item in history:
+            role = item.get("role")
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                current_question = content
+                continue
+            if role == "assistant" and current_question is not None:
+                turns.append(
+                    {
+                        "question": current_question,
+                        "answer": content,
+                    }
+                )
+                current_question = None
+        return turns
+
+    def _is_reusable_recent_answer(self, answer: str) -> bool:
+        """过滤非正常检索产生的历史答案，避免复用错误或Mock答案。"""
+        if not (answer or "").strip():
+            return False
+        return not any(marker in answer for marker in _NON_REUSABLE_RECENT_ANSWER_MARKERS)
+
+    def _evaluate_recent_answer_reuse(self, question: str, history: list[dict]) -> dict:
+        """评估是否可以直接复用最近答案，并返回命中或未命中原因。"""
+        min_chars = max(int(settings.recent_answer_reuse_min_chars), 1)
+        threshold = float(settings.recent_answer_reuse_similarity_threshold)
+        base_result = {
+            "hit": False,
+            "answer": None,
+            "question": None,
+            "similarity": 0.0,
+            "turn_offset": None,
+            "miss_reason": None,
+            "best_similarity": 0.0,
+            "best_turn_offset": None,
+            "candidate_count": 0,
+            "threshold": threshold,
+            "min_chars": min_chars,
+        }
+
+        if not history:
+            return {**base_result, "miss_reason": "no_history"}
+
+        normalized_question = self._normalize_recent_answer_text(question)
+        if not normalized_question:
+            return {**base_result, "miss_reason": "empty_question"}
+
+        turns = self._iter_recent_turns(history)
+        if not turns:
+            return {**base_result, "miss_reason": "no_complete_turns"}
+
+        best_similarity = 0.0
+        best_turn_offset = None
+        candidate_count = 0
+        non_reusable_answer_count = 0
+        short_question_blocked = False
+        for turn_offset, turn in enumerate(reversed(turns)):
+            candidate_question = turn.get("question", "")
+            candidate_answer = turn.get("answer", "")
+            if not candidate_answer:
+                continue
+            if not self._is_reusable_recent_answer(candidate_answer):
+                non_reusable_answer_count += 1
+                continue
+
+            normalized_candidate = self._normalize_recent_answer_text(candidate_question)
+            if not normalized_candidate:
+                continue
+
+            candidate_count += 1
+            if min(len(normalized_question), len(normalized_candidate)) < min_chars:
+                similarity = 1.0 if normalized_question == normalized_candidate else 0.0
+                if similarity == 0.0:
+                    short_question_blocked = True
+            else:
+                similarity = SequenceMatcher(
+                    None,
+                    normalized_question,
+                    normalized_candidate,
+                ).ratio()
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_turn_offset = turn_offset
+
+            if similarity > threshold:
+                return {
+                    **base_result,
+                    "hit": True,
+                    "answer": candidate_answer,
+                    "question": candidate_question,
+                    "similarity": similarity,
+                    "turn_offset": turn_offset,
+                    "miss_reason": None,
+                    "best_similarity": similarity,
+                    "best_turn_offset": turn_offset,
+                    "candidate_count": candidate_count,
+                }
+
+        if candidate_count == 0:
+            miss_reason = "non_reusable_answer" if non_reusable_answer_count else "no_usable_answer"
+        elif short_question_blocked and best_similarity == 0.0:
+            miss_reason = "short_question_not_exact"
+        else:
+            miss_reason = "similarity_below_threshold"
+
+        return {
+            **base_result,
+            "miss_reason": miss_reason,
+            "best_similarity": best_similarity,
+            "best_turn_offset": best_turn_offset,
+            "candidate_count": candidate_count,
+        }
+
+    def _find_recent_answer_reuse(self, question: str, history: list[dict]) -> dict | None:
+        """查找是否可以直接复用最近答案。"""
+        decision = self._evaluate_recent_answer_reuse(question, history)
+        if not decision["hit"]:
+            return None
+        return {
+            "answer": decision["answer"],
+            "question": decision["question"],
+            "similarity": decision["similarity"],
+            "turn_offset": decision["turn_offset"],
+        }
+
     def _decide_route(self, request: AskRequest) -> str:
         """决定路由"""
         question = request.question.strip().lower()
@@ -135,13 +364,31 @@ class Orchestrator:
                 "最新",
                 "今天",
                 "新闻",
+                "资讯",
                 "天气",
                 "气温",
                 "价格",
                 "股价",
                 "汇率",
+                "论坛",
+                "社区",
+                "帖子",
+                "技术方案",
+                "解决方案",
+                "官方文档",
+                "报错",
+                "故障",
+                "site:",
+                "网站",
+                "github",
+                "stackoverflow",
+                "reddit",
+                "v2ex",
             ]
-            if any(word in question for word in web_words):
+            if any(word in question for word in web_words) or re.search(
+                r"(?:https?://|site:)?[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+",
+                question,
+            ):
                 return "agentic_rag"
 
         # 需要计算。要求能提取出真实数学表达式，避免“今天气温多少”误入计算器。
@@ -204,7 +451,7 @@ class Orchestrator:
         )
 
         start = time.perf_counter()
-        answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+        answer = await self.llm.generate(prompt, system_prompt=system_prompt, allow_mock=False)
         llm_ms = (time.perf_counter() - start) * 1000
 
         return {
@@ -228,6 +475,54 @@ class Orchestrator:
             )
             for r in selected
         ]
+
+    def _extract_search_domains(self, question: str) -> list[str]:
+        """从自然语言里的 URL、site: 语法中提取站点限制。"""
+        text = question or ""
+        candidates = []
+        candidates.extend(re.findall(r"site:([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})", text, flags=re.IGNORECASE))
+        candidates.extend(re.findall(r"https?://([^/\s，。]+)", text, flags=re.IGNORECASE))
+        candidates.extend(re.findall(r"\b([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)\b", text))
+
+        domains = []
+        for candidate in candidates:
+            domain = candidate.lower().strip(" .，,。")
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if "." in domain and domain not in domains:
+                domains.append(domain)
+        return domains
+
+    def _clean_site_syntax_from_query(self, question: str) -> str:
+        query = re.sub(r"site:[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "", question or "", flags=re.IGNORECASE)
+        query = re.sub(r"https?://\S+", "", query, flags=re.IGNORECASE)
+        query = re.sub(r"\b[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+\b", "", query)
+        return " ".join(query.split()) or question
+
+    def _classify_web_search_intent(self, question: str, domains: list[str] | None = None) -> str:
+        text = (question or "").lower()
+        if domains:
+            return "site"
+        if any(word in text for word in ["天气", "气温", "降雨", "下雨", "台风", "预报"]):
+            return "weather"
+        if any(word in text for word in ["新闻", "资讯", "最新", "快讯", "热点"]):
+            return "news"
+        if any(word in text for word in ["论坛", "社区", "帖子", "reddit", "v2ex", "知乎"]):
+            return "forum"
+        if any(word in text for word in ["技术方案", "解决方案", "官方文档", "报错", "bug", "github", "stackoverflow"]):
+            return "tech"
+        return "general"
+
+    def _build_web_search_input(self, question: str) -> dict:
+        domains = self._extract_search_domains(question)
+        query = self._clean_site_syntax_from_query(question) if domains else question
+        search_input = {"query": query}
+        if domains:
+            search_input["domains"] = domains
+        return search_input
+
+    def _is_web_first_question(self, question: str, domains: list[str] | None = None) -> bool:
+        return self._classify_web_search_intent(question, domains) in {"weather", "news", "forum", "tech", "site"}
 
     def _build_enriched_question(
         self,
@@ -292,7 +587,8 @@ class Orchestrator:
         tool_trace = []
 
         # 执行搜索
-        execution = await self.tools.execute_with_result("web_search", {"query": standalone_question})
+        search_input = self._build_web_search_input(standalone_question)
+        execution = await self.tools.execute_with_result("web_search", search_input)
         tool_trace.append(execution.trace)
         search_result = execution.result
 
@@ -301,11 +597,10 @@ class Orchestrator:
             sources = self._web_sources_from_results(results)
 
             search_text = format_search_results(results)
-            prompt = f"基于以下搜索结果回答问题：\n\n{search_text}\n\n问题：{request.question}"
-            system_prompt = "你是一个有用的中文助手。请基于搜索结果回答问题，并注明来源。"
+            system_prompt, prompt = build_web_search_prompt(request.question, search_text)
 
             start = time.perf_counter()
-            answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+            answer = await self.llm.generate(prompt, system_prompt=system_prompt, allow_mock=False)
             llm_ms = (time.perf_counter() - start) * 1000
 
             return {
@@ -331,7 +626,7 @@ class Orchestrator:
             )
 
             start = time.perf_counter()
-            answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+            answer = await self.llm.generate(prompt, system_prompt=system_prompt, allow_mock=False)
             llm_ms = (time.perf_counter() - start) * 1000
 
             return {
@@ -387,7 +682,8 @@ class Orchestrator:
 
         # 并行执行 RAG 和搜索
         rag_task = self._search_local_sources(request, standalone_question)
-        search_task = self.tools.execute_with_result("web_search", {"query": standalone_question})
+        search_input = self._build_web_search_input(standalone_question)
+        search_task = self.tools.execute_with_result("web_search", search_input)
 
         (rag_results, retrieval_ms), search_execution = await asyncio.gather(rag_task, search_task)
 
@@ -410,14 +706,25 @@ class Orchestrator:
             f"{self._build_enriched_question(request, standalone_question, history)}\n\n"
             "请综合本地知识库片段和联网搜索片段回答；如果联网搜索失败或为空，需要明确说明。"
         )
-        system_prompt, prompt = build_rag_prompt(
-            enriched_question,
-            context,
-            is_global=self._is_global_question(request.question, standalone_question),
-        )
+        if search_execution.trace.status == "success" and search_execution.result.get("success") and self._is_web_first_question(
+            standalone_question,
+            search_input.get("domains"),
+        ):
+            search_text = format_search_results(search_execution.result.get("results", []))
+            web_first_context = (
+                f"联网搜索片段：\n{search_text or '无'}\n\n"
+                f"本地知识库片段（仅在相关时辅助，若无关请忽略）：\n{local_context or '无'}"
+            )
+            system_prompt, prompt = build_web_search_prompt(request.question, web_first_context)
+        else:
+            system_prompt, prompt = build_rag_prompt(
+                enriched_question,
+                context,
+                is_global=self._is_global_question(request.question, standalone_question),
+            )
 
         start = time.perf_counter()
-        answer = await self.llm.generate(prompt, system_prompt=system_prompt)
+        answer = await self.llm.generate(prompt, system_prompt=system_prompt, allow_mock=False)
         llm_ms = (time.perf_counter() - start) * 1000
 
         return {

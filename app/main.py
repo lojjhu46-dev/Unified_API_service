@@ -3,11 +3,12 @@
 import asyncio
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import BackgroundTasks, FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from app.config import settings
+from app.config import parse_csv_setting, settings
 from app.schemas import (
     AskRequest,
     AgentResponse,
@@ -20,6 +21,7 @@ from app.schemas import (
 from app.llm.gateway import LLMGatewayError
 from app.orchestrator import orchestrator
 from app.channels.feishu import feishu_adapter
+from app.channels.pending_store import get_pending_file_store, pending_feishu_files
 from app.retrieval.ingest import (
     ingest_file,
     sanitize_filename,
@@ -27,24 +29,35 @@ from app.retrieval.ingest import (
     validate_file_extension,
 )
 from app.observability.logging import get_logger
+from app.redis_client import log_redis_startup_health
+from app.security.auth import AuthContext, get_api_auth_context
+from app.security import rate_limit as rate_limit_module
+from app.security.rate_limit import enforce_rate_limit, identity_from_auth, identity_from_feishu_event
 
 logger = get_logger(__name__)
 
-pending_feishu_files: dict[str, dict] = {}
+pending_file_store = get_pending_file_store()
 SUPPORTED_FILE_TEXT = "仅支持 PDF、DOCX、TXT 和 XLSX 文件。"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(log_redis_startup_health())
+    yield
+
 
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
+    lifespan=lifespan,
     description="统一Agentic RAG API服务",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=parse_csv_setting(settings.cors_allowed_origins),
+    allow_credentials=settings.cors_allow_credentials,
+    allow_methods=parse_csv_setting(settings.cors_allowed_methods),
+    allow_headers=parse_csv_setting(settings.cors_allowed_headers),
 )
 
 
@@ -83,25 +96,53 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
+    feishu_dedupe_health = await feishu_adapter.get_event_dedupe_health()
+    memory_health = await orchestrator.memory.health()
+    pending_health = await pending_file_store.health()
+    rate_limit_health = await rate_limit_module.rate_limiter.health()
+    token_cache_health = await feishu_adapter.get_tenant_token_cache_health()
     return HealthResponse(
         status="ok",
         version=settings.app_version,
         timestamp=datetime.now(),
+        components={
+            "memory_store": memory_health,
+            "feishu_pending_store": pending_health,
+            "feishu_event_dedupe": feishu_dedupe_health,
+            "rate_limiter": rate_limit_health,
+            "feishu_token_cache": token_cache_health,
+        },
     )
 
 
 @app.post("/ask", response_model=AgentResponse)
-async def ask(request: AskRequest):
-    return await orchestrator.process(request)
+async def ask(
+    http_request: Request,
+    request: AskRequest,
+    auth_context: AuthContext | None = Depends(get_api_auth_context),
+):
+    await enforce_rate_limit("ask", identity_from_auth(http_request, auth_context))
+    trusted_request = request
+    if auth_context is not None:
+        trusted_request = request.model_copy(
+            update={
+                "user_id": auth_context.user_id,
+                "channel": auth_context.channel,
+            }
+        )
+    return await orchestrator.process(trusted_request)
 
 
 @app.post("/documents/upload", response_model=UploadResponse)
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     knowledge_base_type: str = Form("enterprise"),
     owner_open_id: str | None = Form(None),
+    auth_context: AuthContext | None = Depends(get_api_auth_context),
 ):
     """上传文档到知识库"""
+    await enforce_rate_limit("documents_upload", identity_from_auth(request, auth_context))
     if not validate_file_extension(file.filename):
         raise HTTPException(status_code=400, detail=SUPPORTED_FILE_TEXT)
 
@@ -109,6 +150,8 @@ async def upload_document(
     owner_open_id = owner_open_id.strip() if owner_open_id else None
     if knowledge_base_type not in {"enterprise", "personal"}:
         raise HTTPException(status_code=400, detail="knowledge_base_type 仅支持 enterprise 或 personal")
+    if auth_context is not None and knowledge_base_type == "personal":
+        owner_open_id = auth_context.user_id
     if knowledge_base_type == "personal" and not owner_open_id:
         raise HTTPException(status_code=400, detail="上传到个人知识库时必须提供 owner_open_id")
 
@@ -263,11 +306,14 @@ async def process_feishu_file_event(event_data: dict) -> None:
 
     filename = sanitize_filename(raw_filename)
     pending_id = str(uuid.uuid4())[:12]
-    pending_feishu_files[pending_id] = {
+    pending = {
         **event_data,
         "file_name": filename,
+        "status": "pending",
+        "created_at": time.time(),
         "expires_at": time.time() + settings.feishu_pending_file_ttl_seconds,
     }
+    await pending_file_store.create(pending_id, pending, settings.feishu_pending_file_ttl_seconds)
     card = build_personal_file_confirm_card(filename, pending_id)
     await feishu_adapter.send_interactive_card(event_data.get("chat_id"), card)
 
@@ -311,14 +357,14 @@ def build_personal_file_confirm_card(filename: str, pending_id: str) -> dict:
 async def process_feishu_card_action(action_data: dict) -> None:
     action = action_data.get("action")
     pending_id = action_data.get("pending_id")
-    pending = pending_feishu_files.get(pending_id)
+    pending = await pending_file_store.get(pending_id)
     if not pending:
         chat_id = action_data.get("chat_id")
         if chat_id:
             await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
         return
     if pending.get("expires_at", 0) < time.time():
-        pending_feishu_files.pop(pending_id, None)
+        await pending_file_store.delete(pending_id)
         chat_id = action_data.get("chat_id") or pending.get("chat_id")
         if chat_id:
             await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
@@ -328,14 +374,19 @@ async def process_feishu_card_action(action_data: dict) -> None:
         return
 
     if action == "cancel_save_personal_file":
-        pending_feishu_files.pop(pending_id, None)
+        await pending_file_store.delete(pending_id)
         await feishu_adapter.send_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。")
         return
 
     if action not in {"confirm_save_personal_file", "confirm_save_enterprise_file"}:
         return
 
-    pending_feishu_files.pop(pending_id, None)
+    pending = await pending_file_store.consume(pending_id)
+    if not pending:
+        chat_id = action_data.get("chat_id")
+        if chat_id:
+            await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+        return
     if action == "confirm_save_enterprise_file":
         await save_feishu_file_to_enterprise_knowledge(pending)
     else:
@@ -529,6 +580,10 @@ async def feishu_events(request: Request, background_tasks: BackgroundTasks):
 
     card_action = parse_feishu_card_action(body)
     if card_action:
+        await enforce_rate_limit(
+            "feishu_events",
+            identity_from_feishu_event(request, None, card_action),
+        )
         background_tasks.add_task(process_feishu_card_action, card_action)
         return {
             "code": 0,
@@ -551,18 +606,43 @@ async def feishu_events(request: Request, background_tasks: BackgroundTasks):
         )
         return {"code": 0}
 
+    await enforce_rate_limit(
+        "feishu_events",
+        identity_from_feishu_event(request, event_data),
+    )
+
     # 4. 幂等登记，重复事件直接确认，避免飞书重试造成重复回复。
-    if not feishu_adapter.mark_event_seen(event_data.get("dedupe_key")):
+    is_first_seen = await feishu_adapter.mark_event_seen(event_data.get("dedupe_key"))
+    dedupe_health = await feishu_adapter.get_event_dedupe_health()
+    dedupe_log_fields = {
+        "event_id": event_data.get("event_id"),
+        "message_id": event_data.get("message_id"),
+        "dedupe_key": event_data.get("dedupe_key"),
+        "dedupe_key_source": event_data.get("dedupe_key_source"),
+        "dedupe_backend": dedupe_health.get("backend"),
+        "dedupe_degraded": dedupe_health.get("degraded"),
+        "dedupe_ttl_seconds": dedupe_health.get("ttl_seconds"),
+    }
+    if not is_first_seen:
         logger.info(
             "Feishu duplicate event acknowledged",
             extra={
-                "dedupe_key": event_data.get("dedupe_key"),
-                "message_id": event_data.get("message_id"),
+                **dedupe_log_fields,
+                "dedupe_result": "duplicate",
+                "feishu_retry_likely": event_data.get("dedupe_key_source") == "message_id",
             },
         )
         return {"code": 0}
 
     if event_data.get("event_kind") == "file":
+        logger.info(
+            "Feishu file event accepted",
+            extra={
+                **dedupe_log_fields,
+                "dedupe_result": "accepted",
+                "chat_type": event_data.get("chat_type"),
+            },
+        )
         background_tasks.add_task(process_feishu_file_event, event_data)
         return {"code": 0}
 
@@ -570,10 +650,9 @@ async def feishu_events(request: Request, background_tasks: BackgroundTasks):
     logger.info(
         "Feishu message event accepted",
         extra={
-            "event_id": event_data.get("event_id"),
-            "message_id": event_data.get("message_id"),
+            **dedupe_log_fields,
+            "dedupe_result": "accepted",
             "chat_type": event_data.get("chat_type"),
-            "dedupe_key": event_data.get("dedupe_key"),
         },
     )
     background_tasks.add_task(process_feishu_message, event_data)

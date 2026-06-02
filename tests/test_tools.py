@@ -82,6 +82,59 @@ class TestWebSearch:
             assert len(result["results"]) > 0
 
     @pytest.mark.asyncio
+    async def test_search_supports_domain_limited_query(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "organic": [
+                {"title": "Docs", "link": "https://docs.python.org/3/", "snippet": "Python docs"},
+            ],
+        }
+        mock_response.raise_for_status = MagicMock()
+        mock_post = AsyncMock(return_value=mock_response)
+
+        with patch("app.tools.search.settings") as mock_settings, \
+             patch("httpx.AsyncClient.post", new=mock_post):
+            mock_settings.serper_api_key = "test_key"
+            mock_settings.serper_url = "https://google.serper.dev/search"
+            mock_settings.search_timeout = 10
+            mock_settings.max_retries = 0
+
+            result = await web_search(
+                "dataclasses official docs",
+                domains=["https://www.python.org/doc/", "docs.python.org", "not a domain"],
+            )
+
+        assert result["success"] is True
+        assert result["domains"] == ["python.org", "docs.python.org"]
+        assert result["effective_query"] == "dataclasses official docs (site:python.org OR site:docs.python.org)"
+        payload = mock_post.await_args.kwargs["json"]
+        assert payload["q"] == result["effective_query"]
+        assert payload["gl"] == "cn"
+        assert payload["hl"] == "zh-cn"
+
+    @pytest.mark.asyncio
+    async def test_search_accepts_single_domain_string(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"organic": []}
+        mock_response.raise_for_status = MagicMock()
+        mock_post = AsyncMock(return_value=mock_response)
+
+        with patch("app.tools.search.settings") as mock_settings, \
+             patch("httpx.AsyncClient.post", new=mock_post):
+            mock_settings.serper_api_key = "test_key"
+            mock_settings.serper_url = "https://google.serper.dev/search"
+            mock_settings.search_timeout = 10
+            mock_settings.max_retries = 0
+
+            result = await web_search("redis ttl", domains="redis.io")
+
+        assert result["success"] is True
+        assert result["domains"] == ["redis.io"]
+        assert mock_post.await_args.kwargs["json"]["q"] == "redis ttl (site:redis.io)"
+
+    @pytest.mark.asyncio
     async def test_search_429(self):
         mock_response = MagicMock()
         mock_response.status_code = 429

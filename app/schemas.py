@@ -93,6 +93,7 @@ class HealthResponse(BaseModel):
     status: str = Field(default="ok", description="状态")
     version: str = Field(..., description="版本")
     timestamp: datetime = Field(default_factory=datetime.now, description="时间戳")
+    components: dict = Field(default_factory=dict, description="组件健康状态")
 
 
 class ErrorResponse(BaseModel):

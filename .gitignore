@@ -12,3 +12,6 @@ data/uploads/
 .env.toml
 .env
 reports/
+
+.venv-wsl/
+.venv/

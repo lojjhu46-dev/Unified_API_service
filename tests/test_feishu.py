@@ -10,7 +10,15 @@ from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.channels.feishu import FeishuAdapter
+from app.channels.event_dedupe import InMemoryEventDedupeStore
+from app.channels.token_cache import (
+    FallbackFeishuTokenCache,
+    InMemoryFeishuTokenCache,
+    RedisFeishuTokenCache,
+)
 from app.config import settings
+from app.security import rate_limit as rate_limit_module
+from app.security.rate_limit import InMemoryRateLimitBackend, RateLimiter
 from app.main import (
     app,
     decide_feishu_knowledge_scope,
@@ -98,12 +106,36 @@ def _card_action(
 
 @pytest.fixture
 def adapter():
-    return FeishuAdapter()
+    instance = FeishuAdapter()
+    instance._event_dedupe_store = InMemoryEventDedupeStore(instance._processed_events)
+    instance._tenant_token_cache = InMemoryFeishuTokenCache()
+    instance._processed_events.clear()
+    return instance
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    from app.main import feishu_adapter
+
+    feishu_adapter._processed_events.clear()
+    feishu_adapter._event_dedupe_store = InMemoryEventDedupeStore(feishu_adapter._processed_events)
+    feishu_adapter._tenant_token_cache = InMemoryFeishuTokenCache()
+    try:
+        yield TestClient(app)
+    finally:
+        feishu_adapter._processed_events.clear()
+        feishu_adapter._event_dedupe_store = InMemoryEventDedupeStore(feishu_adapter._processed_events)
+        feishu_adapter._tenant_token_cache = InMemoryFeishuTokenCache()
+
+
+@pytest.fixture
+def isolated_rate_limiter(monkeypatch):
+    limiter = RateLimiter(InMemoryRateLimitBackend())
+    monkeypatch.setattr(rate_limit_module, "rate_limiter", limiter)
+    with patch.object(settings, "rate_limit_per_minute", 1), patch.object(
+        settings, "rate_limit_per_hour", 100
+    ):
+        yield limiter
 
 
 class TestChallengeVerification:
@@ -185,12 +217,18 @@ class TestEventParsing:
         assert result["text"] == "你好"
         assert result["dedupe_key"] == "om_test456"
 
-    def test_parse_message_event_v2_dedupe_prefers_event_id(self, adapter):
+    def test_parse_message_event_v2_dedupe_prefers_message_id(self, adapter):
         body = _message_event(event_id="event_123", message_id="om_456")
         result = adapter.parse_event(body)
         assert result["event_id"] == "event_123"
         assert result["uuid"] == "uuid_1"
-        assert result["dedupe_key"] == "event_123"
+        assert result["dedupe_key"] == "om_456"
+
+    def test_parse_message_event_v2_ignores_non_user_sender(self, adapter):
+        body = _message_event(event_id="event_bot_message", message_id="om_bot")
+        body["event"]["sender"]["sender_type"] = "app"
+
+        assert adapter.parse_event(body) is None
 
     def test_parse_message_event_v2_group(self, adapter):
         body = {
@@ -272,7 +310,7 @@ class TestEventParsing:
         assert result["message_id"] == "om_file456"
         assert result["file_key"] == "file_key_1"
         assert result["file_name"] == "资料.pdf"
-        assert result["dedupe_key"] == "file_event_1"
+        assert result["dedupe_key"] == "om_file456"
 
 
 class TestSessionId:
@@ -296,23 +334,53 @@ class TestSessionId:
 class TestDedupe:
     """事件去重测试"""
 
-    def test_dedupe_first_seen_then_duplicate(self, adapter):
-        assert adapter.mark_event_seen("event_1") is True
-        assert adapter.mark_event_seen("event_1") is False
+    @pytest.mark.asyncio
+    async def test_dedupe_first_seen_then_duplicate(self, adapter):
+        assert await adapter.mark_event_seen("event_1") is True
+        assert await adapter.mark_event_seen("event_1") is False
 
-    def test_dedupe_expired_key_can_be_seen_again(self, adapter):
+    @pytest.mark.asyncio
+    async def test_dedupe_expired_key_can_be_seen_again(self, adapter):
         adapter._dedupe_ttl_seconds = -1
-        assert adapter.mark_event_seen("event_1") is True
-        assert adapter.mark_event_seen("event_1") is True
+        assert await adapter.mark_event_seen("event_1") is True
+        assert await adapter.mark_event_seen("event_1") is True
 
     def test_dedupe_key_priority(self, adapter):
-        assert adapter.get_dedupe_key("event", "uuid", "message") == "event"
-        assert adapter.get_dedupe_key(None, "uuid", "message") == "uuid"
+        assert adapter.get_dedupe_key("event", "uuid", "message") == "message"
+        assert adapter.get_dedupe_key("event", "uuid", None) == "event"
+        assert adapter.get_dedupe_key(None, "uuid", None) == "uuid"
         assert adapter.get_dedupe_key(None, None, "message") == "message"
 
 
 class TestTenantAccessToken:
     """tenant_access_token 缓存测试"""
+
+    class FakeRedis:
+        def __init__(self, fail: bool = False):
+            self.fail = fail
+            self.values = {}
+            self.expirations = {}
+
+        def _maybe_fail(self):
+            if self.fail:
+                raise RuntimeError("redis down")
+
+        async def get(self, key):
+            self._maybe_fail()
+            return self.values.get(key)
+
+        async def set(self, key, value, ex=None):
+            self._maybe_fail()
+            self.values[key] = value
+            self.expirations[key] = ex
+
+        async def delete(self, key):
+            self._maybe_fail()
+            self.values.pop(key, None)
+
+        async def ping(self):
+            self._maybe_fail()
+            return True
 
     @pytest.mark.asyncio
     async def test_get_tenant_access_token_reuses_valid_cache(self, adapter):
@@ -356,6 +424,97 @@ class TestTenantAccessToken:
 
         assert result is False
         assert adapter._tenant_access_token is None
+
+    @pytest.mark.asyncio
+    async def test_get_tenant_access_token_uses_redis_cache_before_http(self, adapter):
+        redis = self.FakeRedis()
+        adapter._tenant_token_cache = RedisFeishuTokenCache(redis)
+        await redis.set("unified_rag:feishu_token:tenant_access_token", "redis_token", ex=60)
+
+        with patch("httpx.AsyncClient.post", new=AsyncMock()) as mock_post:
+            token = await adapter.get_tenant_access_token()
+
+        assert token == "redis_token"
+        mock_post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_tenant_access_token_uses_memory_when_redis_misses(self, adapter):
+        adapter._tenant_token_cache = RedisFeishuTokenCache(self.FakeRedis())
+        adapter._tenant_access_token = "memory_token"
+        adapter._tenant_access_token_expires_at = 9999999999
+
+        token = await adapter.get_tenant_access_token()
+
+        assert token == "memory_token"
+
+    @pytest.mark.asyncio
+    async def test_get_tenant_access_token_writes_redis_cache_after_refresh(self, adapter):
+        redis = self.FakeRedis()
+        adapter._tenant_token_cache = RedisFeishuTokenCache(redis)
+        adapter._tenant_access_token = None
+        adapter._tenant_access_token_expires_at = 0
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "code": 0,
+            "tenant_access_token": "new_token",
+            "expire": 7200,
+        }
+
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("httpx.AsyncClient.post", new=AsyncMock(return_value=mock_response)):
+            mock_settings.feishu_app_id = "app_id"
+            mock_settings.feishu_app_secret = "app_secret"
+            token = await adapter.get_tenant_access_token()
+
+        assert token == "new_token"
+        key = "unified_rag:feishu_token:tenant_access_token"
+        assert redis.values[key] == "new_token"
+        assert redis.expirations[key] == 6900
+
+    @pytest.mark.asyncio
+    async def test_clear_tenant_access_token_clears_redis_and_memory(self, adapter):
+        redis = self.FakeRedis()
+        adapter._tenant_token_cache = RedisFeishuTokenCache(redis)
+        adapter._tenant_access_token = "memory_token"
+        adapter._tenant_access_token_expires_at = 9999999999
+        await redis.set("unified_rag:feishu_token:tenant_access_token", "redis_token", ex=60)
+
+        await adapter.clear_tenant_access_token()
+
+        assert adapter._tenant_access_token is None
+        assert "unified_rag:feishu_token:tenant_access_token" not in redis.values
+
+    @pytest.mark.asyncio
+    async def test_token_cache_falls_back_to_memory_when_redis_fails(self):
+        fallback = InMemoryFeishuTokenCache()
+        await fallback.set("fallback_token", 60)
+        cache = FallbackFeishuTokenCache(RedisFeishuTokenCache(self.FakeRedis(fail=True)), fallback)
+
+        assert await cache.get() == "fallback_token"
+        health = await cache.health()
+        assert health["backend"] == "memory"
+        assert health["degraded"] is True
+
+    @pytest.mark.asyncio
+    async def test_token_cache_retries_and_recovers_after_cooldown(self):
+        redis = self.FakeRedis(fail=True)
+        fallback = InMemoryFeishuTokenCache()
+        cache = FallbackFeishuTokenCache(RedisFeishuTokenCache(redis), fallback)
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr("app.redis_client.settings.redis_retry_cooldown_seconds", 0)
+            await cache.set("fallback_token", 60)
+            failed_health = await cache.health()
+            assert failed_health["backend"] == "memory"
+            assert failed_health["next_retry_at"] is not None
+
+            redis.fail = False
+            await cache.set("redis_token", 60)
+            recovered_health = await cache.health()
+
+        assert recovered_health["backend"] == "redis"
+        assert await cache.get() == "redis_token"
 
 
 class TestReplyMessage:
@@ -837,6 +996,26 @@ class TestFeishuEndpoint:
         mock_process.assert_awaited_once()
         mock_reply.assert_awaited_once_with("om_test456", "机器人回答")
 
+    def test_feishu_callback_rate_limit_returns_429(self, client, isolated_rate_limiter):
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)):
+            mock_settings.feishu_verification_token = "expected_token"
+            mock_process.return_value.answer = "机器人回答"
+
+            first = client.post(
+                "/channels/feishu/events",
+                json=_message_event(event_id="event_limit_1", message_id="om_limit_1"),
+            )
+            second = client.post(
+                "/channels/feishu/events",
+                json=_message_event(event_id="event_limit_2", message_id="om_limit_2"),
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        mock_process.assert_awaited_once()
+
     def test_duplicate_event_is_not_processed_twice(self, client):
         with patch("app.channels.feishu.settings") as mock_settings, \
              patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
@@ -851,6 +1030,46 @@ class TestFeishuEndpoint:
         assert second.status_code == 200
         mock_process.assert_awaited_once()
         mock_reply.assert_awaited_once()
+
+    def test_same_message_with_different_event_id_is_not_processed_twice(self, client):
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            mock_settings.feishu_verification_token = "expected_token"
+            mock_process.return_value.answer = "机器人回答"
+
+            first = client.post(
+                "/channels/feishu/events",
+                json=_message_event(event_id="event_replay_1", message_id="om_same_message"),
+            )
+            second = client.post(
+                "/channels/feishu/events",
+                json=_message_event(event_id="event_replay_2", message_id="om_same_message"),
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        mock_process.assert_awaited_once()
+        mock_reply.assert_awaited_once()
+
+    def test_same_file_message_with_different_event_id_sends_one_card(self, client):
+        with patch("app.channels.feishu.settings") as mock_settings, \
+             patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock(return_value=True)) as mock_card:
+            mock_settings.feishu_verification_token = "expected_token"
+
+            first = client.post(
+                "/channels/feishu/events",
+                json=_file_event(event_id="file_replay_1", message_id="om_same_file"),
+            )
+            second = client.post(
+                "/channels/feishu/events",
+                json=_file_event(event_id="file_replay_2", message_id="om_same_file"),
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        mock_card.assert_awaited_once()
+        pending_feishu_files.clear()
 
     def test_invalid_or_non_text_event_is_acknowledged_without_processing(self, client):
         body = _message_event(event_id="event_image")

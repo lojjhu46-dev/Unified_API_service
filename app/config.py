@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "unified_rag"
     redis_socket_timeout: int = 5
+    redis_connect_timeout: int = 5
+    redis_health_check_interval: int = 30
+    redis_retry_cooldown_seconds: int = 10
 
     # Serper 搜索配置
     serper_api_key: Optional[str] = None
@@ -54,6 +57,9 @@ class Settings(BaseSettings):
     # 会话配置
     memory_window_messages: int = 6
     memory_max_messages: int = 20
+    memory_session_ttl_seconds: int = 7 * 24 * 60 * 60
+    recent_answer_reuse_similarity_threshold: float = 0.8
+    recent_answer_reuse_min_chars: int = 6
 
     # 检索配置
     top_k: int = 5
@@ -96,6 +102,10 @@ class Settings(BaseSettings):
     jwt_secret: Optional[str] = None
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 30
+    cors_allowed_origins: str = ""
+    cors_allow_credentials: bool = False
+    cors_allowed_methods: str = "GET,POST,DELETE,OPTIONS"
+    cors_allowed_headers: str = "Authorization,Content-Type,X-API-Key,X-User-Id,X-Channel"
 
     # 限流配置
     rate_limit_per_minute: int = 60
@@ -116,6 +126,11 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+
+def parse_csv_setting(value: str) -> list[str]:
+    """Parse comma-separated env settings into a clean list."""
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
 def ensure_directories():

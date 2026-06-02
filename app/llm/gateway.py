@@ -51,9 +51,12 @@ class LLMGateway:
         system_prompt: Optional[str] = None,
         max_tokens: int = 1024,
         temperature: float = 0.7,
+        allow_mock: bool = True,
     ) -> str:
         """生成回答"""
         if self.provider == "mock":
+            if not allow_mock:
+                raise LLMGatewayError("当前为 mock LLM，不能用于正式文档问答")
             return await self._mock_generate(prompt)
         elif self.provider == "deepseek":
             return await self._deepseek_generate(prompt, system_prompt, max_tokens, temperature)

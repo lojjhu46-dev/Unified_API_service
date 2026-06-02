@@ -25,6 +25,15 @@ async def test_mock_generate():
 
 
 @pytest.mark.asyncio
+async def test_mock_generate_can_be_disabled_for_document_answers():
+    gateway = LLMGateway()
+    gateway.provider = "mock"
+
+    with pytest.raises(LLMGatewayError, match="不能用于正式文档问答"):
+        await gateway.generate("测试问题", allow_mock=False)
+
+
+@pytest.mark.asyncio
 async def test_deepseek_no_api_key(mock_settings):
     mock_settings.llm_provider = "deepseek"
     mock_settings.deepseek_api_key = None

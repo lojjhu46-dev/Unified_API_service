@@ -14,6 +14,8 @@ from typing import Optional
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.config import settings
+from app.channels.event_dedupe import get_event_dedupe_store
+from app.channels.token_cache import get_feishu_token_cache
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -28,7 +30,9 @@ class FeishuAdapter:
     def __init__(self):
         self._tenant_access_token: Optional[str] = None
         self._tenant_access_token_expires_at: float = 0
+        self._tenant_token_cache = get_feishu_token_cache()
         self._processed_events: dict[str, float] = {}
+        self._event_dedupe_store = get_event_dedupe_store(self._processed_events)
         self._dedupe_ttl_seconds = 24 * 60 * 60
 
     def verify_challenge(self, body: dict) -> Optional[dict]:
@@ -113,6 +117,8 @@ class FeishuAdapter:
         """解析 Schema 2.0 消息事件"""
         message = event.get("message", {})
         sender = event.get("sender", {})
+        if sender.get("sender_type") != "user":
+            return None
 
         chat_type = message.get("chat_type")  # p2p 或 group
         chat_id = message.get("chat_id")
@@ -154,6 +160,7 @@ class FeishuAdapter:
 
         event_id = header.get("event_id")
         uuid = header.get("uuid")
+        dedupe_key_source = "message_id"
         return {
             "open_id": open_id,
             "chat_id": chat_id,
@@ -163,6 +170,7 @@ class FeishuAdapter:
             "event_id": event_id,
             "uuid": uuid,
             "dedupe_key": self.get_dedupe_key(event_id, uuid, message_id),
+            "dedupe_key_source": dedupe_key_source,
         }
 
     def _parse_file_message_event_v2(
@@ -187,6 +195,7 @@ class FeishuAdapter:
 
         event_id = header.get("event_id")
         uuid = header.get("uuid")
+        dedupe_key_source = "message_id"
         return {
             "event_kind": "file",
             "open_id": open_id,
@@ -198,6 +207,7 @@ class FeishuAdapter:
             "event_id": event_id,
             "uuid": uuid,
             "dedupe_key": self.get_dedupe_key(event_id, uuid, message_id),
+            "dedupe_key_source": dedupe_key_source,
         }
 
     def _parse_message_event_v1(self, event: dict) -> Optional[dict]:
@@ -225,6 +235,7 @@ class FeishuAdapter:
             "event_id": event.get("event_id"),
             "uuid": event.get("uuid"),
             "dedupe_key": self.get_dedupe_key(event.get("event_id"), event.get("uuid"), message_id),
+            "dedupe_key_source": "message_id" if message_id else "event_id",
         }
 
     def get_dedupe_key(
@@ -233,27 +244,22 @@ class FeishuAdapter:
         uuid: Optional[str],
         message_id: Optional[str],
     ) -> Optional[str]:
-        """获取事件去重 key，优先使用事件级唯一标识"""
-        return event_id or uuid or message_id
+        """获取事件去重 key，优先使用消息级唯一标识。"""
+        return message_id or event_id or uuid
 
-    def mark_event_seen(self, dedupe_key: Optional[str]) -> bool:
+    async def mark_event_seen(self, dedupe_key: Optional[str]) -> bool:
         """登记事件并返回是否为首次处理"""
         if not dedupe_key:
             return False
+        return await self._event_dedupe_store.mark_seen(dedupe_key, self._dedupe_ttl_seconds)
 
-        now = time.time()
-        expired_keys = [
-            key for key, expires_at in self._processed_events.items()
-            if expires_at <= now
-        ]
-        for key in expired_keys:
-            self._processed_events.pop(key, None)
-
-        if dedupe_key in self._processed_events:
-            return False
-
-        self._processed_events[dedupe_key] = now + self._dedupe_ttl_seconds
-        return True
+    async def get_event_dedupe_health(self) -> dict:
+        health = await self._event_dedupe_store.health()
+        return {
+            **health,
+            "ttl_seconds": self._dedupe_ttl_seconds,
+            "local_key_count": len(self._processed_events),
+        }
 
     def generate_session_id(self, open_id: str, chat_id: str) -> str:
         """生成稳定的 session_id
@@ -265,6 +271,12 @@ class FeishuAdapter:
 
     async def get_tenant_access_token(self) -> Optional[str]:
         """获取 tenant_access_token"""
+        cached_token = await self._tenant_token_cache.get()
+        if cached_token:
+            self._tenant_access_token = cached_token
+            self._tenant_access_token_expires_at = time.time() + 60
+            return cached_token
+
         if self._tenant_access_token and time.time() < self._tenant_access_token_expires_at:
             return self._tenant_access_token
 
@@ -283,9 +295,15 @@ class FeishuAdapter:
                 )
                 data = resp.json()
                 if data.get("code") == 0:
-                    self._tenant_access_token = data.get("tenant_access_token")
+                    token = data.get("tenant_access_token")
+                    if not token:
+                        logger.error(f"获取 tenant_access_token 响应缺少 token: {data}")
+                        return None
+                    self._tenant_access_token = token
                     expire_seconds = int(data.get("expire") or 7200)
-                    self._tenant_access_token_expires_at = time.time() + max(expire_seconds - 300, 60)
+                    token_ttl = max(expire_seconds - 300, 60)
+                    self._tenant_access_token_expires_at = time.time() + token_ttl
+                    await self._tenant_token_cache.set(token, token_ttl)
                     return self._tenant_access_token
                 else:
                     logger.error(f"获取 tenant_access_token 失败: {data}")
@@ -294,10 +312,14 @@ class FeishuAdapter:
             logger.error(f"获取 tenant_access_token 异常: {e}")
             return None
 
-    def clear_tenant_access_token(self) -> None:
+    async def clear_tenant_access_token(self) -> None:
         """清空 tenant_access_token 缓存"""
         self._tenant_access_token = None
         self._tenant_access_token_expires_at = 0
+        await self._tenant_token_cache.clear()
+
+    async def get_tenant_token_cache_health(self) -> dict:
+        return await self._tenant_token_cache.health()
 
     def _is_auth_error(self, code: int) -> bool:
         """判断是否为飞书鉴权错误"""
@@ -331,7 +353,7 @@ class FeishuAdapter:
                     return True
                 else:
                     if self._is_auth_error(data.get("code")):
-                        self.clear_tenant_access_token()
+                        await self.clear_tenant_access_token()
                     logger.error(f"回复消息失败: {data}")
                     return False
         except Exception as e:
@@ -364,7 +386,7 @@ class FeishuAdapter:
                     return True
                 else:
                     if self._is_auth_error(data.get("code")):
-                        self.clear_tenant_access_token()
+                        await self.clear_tenant_access_token()
                     logger.error(f"发送消息失败: {data}")
                     return False
         except Exception as e:
@@ -392,7 +414,7 @@ class FeishuAdapter:
                 if data.get("code") == 0:
                     return True
                 if self._is_auth_error(data.get("code")):
-                    self.clear_tenant_access_token()
+                    await self.clear_tenant_access_token()
                 logger.error(f"发送卡片失败: {data}")
                 return False
         except Exception as e:
