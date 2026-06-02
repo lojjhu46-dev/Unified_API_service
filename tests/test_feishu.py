@@ -22,6 +22,7 @@ from app.security.rate_limit import InMemoryRateLimitBackend, RateLimiter
 from app.main import (
     app,
     decide_feishu_knowledge_scope,
+    handle_feishu_event_body,
     parse_feishu_card_action,
     pending_feishu_files,
     process_feishu_card_action,
@@ -1140,3 +1141,159 @@ class TestFeishuEndpoint:
         assert data["toast"]["content"] == "已收到操作，正在处理。"
         assert "已取消保存" in mock_send.await_args.args[1]
         assert "pending_endpoint" not in pending_feishu_files
+
+
+class TestFeishuLongConnectionDispatch:
+    """飞书长连接事件分发测试"""
+
+    @pytest.mark.asyncio
+    async def test_ws_text_message_uses_shared_dispatch_without_http_token(self, client):
+        with patch("app.main.feishu_adapter.verify_token") as mock_verify, \
+             patch("app.main.process_feishu_message", new=AsyncMock()) as mock_process:
+            result = await handle_feishu_event_body(_message_event(event_id="ws_text_1"), source="ws")
+            await asyncio.sleep(0)
+
+        assert result == {"code": 0}
+        mock_verify.assert_not_called()
+        mock_process.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ws_file_message_uses_shared_dispatch(self, client):
+        with patch("app.main.process_feishu_file_event", new=AsyncMock()) as mock_process:
+            result = await handle_feishu_event_body(_file_event(event_id="ws_file_1"), source="ws")
+            await asyncio.sleep(0)
+
+        assert result == {"code": 0}
+        mock_process.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ws_card_action_uses_shared_dispatch(self, client):
+        with patch("app.main.process_feishu_card_action", new=AsyncMock()) as mock_process:
+            result = await handle_feishu_event_body(_card_action("pending_ws"), source="ws")
+            await asyncio.sleep(0)
+
+        assert result["code"] == 0
+        assert result["toast"]["content"] == "已收到操作，正在处理。"
+        mock_process.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ws_duplicate_message_is_not_processed_twice(self, client):
+        with patch("app.main.process_feishu_message", new=AsyncMock()) as mock_process:
+            first = await handle_feishu_event_body(
+                _message_event(event_id="ws_dup_1", message_id="om_ws_same"),
+                source="ws",
+            )
+            second = await handle_feishu_event_body(
+                _message_event(event_id="ws_dup_2", message_id="om_ws_same"),
+                source="ws",
+            )
+            await asyncio.sleep(0)
+
+        assert first == {"code": 0}
+        assert second == {"code": 0}
+        mock_process.assert_awaited_once()
+
+
+class TestFeishuWsWorker:
+    def test_sdk_event_to_body_accepts_json_string(self):
+        from app.channels.feishu_ws_worker import _sdk_event_to_body
+
+        class FakeJson:
+            @staticmethod
+            def marshal(_data):
+                return json.dumps(_message_event(event_id="ws_worker_1"))
+
+        class FakeLark:
+            JSON = FakeJson
+
+        body = _sdk_event_to_body(FakeLark, object())
+
+        assert body["header"]["event_id"] == "ws_worker_1"
+
+    def test_message_callback_runs_on_long_lived_loop(self, client):
+        from app.channels.feishu_ws_worker import build_event_handler
+
+        callbacks = {}
+
+        class FakeBuilder:
+            def register_p2_im_message_receive_v1(self, callback):
+                callbacks["message"] = callback
+                return self
+
+            def register_p2_card_action_trigger(self, callback):
+                callbacks["card"] = callback
+                return self
+
+            def build(self):
+                return self
+
+        class FakeDispatcherHandler:
+            @staticmethod
+            def builder(*_args):
+                return FakeBuilder()
+
+        class FakeJson:
+            @staticmethod
+            def marshal(_data):
+                return json.dumps(_message_event(event_id="ws_worker_msg"))
+
+        class FakeLark:
+            EventDispatcherHandler = FakeDispatcherHandler
+            JSON = FakeJson
+
+        with patch("app.main.process_feishu_message", new=AsyncMock()) as mock_process:
+            build_event_handler(FakeLark)
+            callbacks["message"](object())
+
+            for _ in range(20):
+                if mock_process.await_count:
+                    break
+                import time
+                time.sleep(0.05)
+
+        mock_process.assert_awaited_once()
+
+    def test_card_action_callback_returns_toast_and_runs_on_loop(self, client):
+        from app.channels.feishu_ws_worker import build_event_handler
+
+        callbacks = {}
+
+        class FakeBuilder:
+            def register_p2_im_message_receive_v1(self, callback):
+                callbacks["message"] = callback
+                return self
+
+            def register_p2_card_action_trigger(self, callback):
+                callbacks["card"] = callback
+                return self
+
+            def build(self):
+                return self
+
+        class FakeDispatcherHandler:
+            @staticmethod
+            def builder(*_args):
+                return FakeBuilder()
+
+        class FakeJson:
+            @staticmethod
+            def marshal(_data):
+                return json.dumps(_card_action("pending_ws_worker"))
+
+        class FakeLark:
+            EventDispatcherHandler = FakeDispatcherHandler
+            JSON = FakeJson
+
+        with patch("app.main.process_feishu_card_action", new=AsyncMock()) as mock_process:
+            build_event_handler(FakeLark, card_response_builder=lambda data: data)
+            result = callbacks["card"](object())
+
+            for _ in range(20):
+                if mock_process.await_count:
+                    break
+                import time
+                time.sleep(0.05)
+
+        assert result["code"] == 0
+        assert result["toast"]["content"] == "已收到操作，正在处理。"
+        mock_process.assert_awaited_once()

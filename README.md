@@ -121,6 +121,25 @@ RATE_LIMIT_PER_HOUR=1000
 
 本机直接运行服务时可使用 `redis://localhost:6379/0`；如果服务也运行在 Docker Compose 网络内，请使用 `redis://redis:6379/0`。`docker-compose.yml` 已包含 Redis 服务，生产环境建议监控 `/health` 中的 Redis-backed components，避免长期处于 memory fallback。
 
+## 飞书事件订阅
+
+当前支持两种飞书事件接收方式，生产环境建议只启用其中一种主通道，避免同一事件双投递；代码层仍会通过 Redis 事件去重兜底。
+
+HTTP 回调方式：在飞书开放平台选择“将事件发送至开发者服务器”，请求地址配置为：
+
+```text
+https://your-domain.example.com/channels/feishu/events
+```
+
+长连接备用方式：在飞书开放平台选择“使用长连接接收事件”，然后单独启动 worker：
+
+```bash
+cd /mnt/d/LLM/Unified_API_service
+/root/.venvs/unified_api_service/bin/python -m app.channels.feishu_ws_worker
+```
+
+长连接 worker 使用 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 建连；HTTP 回调仍使用 `FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY` 进行回调校验与解密。
+
 ## 项目结构
 
 ```

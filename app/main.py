@@ -530,6 +530,120 @@ async def send_feishu_status_message(
         return False
 
 
+def _schedule_feishu_task(background_tasks: BackgroundTasks | None, handler, payload: dict) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(handler, payload)
+        return
+    asyncio.create_task(handler(payload))
+
+
+def _feishu_rate_limit_identity(
+    request: Request | None,
+    event_data: dict | None = None,
+    action_data: dict | None = None,
+) -> str:
+    data = event_data or action_data or {}
+    if data.get("open_id"):
+        return f"feishu_user:{data['open_id']}"
+    if data.get("chat_id"):
+        return f"feishu_chat:{data['chat_id']}"
+    if request is not None:
+        return identity_from_feishu_event(request, event_data, action_data)
+    return "ip:feishu_ws"
+
+
+async def handle_feishu_event_body(
+    body: dict,
+    *,
+    source: str,
+    background_tasks: BackgroundTasks | None = None,
+    request: Request | None = None,
+    encrypted_payload: bool = False,
+) -> dict:
+    """分发已通过通道鉴权的飞书事件体。
+
+    HTTP 回调在进入这里前完成 decrypt/token/challenge；长连接由飞书 SDK 建连鉴权。
+    """
+    card_action = parse_feishu_card_action(body)
+    if card_action:
+        await enforce_rate_limit(
+            "feishu_events",
+            _feishu_rate_limit_identity(request, None, card_action),
+        )
+        _schedule_feishu_task(background_tasks, process_feishu_card_action, card_action)
+        return {
+            "code": 0,
+            "toast": {
+                "type": "info",
+                "content": "已收到操作，正在处理。",
+            },
+        }
+
+    event_data = feishu_adapter.parse_event(body)
+    if not event_data:
+        logger.info(
+            "Feishu event acknowledged without processing",
+            extra={
+                "source": source,
+                "encrypted": encrypted_payload,
+                "event_type": body.get("header", {}).get("event_type"),
+                "type": body.get("type"),
+            },
+        )
+        return {"code": 0}
+
+    await enforce_rate_limit(
+        "feishu_events",
+        _feishu_rate_limit_identity(request, event_data),
+    )
+
+    is_first_seen = await feishu_adapter.mark_event_seen(event_data.get("dedupe_key"))
+    dedupe_health = await feishu_adapter.get_event_dedupe_health()
+    dedupe_log_fields = {
+        "source": source,
+        "event_id": event_data.get("event_id"),
+        "message_id": event_data.get("message_id"),
+        "dedupe_key": event_data.get("dedupe_key"),
+        "dedupe_key_source": event_data.get("dedupe_key_source"),
+        "dedupe_backend": dedupe_health.get("backend"),
+        "dedupe_degraded": dedupe_health.get("degraded"),
+        "dedupe_ttl_seconds": dedupe_health.get("ttl_seconds"),
+    }
+    if not is_first_seen:
+        logger.info(
+            "Feishu duplicate event acknowledged",
+            extra={
+                **dedupe_log_fields,
+                "dedupe_result": "duplicate",
+                "feishu_retry_likely": event_data.get("dedupe_key_source") == "message_id",
+            },
+        )
+        return {"code": 0}
+
+    if event_data.get("event_kind") == "file":
+        logger.info(
+            "Feishu file event accepted",
+            extra={
+                **dedupe_log_fields,
+                "dedupe_result": "accepted",
+                "chat_type": event_data.get("chat_type"),
+            },
+        )
+        _schedule_feishu_task(background_tasks, process_feishu_file_event, event_data)
+        return {"code": 0}
+
+    logger.info(
+        "Feishu message event accepted",
+        extra={
+            **dedupe_log_fields,
+            "dedupe_result": "accepted",
+            "chat_type": event_data.get("chat_type"),
+        },
+    )
+    _schedule_feishu_task(background_tasks, process_feishu_message, event_data)
+    return {"code": 0}
+
+
 @app.post("/channels/feishu/events")
 async def feishu_events(request: Request, background_tasks: BackgroundTasks):
     """飞书事件回调入口
@@ -578,85 +692,13 @@ async def feishu_events(request: Request, background_tasks: BackgroundTasks):
         logger.info("Feishu challenge responded", extra={"encrypted": encrypted_payload})
         return challenge_response
 
-    card_action = parse_feishu_card_action(body)
-    if card_action:
-        await enforce_rate_limit(
-            "feishu_events",
-            identity_from_feishu_event(request, None, card_action),
-        )
-        background_tasks.add_task(process_feishu_card_action, card_action)
-        return {
-            "code": 0,
-            "toast": {
-                "type": "info",
-                "content": "已收到操作，正在处理。",
-            },
-        }
-
-    # 3. 解析消息事件
-    event_data = feishu_adapter.parse_event(body)
-    if not event_data:
-        logger.info(
-            "Feishu callback acknowledged without processing",
-            extra={
-                "encrypted": encrypted_payload,
-                "event_type": body.get("header", {}).get("event_type"),
-                "type": body.get("type"),
-            },
-        )
-        return {"code": 0}
-
-    await enforce_rate_limit(
-        "feishu_events",
-        identity_from_feishu_event(request, event_data),
+    return await handle_feishu_event_body(
+        body,
+        source="http",
+        background_tasks=background_tasks,
+        request=request,
+        encrypted_payload=encrypted_payload,
     )
-
-    # 4. 幂等登记，重复事件直接确认，避免飞书重试造成重复回复。
-    is_first_seen = await feishu_adapter.mark_event_seen(event_data.get("dedupe_key"))
-    dedupe_health = await feishu_adapter.get_event_dedupe_health()
-    dedupe_log_fields = {
-        "event_id": event_data.get("event_id"),
-        "message_id": event_data.get("message_id"),
-        "dedupe_key": event_data.get("dedupe_key"),
-        "dedupe_key_source": event_data.get("dedupe_key_source"),
-        "dedupe_backend": dedupe_health.get("backend"),
-        "dedupe_degraded": dedupe_health.get("degraded"),
-        "dedupe_ttl_seconds": dedupe_health.get("ttl_seconds"),
-    }
-    if not is_first_seen:
-        logger.info(
-            "Feishu duplicate event acknowledged",
-            extra={
-                **dedupe_log_fields,
-                "dedupe_result": "duplicate",
-                "feishu_retry_likely": event_data.get("dedupe_key_source") == "message_id",
-            },
-        )
-        return {"code": 0}
-
-    if event_data.get("event_kind") == "file":
-        logger.info(
-            "Feishu file event accepted",
-            extra={
-                **dedupe_log_fields,
-                "dedupe_result": "accepted",
-                "chat_type": event_data.get("chat_type"),
-            },
-        )
-        background_tasks.add_task(process_feishu_file_event, event_data)
-        return {"code": 0}
-
-    # 5. 后台处理，确保回调入口快速返回。
-    logger.info(
-        "Feishu message event accepted",
-        extra={
-            **dedupe_log_fields,
-            "dedupe_result": "accepted",
-            "chat_type": event_data.get("chat_type"),
-        },
-    )
-    background_tasks.add_task(process_feishu_message, event_data)
-    return {"code": 0}
 
 
 def parse_feishu_card_action(body: dict) -> dict | None:
