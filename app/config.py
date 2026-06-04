@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     rag_context_max_chars: int = 8000
     rag_display_snippet_chars: int = 200
     personal_kb_strict_owner_filter: bool = True
+    rag_parallel_subquestion_max: int = 4
+    rag_llm_subquestion_split_enabled: bool = True
 
     # OpenSearch 检索配置
     opensearch_enabled: bool = False

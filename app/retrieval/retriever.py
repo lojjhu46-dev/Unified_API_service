@@ -39,11 +39,12 @@ class Retriever:
         top_k: int = 5,
         knowledge_scope: List[str] = None,
         owner_open_id: str | None = None,
+        subquestions: List[str] | None = None,
     ) -> List[SourceItem]:
         """检索"""
         if self._use_chroma or (not self._chroma_checked and self.refresh()):
             try:
-                return await self._chroma_search(query, top_k, knowledge_scope, owner_open_id)
+                return await self._chroma_search(query, top_k, knowledge_scope, owner_open_id, subquestions)
             except Exception as e:
                 logger.error(f"Chroma检索失败，降级到Mock检索器: {e}")
                 self._use_chroma = False
@@ -55,116 +56,142 @@ class Retriever:
         top_k: int,
         knowledge_scope: List[str] = None,
         owner_open_id: str | None = None,
+        subquestions: List[str] | None = None,
     ) -> List[SourceItem]:
         """Chroma检索"""
         from app.retrieval.opensearch_store import async_opensearch_search_with_status
         from app.retrieval.vector_store import async_get_document_chunks, async_keyword_search, async_similarity_search
 
         scopes = self._normalize_scopes(knowledge_scope)
-        query_variants = self._build_query_variants(query)
-        search_groups = []
+        query_variants = self._build_query_variants(query, subquestions)
         chunk_cache = {}
         neighbor_window = self._neighbor_window_for_query(query)
         if self._is_code_request(query):
             neighbor_window = max(neighbor_window, 2)
 
-        for query_variant in query_variants:
+        async def run_search_group(query_variant: str, scope: str, metadata_filter: dict | None) -> dict | None:
             ranking_query = self._ranking_query(query_variant, query)
             query_terms = self._extract_query_terms(ranking_query)
-            search_plan = self._build_search_plan(scopes, owner_open_id)
             per_filter_k = self._candidate_k(top_k, len(search_plan), len(query_variants))
-            for scope, metadata_filter in search_plan:
-                keyword_metadata_filter = self._keyword_metadata_filter(scope, metadata_filter)
-                filter_results, allow_owner_mismatch = await self._search_with_owner_fallback(
-                    async_similarity_search,
-                    query_variant,
-                    per_filter_k,
-                    scope,
-                    metadata_filter,
+            keyword_metadata_filter = self._keyword_metadata_filter(scope, metadata_filter)
+            filter_results, allow_owner_mismatch = await self._search_with_owner_fallback(
+                async_similarity_search,
+                query_variant,
+                per_filter_k,
+                scope,
+                metadata_filter,
+            )
+            opensearch_status = await async_opensearch_search_with_status(
+                ranking_query,
+                query_terms,
+                k=max(per_filter_k, settings.opensearch_lexical_top_k),
+                metadata_filter=keyword_metadata_filter,
+            )
+            opensearch_results = opensearch_status.results
+            keyword_results = []
+            keyword_allow_owner_mismatch = False
+            if opensearch_status.succeeded:
+                logger.info(
+                    "OpenSearch keyword retrieval succeeded; local fuzzy skipped",
+                    extra={
+                        "keyword_backend": "opensearch",
+                        "local_fuzzy_skipped": True,
+                        "opensearch_result_count": len(opensearch_results),
+                    },
                 )
-                opensearch_status = await async_opensearch_search_with_status(
-                    ranking_query,
-                    query_terms,
-                    k=max(per_filter_k, settings.opensearch_lexical_top_k),
-                    metadata_filter=keyword_metadata_filter,
+            else:
+                fallback_reason = "opensearch_unavailable" if not opensearch_status.available else "opensearch_error"
+                logger.info(
+                    "OpenSearch keyword retrieval unavailable; using local fuzzy fallback",
+                    extra={
+                        "keyword_backend": "local_fuzzy",
+                        "local_fuzzy_skipped": False,
+                        "fallback_reason": fallback_reason,
+                        "opensearch_error": opensearch_status.error,
+                    },
                 )
-                opensearch_results = opensearch_status.results
-                keyword_results = []
-                keyword_allow_owner_mismatch = False
-                if opensearch_status.succeeded:
-                    logger.info(
-                        "OpenSearch keyword retrieval succeeded; local fuzzy skipped",
-                        extra={
-                            "keyword_backend": "opensearch",
-                            "local_fuzzy_skipped": True,
-                            "opensearch_result_count": len(opensearch_results),
-                        },
+                if scope == "personal" and filter_results and metadata_filter:
+                    keyword_results = await async_keyword_search(
+                        query_terms,
+                        k=per_filter_k,
+                        metadata_filter=keyword_metadata_filter,
                     )
                 else:
-                    fallback_reason = "opensearch_unavailable" if not opensearch_status.available else "opensearch_error"
-                    logger.info(
-                        "OpenSearch keyword retrieval unavailable; using local fuzzy fallback",
-                        extra={
-                            "keyword_backend": "local_fuzzy",
-                            "local_fuzzy_skipped": False,
-                            "fallback_reason": fallback_reason,
-                            "opensearch_error": opensearch_status.error,
-                        },
+                    keyword_results, keyword_allow_owner_mismatch = await self._search_with_owner_fallback(
+                        async_keyword_search,
+                        query_terms,
+                        per_filter_k,
+                        scope,
+                        keyword_metadata_filter,
                     )
-                    if scope == "personal" and filter_results and metadata_filter:
-                        keyword_results = await async_keyword_search(
-                            query_terms,
-                            k=per_filter_k,
-                            metadata_filter=keyword_metadata_filter,
-                        )
-                    else:
-                        keyword_results, keyword_allow_owner_mismatch = await self._search_with_owner_fallback(
-                            async_keyword_search,
-                            query_terms,
-                            per_filter_k,
-                            scope,
-                            keyword_metadata_filter,
-                        )
-                    allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
-                filter_results = self._merge_hybrid_results(filter_results, keyword_results, opensearch_results)
-                sources = []
+                allow_owner_mismatch = allow_owner_mismatch or keyword_allow_owner_mismatch
+            filter_results = self._merge_hybrid_results(filter_results, keyword_results, opensearch_results)
+            sources = []
 
-                for doc, score in filter_results:
-                    metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
-                    if not self._source_allowed(metadata, [scope], owner_open_id, allow_owner_mismatch):
-                        continue
-                    content = await self._expand_neighbor_content(
-                        doc.page_content,
-                        metadata,
-                        chunk_cache,
-                        async_get_document_chunks,
-                        neighbor_window,
-                    )
-                    sources.append(SourceItem(
-                        title=metadata.get("source", "未知来源"),
-                        url="",
-                        source_type="knowledge_base",
-                        snippet=self._build_snippet(doc.page_content, ranking_query),
-                        content=content,
-                        score=self._normalize_distance_score(score),
-                        metadata=metadata,
-                    ))
+            for doc, score in filter_results:
+                metadata = doc.metadata if isinstance(doc.metadata, dict) else {}
+                if not self._source_allowed(metadata, [scope], owner_open_id, allow_owner_mismatch):
+                    continue
+                content = await self._expand_neighbor_content(
+                    doc.page_content,
+                    metadata,
+                    chunk_cache,
+                    async_get_document_chunks,
+                    neighbor_window,
+                )
+                sources.append(SourceItem(
+                    title=metadata.get("source", "未知来源"),
+                    url="",
+                    source_type="knowledge_base",
+                    snippet=self._build_snippet(doc.page_content, ranking_query),
+                    content=content,
+                    score=self._normalize_distance_score(score),
+                    metadata=metadata,
+                ))
 
-                deduped_sources = self._dedupe_sources(sources)
-                if self._is_code_request(ranking_query):
-                    target_sources = [
-                        source for source in deduped_sources
-                        if self._has_target_evidence(ranking_query, source)
-                    ]
-                    if target_sources:
-                        deduped_sources = target_sources
+            deduped_sources = self._dedupe_sources(sources)
+            if self._is_code_request(ranking_query):
+                target_sources = [
+                    source for source in deduped_sources
+                    if self._has_target_evidence(ranking_query, source)
+                ]
+                if target_sources:
+                    deduped_sources = target_sources
 
-                search_groups.append({
-                    "query": ranking_query,
-                    "scope": scope,
-                    "sources": self._rank_sources_for_query(ranking_query, deduped_sources),
-                })
+            return {
+                "query": ranking_query,
+                "scope": scope,
+                "sources": self._rank_sources_for_query(ranking_query, deduped_sources),
+            }
 
+        search_plan = self._build_search_plan(scopes, owner_open_id)
+        tasks = [
+            run_search_group(query_variant, scope, metadata_filter)
+            for query_variant in query_variants
+            for scope, metadata_filter in search_plan
+        ]
+        logger.info(
+            "Knowledge base retrieval planned",
+            extra={
+                "parallel_retrieval": len(tasks) > 1,
+                "subquestion_count": len(query_variants),
+                "search_task_count": len(tasks),
+            },
+        )
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        search_groups = []
+        for result in task_results:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Knowledge base subquestion retrieval failed",
+                    extra={"parallel_retrieval": True, "error": str(result)},
+                )
+                continue
+            if result is not None:
+                search_groups.append(result)
+
+        if not search_groups:
+            return []
         if len(search_groups) == 1:
             return search_groups[0]["sources"][:top_k]
         return self._merge_scoped_sources(search_groups, top_k)
@@ -193,9 +220,14 @@ class Retriever:
             return f"{query_variant} python 代码片段"
         return query_variant
 
-    def _build_query_variants(self, query: str) -> list[str]:
+    def _build_query_variants(self, query: str, subquestions: List[str] | None = None) -> list[str]:
         """组合问题优先拆分引号内目标，避免单个长 query 被第一个目标主导。"""
         variants = []
+        for candidate in subquestions or []:
+            candidate = (candidate or "").strip()
+            if 2 <= len(candidate) <= 200 and candidate not in variants:
+                variants.append(candidate)
+
         patterns = [
             r"“([^”]+)”",
             r'"([^"]+)"',
@@ -208,12 +240,38 @@ class Retriever:
                 if 2 <= len(candidate) <= 200 and candidate not in variants:
                     variants.append(candidate)
 
+        if not variants and self._should_rule_split_query(query):
+            for candidate in re.split(r"[、；;]+", query):
+                candidate = self._clean_split_candidate(candidate)
+                if 2 <= len(candidate) <= 200 and candidate not in variants:
+                    variants.append(candidate)
+
         if not variants:
             return [query]
 
         if query not in variants:
             variants.append(query)
-        return variants[:6]
+        return variants[:max(int(settings.rag_parallel_subquestion_max), 1) + 1]
+
+    def _should_rule_split_query(self, query: str) -> bool:
+        text = query or ""
+        intent_words = ["查找", "检索", "找出", "比较", "总结", "列出", "相关文本", "代码片段"]
+        return any(word in text for word in intent_words) and any(separator in text for separator in ["、", "；", ";"])
+
+    def _clean_split_candidate(self, text: str) -> str:
+        candidate = (text or "").strip()
+        candidate = re.sub(r"^(请|帮我|查询|查找|检索|找出|列出|比较|总结)[：:，,\s]*", "", candidate)
+        candidate = re.sub(r"(的)?(相关文本|相关内容|代码片段)$", "", candidate).strip()
+        generic_phrases = [
+            "企业知识库",
+            "个人知识库",
+            "企业和个人知识库结合",
+            "企业与个人知识库结合",
+            "知识库结合",
+        ]
+        for phrase in generic_phrases:
+            candidate = candidate.replace(phrase, "").strip(" ，,")
+        return candidate
 
     def _candidate_k(self, top_k: int, plan_count: int, query_count: int) -> int:
         """扩大候选集，给后续词面重排留出空间。"""

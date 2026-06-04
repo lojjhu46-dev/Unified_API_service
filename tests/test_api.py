@@ -1075,6 +1075,36 @@ def test_rag_prompt_uses_full_internal_content_not_display_snippet(client):
     assert "全局汇总任务" in system_prompt
 
 
+@pytest.mark.asyncio
+async def test_prepare_rag_subquestions_uses_llm_when_rule_split_is_insufficient():
+    with patch.object(settings, "llm_provider", "deepseek"), patch.object(
+        app_orchestrator.llm,
+        "generate",
+        new=AsyncMock(return_value='["创意写作与描述性文本", "大同思想的历史影响"]'),
+    ) as mock_generate:
+        result = await app_orchestrator._prepare_rag_subquestions(
+            "查找创意写作与描述性文本和大同思想的历史影响的相关文本"
+        )
+
+    assert result == ["创意写作与描述性文本", "大同思想的历史影响"]
+    mock_generate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rag_subquestions_skips_llm_for_mock_provider():
+    with patch.object(settings, "llm_provider", "mock"), patch.object(
+        app_orchestrator.llm,
+        "generate",
+        new=AsyncMock(return_value='["不应使用"]'),
+    ) as mock_generate:
+        result = await app_orchestrator._prepare_rag_subquestions(
+            "查找创意写作与描述性文本和大同思想的历史影响的相关文本"
+        )
+
+    assert result is None
+    mock_generate.assert_not_awaited()
+
+
 def test_pdf_follow_up_prompt_can_include_main_content_evidence(client):
     mock_memory = MagicMock()
     mock_memory.get_history = AsyncMock(return_value=[

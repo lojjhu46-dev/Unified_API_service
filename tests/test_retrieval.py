@@ -1,5 +1,6 @@
 """检索模块测试"""
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from app.retrieval.retriever import Retriever
@@ -950,6 +951,54 @@ async def test_combined_scope_preserves_one_result_per_quoted_target_before_top_
     assert len(results) == 2
     assert any(title.startswith("animation_") for title in titles)
     assert "personal_quick_sort.txt" in titles
+
+
+@pytest.mark.asyncio
+async def test_quoted_target_search_runs_subquestions_in_parallel():
+    retriever = Retriever()
+    active = 0
+    max_active = 0
+    first_doc = MagicMock(
+        page_content="创意写作与描述性文本",
+        metadata={"source": "creative.txt", "knowledge_base_type": "enterprise"},
+    )
+    second_doc = MagicMock(
+        page_content="大同思想的历史影响",
+        metadata={"source": "datong.txt", "knowledge_base_type": "enterprise"},
+    )
+
+    async def fake_search(query, k=5, metadata_filter=None):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        if "创意写作" in query:
+            return [(first_doc, 0)]
+        if "大同思想" in query:
+            return [(second_doc, 0)]
+        return []
+
+    with patch(
+        "app.retrieval.vector_store.async_similarity_search",
+        new=AsyncMock(side_effect=fake_search),
+    ), patch(
+        "app.retrieval.opensearch_store.async_opensearch_search_with_status",
+        new=AsyncMock(return_value=OpenSearchSearchResult(results=[], available=True, succeeded=True)),
+    ), patch(
+        "app.retrieval.vector_store.async_get_document_chunks",
+        new=AsyncMock(return_value=[]),
+    ):
+        results = await retriever._chroma_search(
+            "查找“创意写作与描述性文本”和“大同思想的历史影响”的相关文本",
+            top_k=2,
+            knowledge_scope=["enterprise"],
+        )
+
+    assert max_active > 1
+    titles = [item.title for item in results]
+    assert "creative.txt" in titles
+    assert "datong.txt" in titles
 
 
 @pytest.mark.asyncio

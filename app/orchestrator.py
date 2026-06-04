@@ -1,6 +1,7 @@
 """编排器"""
 
 import asyncio
+import json
 import re
 import uuid
 import time
@@ -430,11 +431,13 @@ class Orchestrator:
     ) -> dict:
         """处理RAG问答"""
         start = time.perf_counter()
+        subquestions = await self._prepare_rag_subquestions(standalone_question)
         sources = await self.retriever.search(
             standalone_question,
             request.top_k,
             request.knowledge_scope,
             owner_open_id=request.user_id if request.channel == "feishu" else None,
+            subquestions=subquestions,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
 
@@ -561,6 +564,97 @@ class Orchestrator:
         keywords = ["主要内容", "时代演变", "历史影响", "有哪些", "列出", "简介", "概括"]
         return any(keyword in text for keyword in keywords)
 
+    async def _prepare_rag_subquestions(self, question: str) -> list[str] | None:
+        """准备可选 LLM 子问题；规则可拆时交给 Retriever 处理。"""
+        rule_variants = self.retriever._build_query_variants(question)
+        if len(rule_variants) > 1:
+            logger.info(
+                "RAG subquestion split uses rule variants",
+                extra={
+                    "split_strategy": "rule",
+                    "subquestion_count": len(rule_variants),
+                },
+            )
+            return None
+        if not self._should_llm_split_subquestions(question):
+            return None
+
+        prompt = (
+            "请把下面的知识库检索问题拆成最多4个可独立检索的小问题。"
+            "只返回JSON数组，数组元素是字符串，不要输出解释。\n\n"
+            f"问题：{question}"
+        )
+        try:
+            raw = await self.llm.generate(
+                prompt,
+                system_prompt="你只负责把复杂检索问题拆成小问题。",
+                max_tokens=300,
+                temperature=0,
+                allow_mock=False,
+            )
+            subquestions = self._parse_llm_subquestions(raw, question)
+        except Exception as e:
+            logger.info(
+                "RAG LLM subquestion split skipped",
+                extra={
+                    "split_strategy": "llm",
+                    "subquestion_count": 0,
+                    "fallback_reason": "llm_split_failed",
+                    "error": str(e),
+                },
+            )
+            return None
+
+        if not subquestions:
+            return None
+        logger.info(
+            "RAG subquestion split uses LLM variants",
+            extra={
+                "split_strategy": "llm",
+                "subquestion_count": len(subquestions),
+            },
+        )
+        return subquestions
+
+    def _should_llm_split_subquestions(self, question: str) -> bool:
+        if not settings.rag_llm_subquestion_split_enabled or self.llm.provider == "mock":
+            return False
+        text = question or ""
+        if len(text) < 24:
+            return False
+        intent_words = ["查找", "检索", "找出", "比较", "总结", "列出", "相关文本", "代码片段"]
+        separators = ["和", "与", "以及", "并且", "同时"]
+        return any(word in text for word in intent_words) and any(separator in text for separator in separators)
+
+    def _parse_llm_subquestions(self, raw: str, original_question: str) -> list[str]:
+        text = (raw or "").strip()
+        if not text:
+            return []
+        match = re.search(r"\[[\s\S]*\]", text)
+        if match:
+            text = match.group(0)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+
+        subquestions = []
+        max_count = max(int(settings.rag_parallel_subquestion_max), 1)
+        for item in payload:
+            if not isinstance(item, str):
+                continue
+            candidate = item.strip()
+            if not (2 <= len(candidate) <= 200):
+                continue
+            if candidate == original_question or candidate in subquestions:
+                continue
+            subquestions.append(candidate)
+            if len(subquestions) >= max_count:
+                break
+        return subquestions
+
     async def _search_local_sources(
         self,
         request: AskRequest,
@@ -568,11 +662,13 @@ class Orchestrator:
     ) -> tuple[list[SourceItem], float]:
         """检索本地知识库并返回耗时"""
         start = time.perf_counter()
+        subquestions = await self._prepare_rag_subquestions(standalone_question)
         sources = await self.retriever.search(
             standalone_question,
             request.top_k,
             request.knowledge_scope,
             owner_open_id=request.user_id if request.channel == "feishu" else None,
+            subquestions=subquestions,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
         return sources, retrieval_ms
