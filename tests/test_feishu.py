@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives import padding
@@ -695,6 +696,95 @@ class TestFeishuHeartbeat:
             await send_feishu_processing_heartbeat("oc_test789", "event_delay")
 
         assert sleep_calls == [5, 20]
+
+
+class TestFeishuResourceLinks:
+    """飞书在线资源链接读取流程测试"""
+
+    @pytest.mark.asyncio
+    async def test_pure_feishu_docx_link_replies_summary_without_rag(self):
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.feishu_adapter.summarize_cloud_resource", new=AsyncMock(return_value={
+                 "success": True,
+                 "resource_type": "docx",
+                 "title": "Docx docx_token",
+                 "url": "https://abc.feishu.cn/docx/docx_token",
+                 "summary": "云文档摘要",
+                 "outline": ["raw_content"],
+                 "warnings": [],
+             })) as mock_summary, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.orchestrator.memory.append_turn", new=AsyncMock()) as mock_append, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_docx",
+                "text": "https://abc.feishu.cn/docx/docx_token",
+                "dedupe_key": "event_docx",
+            })
+
+        mock_summary.assert_awaited_once_with("docx", "docx_token", "https://abc.feishu.cn/docx/docx_token")
+        mock_process.assert_not_awaited()
+        mock_append.assert_awaited_once()
+        assert "飞书资源识别结果" in mock_reply.await_args.args[1]
+        assert "云文档摘要" in mock_reply.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_feishu_link_with_question_uses_resource_context(self):
+        response = SimpleNamespace(answer="基于飞书资源的回答")
+
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.feishu_adapter.summarize_cloud_resource", new=AsyncMock(return_value={
+                 "success": True,
+                 "resource_type": "sheets",
+                 "title": "Sheets sheet_token",
+                 "url": "https://abc.feishu.cn/sheets/sheet_token",
+                 "summary": "表格摘要",
+                 "outline": ["Sheet1"],
+                 "sample_text": "姓名\t分数\n张三\t90",
+                 "warnings": [],
+             })), \
+             patch("app.main.orchestrator.process", new=AsyncMock(return_value=response)) as mock_process, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_sheet",
+                "text": "这个表里张三多少分？ https://abc.feishu.cn/sheets/sheet_token",
+                "dedupe_key": "event_sheet",
+            })
+
+        request = mock_process.await_args.args[0]
+        assert request.user_id == "ou_test123"
+        assert request.need_web == "never"
+        assert "飞书在线资源内容" in request.question
+        assert "张三\t90" in request.question
+        mock_reply.assert_awaited_once_with("om_sheet", "基于飞书资源的回答")
+
+    @pytest.mark.asyncio
+    async def test_feishu_resource_permission_error_does_not_call_rag(self):
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.feishu_adapter.summarize_cloud_resource", new=AsyncMock(return_value={
+                 "success": False,
+                 "error": "我识别到了飞书文档链接，但当前应用没有该资源的读取权限。",
+                 "permission_error": True,
+             })), \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_forbidden",
+                "text": "总结 https://abc.feishu.cn/docx/docx_token",
+                "dedupe_key": "event_forbidden",
+            })
+
+        mock_process.assert_not_awaited()
+        assert "没有该资源的读取权限" in mock_reply.await_args.args[1]
 
 
 class TestFeishuPersonalKnowledgeFiles:

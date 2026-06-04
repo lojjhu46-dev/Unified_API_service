@@ -21,6 +21,7 @@ from app.schemas import (
 from app.llm.gateway import LLMGatewayError
 from app.orchestrator import orchestrator
 from app.channels.feishu import feishu_adapter
+from app.channels.feishu_resources import extract_feishu_resource_links
 from app.channels.pending_store import get_pending_file_store, pending_feishu_files
 from app.retrieval.ingest import (
     ingest_file,
@@ -39,6 +40,98 @@ logger = get_logger(__name__)
 
 pending_file_store = get_pending_file_store()
 SUPPORTED_FILE_TEXT = "仅支持 PDF、DOCX、TXT 和 XLSX 文件。"
+
+
+def _strip_urls(text: str, urls: list[str]) -> str:
+    cleaned = text or ""
+    for url in urls:
+        cleaned = cleaned.replace(url, " ")
+    return " ".join(cleaned.split())
+
+
+def _is_feishu_resource_summary_request(text: str, links: list) -> bool:
+    question_without_links = _strip_urls(text, [link.url for link in links])
+    if not question_without_links:
+        return True
+    summary_words = ["总结", "识别", "概括", "看看", "分析这个链接", "读取这个链接"]
+    return any(word in question_without_links for word in summary_words)
+
+
+def _format_feishu_resource_summary(result: dict) -> str:
+    warnings = "\n".join(f"- {warning}" for warning in result.get("warnings", []))
+    outline = "、".join(result.get("outline") or []) or "未识别到明确结构"
+    message = (
+        f"飞书资源识别结果：{result.get('title') or result.get('token')}\n"
+        f"类型：{result.get('resource_type')}\n"
+        f"来源：{result.get('url')}\n\n"
+        f"摘要：\n{result.get('summary') or '未生成摘要。'}\n\n"
+        f"结构/范围：{outline}"
+    )
+    if warnings:
+        message += f"\n\n注意：\n{warnings}"
+    return message
+
+
+def _build_feishu_resource_augmented_question(original_text: str, results: list[dict]) -> str:
+    sections = []
+    for index, result in enumerate(results, start=1):
+        outline = "、".join(result.get("outline") or []) or "未识别到明确结构"
+        sections.append(
+            f"[飞书资源{index}]\n"
+            f"标题：{result.get('title') or result.get('token')}\n"
+            f"类型：{result.get('resource_type')}\n"
+            f"来源：{result.get('url')}\n"
+            f"结构/范围：{outline}\n"
+            f"摘要：{result.get('summary') or ''}\n"
+            f"样例内容：\n{result.get('sample_text') or ''}"
+        )
+    urls = [result.get("url") for result in results if result.get("url")]
+    cleaned_question = _strip_urls(original_text, urls) or "请总结这些飞书在线资源。"
+    return (
+        "请优先基于以下已通过飞书 OpenAPI 读取到的在线资源内容回答用户问题；"
+        "不要编造资源中没有的信息。\n\n"
+        f"用户问题：{cleaned_question}\n\n"
+        "飞书在线资源内容：\n"
+        + "\n\n".join(sections)
+    )
+
+
+async def _handle_feishu_resource_links(text: str, session_id: str, open_id: str) -> str | None:
+    if not settings.feishu_link_read_enabled:
+        return None
+
+    links = extract_feishu_resource_links(text)
+    if not links:
+        return None
+
+    results = []
+    errors = []
+    for link in links:
+        result = await feishu_adapter.summarize_cloud_resource(link.resource_type, link.token, link.url)
+        if result.get("success"):
+            results.append(result)
+        else:
+            errors.append(result.get("error") or "飞书在线资源读取失败。")
+
+    if not results:
+        return "\n".join(dict.fromkeys(errors)) or "飞书在线资源读取失败。"
+
+    if _is_feishu_resource_summary_request(text, links):
+        answer = "\n\n".join(_format_feishu_resource_summary(result) for result in results)
+        await orchestrator.memory.append_turn(session_id, text, answer)
+        return answer
+
+    augmented_question = _build_feishu_resource_augmented_question(text, results)
+    ask_request = AskRequest(
+        channel="feishu",
+        user_id=open_id,
+        session_id=session_id,
+        question=augmented_question,
+        knowledge_scope=["enterprise", "personal"],
+        need_web="never",
+    )
+    response = await orchestrator.process(ask_request)
+    return response.answer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -256,16 +349,20 @@ async def process_feishu_message(event_data: dict) -> None:
     try:
         try:
             session_id = feishu_adapter.generate_session_id(open_id, chat_id)
-            knowledge_scope = decide_feishu_knowledge_scope(text)
-            ask_request = AskRequest(
-                channel="feishu",
-                user_id=open_id,
-                session_id=session_id,
-                question=text,
-                knowledge_scope=knowledge_scope,
-            )
-            response = await orchestrator.process(ask_request)
-            answer = response.answer
+            resource_answer = await _handle_feishu_resource_links(text, session_id, open_id)
+            if resource_answer is not None:
+                answer = resource_answer
+            else:
+                knowledge_scope = decide_feishu_knowledge_scope(text)
+                ask_request = AskRequest(
+                    channel="feishu",
+                    user_id=open_id,
+                    session_id=session_id,
+                    question=text,
+                    knowledge_scope=knowledge_scope,
+                )
+                response = await orchestrator.process(ask_request)
+                answer = response.answer
         except Exception as e:
             logger.error(f"飞书消息处理失败: {e}", exc_info=True)
             answer = "抱歉，处理您的问题时出现错误，请稍后重试。"

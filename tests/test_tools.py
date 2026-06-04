@@ -231,6 +231,7 @@ class TestToolRegistry:
         assert "calculator" in tools
         assert "web_search" in tools
         assert "summarize_uploaded_file" in tools
+        assert "feishu_resource_summarize" in tools
 
     @pytest.mark.asyncio
     async def test_summarize_uploaded_file_tool(self):
@@ -251,3 +252,30 @@ class TestToolRegistry:
         assert execution.trace.status == "success"
         assert execution.result["summary"] == "摘要"
         mock_summary.assert_awaited_once_with(b"hello", "test.txt")
+
+    @pytest.mark.asyncio
+    async def test_feishu_resource_summarize_tool(self):
+        with patch("app.tools.registry.feishu_adapter.summarize_cloud_resource", new=AsyncMock(return_value={
+            "success": True,
+            "resource_type": "docx",
+            "title": "Docx docx_token",
+            "summary": "云文档摘要",
+        })) as mock_summary:
+            execution = await tool_registry.execute_with_result(
+                "feishu_resource_summarize",
+                {"url": "https://abc.feishu.cn/docx/docx_token"},
+            )
+
+        assert execution.trace.status == "success"
+        assert execution.result["summary"] == "云文档摘要"
+        mock_summary.assert_awaited_once_with("docx", "docx_token", "https://abc.feishu.cn/docx/docx_token")
+
+    @pytest.mark.asyncio
+    async def test_feishu_resource_summarize_tool_rejects_unknown_url(self):
+        execution = await tool_registry.execute_with_result(
+            "feishu_resource_summarize",
+            {"url": "https://example.com/docx/docx_token"},
+        )
+
+        assert execution.trace.status == "error"
+        assert "未识别" in execution.result["error"]

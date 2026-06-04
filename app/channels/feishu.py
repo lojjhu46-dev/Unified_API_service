@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from app.config import settings
 from app.channels.event_dedupe import get_event_dedupe_store
+from app.channels.feishu_resources import FeishuResourceClient, FeishuResourceLink, summarize_feishu_resource_content
 from app.channels.token_cache import get_feishu_token_cache
 from app.observability.logging import get_logger
 
@@ -34,6 +35,7 @@ class FeishuAdapter:
         self._processed_events: dict[str, float] = {}
         self._event_dedupe_store = get_event_dedupe_store(self._processed_events)
         self._dedupe_ttl_seconds = 24 * 60 * 60
+        self._resource_client = FeishuResourceClient(self.get_tenant_access_token, FEISHU_API_BASE)
 
     def verify_challenge(self, body: dict) -> Optional[dict]:
         """处理飞书 challenge 验证
@@ -320,6 +322,14 @@ class FeishuAdapter:
 
     async def get_tenant_token_cache_health(self) -> dict:
         return await self._tenant_token_cache.health()
+
+    async def read_cloud_resource(self, resource_type: str, token: str, url: str = "") -> dict:
+        link = FeishuResourceLink(resource_type=resource_type, token=token, url=url)
+        return await self._resource_client.read_resource(link)
+
+    async def summarize_cloud_resource(self, resource_type: str, token: str, url: str = "") -> dict:
+        resource = await self.read_cloud_resource(resource_type, token, url)
+        return await summarize_feishu_resource_content(resource)
 
     def _is_auth_error(self, code: int) -> bool:
         """判断是否为飞书鉴权错误"""

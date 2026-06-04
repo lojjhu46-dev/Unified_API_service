@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     feishu_heartbeat_interval_seconds: int = 20
     feishu_heartbeat_max_count: int = 12
     feishu_pending_file_ttl_seconds: int = 30 * 60
+    feishu_link_read_enabled: bool = True
+    feishu_link_max_count: int = 3
+    feishu_resource_max_chars: int = 12000
+    feishu_sheet_sample_rows: int = 30
+    feishu_bitable_sample_records: int = 50
 
     # 安全配置
     api_key: Optional[str] = None

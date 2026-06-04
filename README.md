@@ -140,6 +140,18 @@ cd /mnt/d/LLM/Unified_API_service
 
 长连接 worker 使用 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 建连；HTTP 回调仍使用 `FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY` 进行回调校验与解密。
 
+飞书文本消息中包含 Docx、Sheets 或 Bitable 链接时，Agent 会默认用应用身份读取在线资源内容并参与本轮回答：
+
+```env
+FEISHU_LINK_READ_ENABLED=true
+FEISHU_LINK_MAX_COUNT=3
+FEISHU_RESOURCE_MAX_CHARS=12000
+FEISHU_SHEET_SAMPLE_ROWS=30
+FEISHU_BITABLE_SAMPLE_RECORDS=50
+```
+
+该能力只使用 `tenant_access_token` 读取资源，不使用用户登录态、不爬网页、不自动入库知识库。生产环境需要在飞书开放平台为应用开通 Docx、Sheets、Bitable 对应只读权限，并确保目标文档已授权给机器人/应用；否则会提示应用没有读取权限。
+
 ## 项目结构
 
 ```
