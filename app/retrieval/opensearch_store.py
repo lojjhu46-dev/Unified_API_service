@@ -86,9 +86,12 @@ def build_index_body(use_ik_analyzer: bool | None = None) -> dict:
                     "fields": {"keyword": {"type": "keyword"}},
                 },
                 "document_id": {"type": "keyword"},
+                "chunk_id": {"type": "keyword"},
+                "tenant_id": {"type": "keyword"},
                 "stored_filename": {"type": "keyword"},
                 "chunk_index": {"type": "integer"},
                 "knowledge_base_type": {"type": "keyword"},
+                "owner_user_id": {"type": "keyword"},
                 "owner_open_id": {"type": "keyword"},
                 "chat_id": {"type": "keyword"},
                 "channel": {"type": "keyword"},
@@ -282,24 +285,53 @@ def _build_query(query: str, terms: list[str], metadata_filter: dict | None) -> 
 def _metadata_filters(metadata_filter: dict | None) -> list[dict]:
     if not metadata_filter:
         return []
-    if metadata_filter == {"knowledge_base_type": "enterprise"}:
-        return [{"term": {"knowledge_base_type": "enterprise"}}]
-    if "owner_open_id" in metadata_filter:
+    tenant_id = metadata_filter.get("tenant_id") or settings.default_tenant_id
+    if metadata_filter.get("knowledge_base_type") == "enterprise":
+        return [
+            {"term": {"knowledge_base_type": "enterprise"}},
+            _tenant_filter(tenant_id),
+        ]
+    if "owner_open_id" in metadata_filter or "owner_user_id" in metadata_filter:
+        owner = metadata_filter.get("owner_user_id") or metadata_filter.get("owner_open_id") or ""
         return [
             {"term": {"knowledge_base_type": "personal"}},
-            {"term": {"owner_open_id": metadata_filter.get("owner_open_id") or ""}},
+            _tenant_filter(tenant_id),
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"owner_user_id": owner}},
+                        {"term": {"owner_open_id": owner}},
+                    ],
+                    "minimum_should_match": 1,
+                },
+            },
         ]
     return [{"term": {key: value}} for key, value in metadata_filter.items()]
+
+
+def _tenant_filter(tenant_id: str) -> dict:
+    return {
+        "bool": {
+            "should": [
+                {"term": {"tenant_id": tenant_id}},
+                {"bool": {"must_not": [{"exists": {"field": "tenant_id"}}]}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
 
 
 def _document_source(content: str, metadata: dict) -> dict[str, Any]:
     return {
         "content": content,
+        "tenant_id": str(metadata.get("tenant_id") or settings.default_tenant_id),
         "document_id": str(metadata.get("document_id") or ""),
+        "chunk_id": str(metadata.get("chunk_id") or ""),
         "chunk_index": _safe_int(metadata.get("chunk_index")),
         "original_filename": str(metadata.get("original_filename") or metadata.get("source") or ""),
         "stored_filename": str(metadata.get("stored_filename") or ""),
         "knowledge_base_type": str(metadata.get("knowledge_base_type") or "enterprise"),
+        "owner_user_id": str(metadata.get("owner_user_id") or ""),
         "owner_open_id": str(metadata.get("owner_open_id") or ""),
         "chat_id": str(metadata.get("chat_id") or ""),
         "channel": str(metadata.get("channel") or ""),
@@ -311,11 +343,14 @@ def _document_source(content: str, metadata: dict) -> dict[str, Any]:
 
 def _source_metadata(source: dict) -> dict:
     metadata = {
+        "tenant_id": source.get("tenant_id") or settings.default_tenant_id,
         "document_id": source.get("document_id") or "",
+        "chunk_id": source.get("chunk_id") or "",
         "chunk_index": source.get("chunk_index", 0),
         "original_filename": source.get("original_filename") or "",
         "stored_filename": source.get("stored_filename") or "",
         "knowledge_base_type": source.get("knowledge_base_type") or "enterprise",
+        "owner_user_id": source.get("owner_user_id") or "",
         "owner_open_id": source.get("owner_open_id") or "",
         "chat_id": source.get("chat_id") or "",
         "channel": source.get("channel") or "",

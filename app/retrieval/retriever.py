@@ -165,6 +165,8 @@ class Retriever:
             }
 
         search_plan = self._build_search_plan(scopes, owner_open_id)
+        if not search_plan:
+            return []
         tasks = [
             run_search_group(query_variant, scope, metadata_filter)
             for query_variant in query_variants
@@ -206,13 +208,15 @@ class Retriever:
         plan = []
         if "enterprise" in scopes:
             plan.append(("enterprise", None))
-        if "personal" in scopes:
-            plan.append(("personal", {"owner_open_id": owner_open_id or ""}))
-        return plan or [("enterprise", None)]
+        if "personal" in scopes and owner_open_id:
+            plan.append(("personal", {"owner_open_id": owner_open_id}))
+        return plan
 
     def _keyword_metadata_filter(self, scope: str, metadata_filter: dict | None) -> dict | None:
         if scope == "enterprise":
-            return {"knowledge_base_type": "enterprise"}
+            return {"knowledge_base_type": "enterprise", "tenant_id": settings.default_tenant_id}
+        if metadata_filter:
+            return {**metadata_filter, "tenant_id": settings.default_tenant_id}
         return metadata_filter
 
     def _ranking_query(self, query_variant: str, original_query: str) -> str:
@@ -382,7 +386,9 @@ class Retriever:
         if kb_type == "personal":
             if allow_owner_mismatch:
                 return "personal" in scopes
-            return "personal" in scopes and metadata.get("owner_open_id") == (owner_open_id or "")
+            owner = owner_open_id or ""
+            metadata_owner = metadata.get("owner_user_id") or metadata.get("owner_open_id") or ""
+            return "personal" in scopes and metadata_owner == owner
         return "enterprise" in scopes
 
     async def _expand_neighbor_content(

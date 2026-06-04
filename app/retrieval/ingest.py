@@ -82,39 +82,72 @@ def ingest_file(
     original_filename: str | None = None,
     knowledge_base_type: str = "enterprise",
     owner_open_id: str | None = None,
+    owner_user_id: str | None = None,
+    tenant_id: str | None = None,
+    document_id: str | None = None,
     chat_id: str | None = None,
     channel: str = "api",
 ) -> dict:
     """摄取文件到向量存储"""
+    from app.retrieval.document_registry import document_registry
     from app.retrieval.vector_store import add_documents
     from app.retrieval.opensearch_store import index_documents
 
-    document_id = str(uuid.uuid4())[:12]
+    document_id = document_id or str(uuid.uuid4())[:12]
+    tenant_id = tenant_id or settings.default_tenant_id
+    knowledge_base_type = (knowledge_base_type or "enterprise").strip().lower()
+    if knowledge_base_type == "personal":
+        owner_user_id = owner_user_id or owner_open_id or ""
+        owner_open_id = owner_open_id or owner_user_id or ""
+    else:
+        owner_user_id = owner_user_id or ""
+        owner_open_id = owner_open_id or ""
     stored_filename = os.path.basename(file_path)
     safe_original_filename = sanitize_filename(original_filename or stored_filename)
 
-    docs = load_document(file_path)
-    chunks = split_documents(docs)
-    for index, chunk in enumerate(chunks):
-        # 这些元数据会写入 Chroma，后续可用于来源追踪、权限过滤和文档删除。
-        metadata = chunk.metadata if isinstance(getattr(chunk, "metadata", None), dict) else {}
-        chunk.metadata = {
-            **metadata,
-            "document_id": document_id,
-            "original_filename": safe_original_filename,
-            "stored_filename": stored_filename,
-            "chunk_index": index,
-            "knowledge_base_type": knowledge_base_type,
-            "owner_open_id": owner_open_id or "",
-            "chat_id": chat_id or "",
-            "channel": channel,
-        }
-    chunk_count = add_documents(chunks)
-    opensearch_count = index_documents(chunks)
-    if opensearch_count:
-        logger.info(f"OpenSearch index updated: {opensearch_count}个切块")
+    document_registry.create_processing(
+        document_id=document_id,
+        tenant_id=tenant_id,
+        knowledge_base_type=knowledge_base_type,
+        owner_user_id=owner_user_id,
+        owner_open_id=owner_open_id,
+        original_filename=safe_original_filename,
+        stored_filename=stored_filename,
+        stored_path=str(Path(file_path).resolve()),
+        channel=channel,
+        chat_id=chat_id or "",
+    )
 
-    logger.info(f"文档摄取完成: {safe_original_filename}, {chunk_count}个切块")
+    try:
+        docs = load_document(file_path)
+        chunks = split_documents(docs)
+        for index, chunk in enumerate(chunks):
+            # 这些元数据会写入 Chroma，后续可用于来源追踪、权限过滤和文档删除。
+            metadata = chunk.metadata if isinstance(getattr(chunk, "metadata", None), dict) else {}
+            chunk.metadata = {
+                **metadata,
+                "tenant_id": tenant_id,
+                "document_id": document_id,
+                "chunk_id": f"{document_id}:{index}",
+                "original_filename": safe_original_filename,
+                "stored_filename": stored_filename,
+                "chunk_index": index,
+                "knowledge_base_type": knowledge_base_type,
+                "owner_user_id": owner_user_id,
+                "owner_open_id": owner_open_id,
+                "chat_id": chat_id or "",
+                "channel": channel,
+            }
+        chunk_count = add_documents(chunks)
+        opensearch_count = index_documents(chunks)
+        if opensearch_count:
+            logger.info(f"OpenSearch index updated: {opensearch_count}个切块")
+
+        document_registry.mark_ready(document_id, chunk_count)
+        logger.info(f"文档摄取完成: {safe_original_filename}, {chunk_count}个切块")
+    except Exception as e:
+        document_registry.mark_failed(document_id, str(e))
+        raise
 
     return {
         "document_id": document_id,
@@ -145,16 +178,41 @@ def sanitize_filename(filename: str | None) -> str:
     return f"{stem}{ext}"
 
 
-def save_uploaded_file(content: bytes, filename: str, upload_dir: str | None = None) -> str:
+def save_uploaded_file(
+    content: bytes,
+    filename: str,
+    upload_dir: str | None = None,
+    *,
+    tenant_id: str | None = None,
+    owner_user_id: str | None = None,
+    knowledge_base_type: str | None = None,
+    document_id: str | None = None,
+) -> str:
     """保存上传的文件"""
-    target_dir = Path(upload_dir or settings.upload_dir).resolve()
+    target_dir = Path(upload_dir or settings.upload_dir)
+    if knowledge_base_type:
+        kb_type = (knowledge_base_type or "enterprise").strip().lower()
+        tenant = sanitize_path_segment(tenant_id or settings.default_tenant_id)
+        if kb_type == "personal":
+            owner = sanitize_path_segment(owner_user_id or "unknown")
+            target_dir = target_dir / "personal" / tenant / owner
+        else:
+            target_dir = target_dir / "enterprise" / tenant
+    target_dir = target_dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
 
     safe_filename = sanitize_filename(filename)
-    file_path = (target_dir / f"{uuid.uuid4()}_{safe_filename}").resolve()
+    prefix = document_id or str(uuid.uuid4())
+    file_path = (target_dir / f"{prefix}_{safe_filename}").resolve()
     if target_dir not in file_path.parents:
         raise ValueError("上传文件路径非法")
 
     with open(file_path, "wb") as f:
         f.write(content)
     return str(file_path)
+
+
+def sanitize_path_segment(value: str | None) -> str:
+    """清理租户和用户 ID 路径片段。"""
+    segment = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "").strip("._")
+    return segment or "default"

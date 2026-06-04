@@ -161,12 +161,24 @@ async def upload_document(
 
     try:
         safe_filename = sanitize_filename(file.filename)
-        file_path = save_uploaded_file(content, file.filename)
+        document_id = str(uuid.uuid4())[:12]
+        owner_user_id = owner_open_id if knowledge_base_type == "personal" else None
+        file_path = save_uploaded_file(
+            content,
+            file.filename,
+            tenant_id=settings.default_tenant_id,
+            owner_user_id=owner_user_id,
+            knowledge_base_type=knowledge_base_type,
+            document_id=document_id,
+        )
         result = ingest_file(
             file_path,
             original_filename=safe_filename,
             knowledge_base_type=knowledge_base_type,
             owner_open_id=owner_open_id if knowledge_base_type == "personal" else None,
+            owner_user_id=owner_user_id,
+            tenant_id=settings.default_tenant_id,
+            document_id=document_id,
             channel="api",
         )
         orchestrator.retriever.refresh()
@@ -408,12 +420,25 @@ async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
             await feishu_adapter.send_message(chat_id, "文件大小不能超过10MB。")
             return
 
-        file_path = save_uploaded_file(content, filename, upload_dir=settings.personal_upload_dir)
+        document_id = str(uuid.uuid4())[:12]
+        owner_user_id = pending.get("open_id")
+        file_path = save_uploaded_file(
+            content,
+            filename,
+            upload_dir=settings.upload_dir,
+            tenant_id=settings.default_tenant_id,
+            owner_user_id=owner_user_id,
+            knowledge_base_type="personal",
+            document_id=document_id,
+        )
         result = ingest_file(
             file_path,
             original_filename=filename,
             knowledge_base_type="personal",
-            owner_open_id=pending.get("open_id"),
+            owner_open_id=owner_user_id,
+            owner_user_id=owner_user_id,
+            tenant_id=settings.default_tenant_id,
+            document_id=document_id,
             chat_id=chat_id,
             channel="feishu",
         )
@@ -442,12 +467,23 @@ async def save_feishu_file_to_enterprise_knowledge(pending: dict) -> None:
             await feishu_adapter.send_message(chat_id, "文件大小不能超过10MB。")
             return
 
-        file_path = save_uploaded_file(content, filename, upload_dir=settings.upload_dir)
+        document_id = str(uuid.uuid4())[:12]
+        file_path = save_uploaded_file(
+            content,
+            filename,
+            upload_dir=settings.upload_dir,
+            tenant_id=settings.default_tenant_id,
+            knowledge_base_type="enterprise",
+            document_id=document_id,
+        )
         result = ingest_file(
             file_path,
             original_filename=filename,
             knowledge_base_type="enterprise",
             owner_open_id=None,
+            owner_user_id=None,
+            tenant_id=settings.default_tenant_id,
+            document_id=document_id,
             chat_id=chat_id,
             channel="feishu",
         )

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # 文档处理配置
     upload_dir: str = "./data/uploads"
     personal_upload_dir: str = "./data/personal_uploads"
+    default_tenant_id: str = "default"
+    document_registry_db_path: str = "./data/document_registry.sqlite3"
     chunk_size: int = 500
     chunk_overlap: int = 50
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
@@ -139,6 +141,10 @@ def ensure_directories():
     os.makedirs(settings.upload_dir, exist_ok=True)
     os.makedirs(settings.personal_upload_dir, exist_ok=True)
     os.makedirs(settings.chroma_persist_dir, exist_ok=True)
+    if settings.document_registry_db_path:
+        registry_dir = os.path.dirname(settings.document_registry_db_path)
+        if registry_dir:
+            os.makedirs(registry_dir, exist_ok=True)
     if settings.log_file:
         os.makedirs(os.path.dirname(settings.log_file), exist_ok=True)
 

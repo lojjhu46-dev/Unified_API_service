@@ -604,6 +604,9 @@ def test_upload_enterprise_accepts_valid_api_key(client):
     assert response.status_code == 200
     assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "enterprise"
     assert mock_ingest.call_args.kwargs["owner_open_id"] is None
+    assert mock_ingest.call_args.kwargs["owner_user_id"] is None
+    assert mock_ingest.call_args.kwargs["tenant_id"] == settings.default_tenant_id
+    assert mock_ingest.call_args.kwargs["document_id"]
     assert mock_ingest.call_args.kwargs["channel"] == "api"
     mock_refresh.assert_called_once()
 
@@ -631,6 +634,9 @@ def test_upload_personal_uses_trusted_header_owner_when_api_key_configured(clien
     assert response.status_code == 200
     assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
     assert mock_ingest.call_args.kwargs["owner_open_id"] == "real_user"
+    assert mock_ingest.call_args.kwargs["owner_user_id"] == "real_user"
+    assert mock_ingest.call_args.kwargs["tenant_id"] == settings.default_tenant_id
+    assert mock_ingest.call_args.kwargs["document_id"]
     assert mock_ingest.call_args.kwargs["channel"] == "api"
 
 
@@ -651,6 +657,7 @@ def test_upload_personal_does_not_require_form_owner_when_api_key_configured(cli
     assert response.status_code == 200
     assert mock_ingest.call_args.kwargs["knowledge_base_type"] == "personal"
     assert mock_ingest.call_args.kwargs["owner_open_id"] == "real_user"
+    assert mock_ingest.call_args.kwargs["owner_user_id"] == "real_user"
 
 
 def test_upload_rate_limit_returns_429_before_ingest(client, isolated_rate_limiter):

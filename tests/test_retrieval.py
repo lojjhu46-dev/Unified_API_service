@@ -5,11 +5,18 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from app.retrieval.retriever import Retriever
 from app.retrieval.vector_store import (
+    _metadata_matches_keyword_filter,
     _sync_keyword_search,
     expand_search_terms,
     normalize_search_text,
 )
-from app.retrieval.opensearch_store import OpenSearchSearchResult, build_index_body, _metadata_filters
+from app.retrieval.opensearch_store import (
+    OpenSearchSearchResult,
+    build_index_body,
+    _document_source,
+    _metadata_filters,
+    _source_metadata,
+)
 from app.config import settings
 from app.retrieval.ingest import (
     ingest_file,
@@ -19,6 +26,7 @@ from app.retrieval.ingest import (
     save_uploaded_file,
     validate_file_extension,
 )
+from app.retrieval.document_registry import DocumentRegistry
 from app.schemas import SourceItem
 
 
@@ -162,18 +170,49 @@ def test_opensearch_index_body_uses_synonym_graph():
 
     filters = body["settings"]["analysis"]["filter"]
     content_mapping = body["mappings"]["properties"]["content"]
+    mappings = body["mappings"]["properties"]
 
     assert filters["rag_synonyms"]["type"] == "synonym_graph"
     assert any("大模型" in synonym for synonym in filters["rag_synonyms"]["synonyms"])
     assert content_mapping["analyzer"] == "rag_index_analyzer"
     assert content_mapping["search_analyzer"] == "rag_search_analyzer"
+    assert mappings["tenant_id"]["type"] == "keyword"
+    assert mappings["owner_user_id"]["type"] == "keyword"
+    assert mappings["chunk_id"]["type"] == "keyword"
 
 
 def test_opensearch_personal_filter_requires_owner_and_personal_scope():
     filters = _metadata_filters({"owner_open_id": "ou_owner"})
 
     assert {"term": {"knowledge_base_type": "personal"}} in filters
-    assert {"term": {"owner_open_id": "ou_owner"}} in filters
+    owner_filter = next(
+        item for item in filters
+        if {"term": {"owner_user_id": "ou_owner"}} in item.get("bool", {}).get("should", [])
+    )
+    assert {"term": {"owner_user_id": "ou_owner"}} in owner_filter["bool"]["should"]
+    assert {"term": {"owner_open_id": "ou_owner"}} in owner_filter["bool"]["should"]
+
+
+def test_opensearch_source_roundtrip_includes_tenant_and_owner_user_id():
+    source = _document_source(
+        "content",
+        {
+            "tenant_id": "tenant_a",
+            "document_id": "doc1",
+            "chunk_id": "doc1:0",
+            "chunk_index": 0,
+            "original_filename": "a.txt",
+            "knowledge_base_type": "personal",
+            "owner_user_id": "user_a",
+            "owner_open_id": "user_a",
+        },
+    )
+    metadata = _source_metadata(source)
+
+    assert metadata["tenant_id"] == "tenant_a"
+    assert metadata["owner_user_id"] == "user_a"
+    assert metadata["owner_open_id"] == "user_a"
+    assert metadata["chunk_id"] == "doc1:0"
 
 
 @pytest.mark.asyncio
@@ -318,6 +357,34 @@ def test_keyword_search_keeps_personal_owner_filter_for_fuzzy_match():
     assert results[0][0].metadata["source"] == "mine.txt"
 
 
+def test_keyword_filter_accepts_owner_user_id_and_legacy_owner_open_id():
+    metadata_filter = {"owner_user_id": "ou_owner", "tenant_id": settings.default_tenant_id}
+
+    assert _metadata_matches_keyword_filter(
+        {
+            "knowledge_base_type": "personal",
+            "owner_user_id": "ou_owner",
+            "tenant_id": settings.default_tenant_id,
+        },
+        metadata_filter,
+    )
+    assert _metadata_matches_keyword_filter(
+        {
+            "knowledge_base_type": "personal",
+            "owner_open_id": "ou_owner",
+        },
+        metadata_filter,
+    )
+    assert not _metadata_matches_keyword_filter(
+        {
+            "knowledge_base_type": "personal",
+            "owner_user_id": "ou_other",
+            "tenant_id": settings.default_tenant_id,
+        },
+        metadata_filter,
+    )
+
+
 def test_keyword_search_treats_legacy_enterprise_metadata_as_enterprise():
     class FakeVectorStore:
         def get(self, include=None, **kwargs):
@@ -348,28 +415,51 @@ def test_save_uploaded_file_stays_inside_upload_dir(tmp_path):
         settings.upload_dir = old_upload_dir
 
 
+def test_save_uploaded_file_uses_per_user_personal_path(tmp_path):
+    saved_path = save_uploaded_file(
+        b"hello",
+        "doc.txt",
+        upload_dir=str(tmp_path),
+        tenant_id="tenant/a",
+        owner_user_id="ou:test",
+        knowledge_base_type="personal",
+        document_id="doc123",
+    )
+    resolved = __import__("pathlib").Path(saved_path).resolve()
+
+    assert tmp_path.resolve() in resolved.parents
+    assert "personal" in resolved.parts
+    assert "tenant_a" in resolved.parts
+    assert "ou_test" in resolved.parts
+    assert resolved.name.startswith("doc123_")
+
+
 @patch("app.retrieval.vector_store.add_documents")
 @patch("app.retrieval.ingest.split_documents")
 @patch("app.retrieval.ingest.load_document")
-def test_ingest_file(mock_load, mock_split, mock_add):
+def test_ingest_file(mock_load, mock_split, mock_add, tmp_path):
     mock_load.return_value = [MagicMock()]
     chunk1 = MagicMock(metadata={"page": 1})
     chunk2 = MagicMock(metadata={"page": 2})
     mock_split.return_value = [chunk1, chunk2]
     mock_add.return_value = 2
 
-    result = ingest_file("/tmp/stored.pdf", original_filename="../test.pdf")
+    with patch("app.retrieval.document_registry.document_registry", DocumentRegistry(str(tmp_path / "registry.sqlite3"))):
+        result = ingest_file("/tmp/stored.pdf", original_filename="../test.pdf")
     assert result["chunks"] == 2
     assert "document_id" in result
     assert "filename" in result
     assert result["filename"] == "test.pdf"
     assert chunk1.metadata["document_id"] == result["document_id"]
+    assert chunk1.metadata["tenant_id"] == settings.default_tenant_id
+    assert chunk1.metadata["chunk_id"] == f"{result['document_id']}:0"
     assert chunk2.metadata["document_id"] == result["document_id"]
     assert chunk1.metadata["chunk_index"] == 0
     assert chunk2.metadata["chunk_index"] == 1
     assert chunk1.metadata["original_filename"] == "test.pdf"
     assert chunk1.metadata["stored_filename"] == "stored.pdf"
     assert chunk1.metadata["knowledge_base_type"] == "enterprise"
+    assert chunk1.metadata["owner_user_id"] == ""
     assert chunk1.metadata["owner_open_id"] == ""
     assert chunk1.metadata["chat_id"] == ""
     assert chunk1.metadata["channel"] == "api"
@@ -378,23 +468,27 @@ def test_ingest_file(mock_load, mock_split, mock_add):
 @patch("app.retrieval.vector_store.add_documents")
 @patch("app.retrieval.ingest.split_documents")
 @patch("app.retrieval.ingest.load_document")
-def test_ingest_file_personal_metadata(mock_load, mock_split, mock_add):
+def test_ingest_file_personal_metadata(mock_load, mock_split, mock_add, tmp_path):
     mock_load.return_value = [MagicMock()]
     chunk = MagicMock(metadata={})
     mock_split.return_value = [chunk]
     mock_add.return_value = 1
 
-    result = ingest_file(
-        "/tmp/stored.txt",
-        original_filename="我的资料.txt",
-        knowledge_base_type="personal",
-        owner_open_id="ou_test123",
-        chat_id="oc_test789",
-        channel="feishu",
-    )
+    with patch("app.retrieval.document_registry.document_registry", DocumentRegistry(str(tmp_path / "registry.sqlite3"))):
+        result = ingest_file(
+            "/tmp/stored.txt",
+            original_filename="我的资料.txt",
+            knowledge_base_type="personal",
+            owner_open_id="ou_test123",
+            owner_user_id="ou_test123",
+            chat_id="oc_test789",
+            channel="feishu",
+        )
 
     assert result["chunks"] == 1
     assert chunk.metadata["knowledge_base_type"] == "personal"
+    assert chunk.metadata["tenant_id"] == settings.default_tenant_id
+    assert chunk.metadata["owner_user_id"] == "ou_test123"
     assert chunk.metadata["owner_open_id"] == "ou_test123"
     assert chunk.metadata["chat_id"] == "oc_test789"
     assert chunk.metadata["channel"] == "feishu"
@@ -404,14 +498,15 @@ def test_ingest_file_personal_metadata(mock_load, mock_split, mock_add):
 @patch("app.retrieval.vector_store.add_documents")
 @patch("app.retrieval.ingest.split_documents")
 @patch("app.retrieval.ingest.load_document")
-def test_ingest_file_updates_opensearch_index(mock_load, mock_split, mock_add, mock_index):
+def test_ingest_file_updates_opensearch_index(mock_load, mock_split, mock_add, mock_index, tmp_path):
     mock_load.return_value = [MagicMock()]
     chunk = MagicMock(metadata={})
     mock_split.return_value = [chunk]
     mock_add.return_value = 1
     mock_index.return_value = 1
 
-    result = ingest_file("/tmp/stored.txt", original_filename="stored.txt")
+    with patch("app.retrieval.document_registry.document_registry", DocumentRegistry(str(tmp_path / "registry.sqlite3"))):
+        result = ingest_file("/tmp/stored.txt", original_filename="stored.txt")
 
     assert result["chunks"] == 1
     mock_index.assert_called_once_with([chunk])

@@ -110,7 +110,8 @@ def _sync_keyword_search(terms: list[str], k: int, metadata_filter: dict | None 
             return []
 
         vector_store = get_vector_store()
-        kwargs = {"where": metadata_filter} if metadata_filter and metadata_filter != {"knowledge_base_type": "enterprise"} else {}
+        where_filter = _chroma_where_filter(metadata_filter)
+        kwargs = {"where": where_filter} if where_filter else {}
         result = vector_store.get(include=["documents", "metadatas"], **kwargs)
         documents = result.get("documents") or []
         metadatas = result.get("metadatas") or []
@@ -263,12 +264,44 @@ def _levenshtein_distance(left: str, right: str) -> int:
 def _metadata_matches_keyword_filter(metadata: dict, metadata_filter: dict | None) -> bool:
     if not metadata_filter:
         return True
-    if metadata_filter == {"knowledge_base_type": "enterprise"}:
-        return (metadata.get("knowledge_base_type") or "enterprise") == "enterprise"
+    if metadata_filter.get("knowledge_base_type") == "enterprise":
+        if (metadata.get("knowledge_base_type") or "enterprise") != "enterprise":
+            return False
+        return _tenant_matches(metadata, metadata_filter.get("tenant_id"))
+    if "owner_open_id" in metadata_filter or "owner_user_id" in metadata_filter:
+        expected_owner = metadata_filter.get("owner_user_id") or metadata_filter.get("owner_open_id") or ""
+        metadata_owner = metadata.get("owner_user_id") or metadata.get("owner_open_id") or ""
+        return (
+            (metadata.get("knowledge_base_type") or "enterprise") == "personal"
+            and metadata_owner == expected_owner
+            and _tenant_matches(metadata, metadata_filter.get("tenant_id"))
+        )
     for key, expected in metadata_filter.items():
+        if key == "tenant_id" and not metadata.get("tenant_id") and expected == settings.default_tenant_id:
+            continue
         if metadata.get(key) != expected:
             return False
     return True
+
+
+def _tenant_matches(metadata: dict, expected_tenant: str | None) -> bool:
+    if not expected_tenant:
+        return True
+    metadata_tenant = metadata.get("tenant_id") or settings.default_tenant_id
+    return metadata_tenant == expected_tenant
+
+
+def _chroma_where_filter(metadata_filter: dict | None) -> dict | None:
+    """Use only legacy-compatible fields in Chroma where filters."""
+    if not metadata_filter:
+        return None
+    if metadata_filter.get("knowledge_base_type") == "enterprise":
+        return None
+    if "owner_open_id" in metadata_filter:
+        return {"owner_open_id": metadata_filter.get("owner_open_id") or ""}
+    if "owner_user_id" in metadata_filter:
+        return {"owner_user_id": metadata_filter.get("owner_user_id") or ""}
+    return {key: value for key, value in metadata_filter.items() if key != "tenant_id"}
 
 
 def _sync_get_document_chunks(document_id: str) -> list[dict]:
