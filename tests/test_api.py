@@ -13,7 +13,7 @@ from app.orchestrator import orchestrator as app_orchestrator
 from app.security import rate_limit as rate_limit_module
 from app.security.rate_limit import InMemoryRateLimitBackend, RateLimiter
 from app.llm.gateway import LLMGatewayError
-from app.schemas import AgentResponse, SourceItem, ToolTrace
+from app.schemas import AgentResponse, AskRequest, SourceItem, ToolTrace
 from app.tools.registry import ToolExecution
 
 
@@ -293,6 +293,30 @@ def test_ask_overrides_forged_body_identity_with_trusted_headers(client):
     trusted_request = mock_process.call_args.args[0]
     assert trusted_request.user_id == "real_user"
     assert trusted_request.channel == "api"
+
+
+@pytest.mark.asyncio
+async def test_api_channel_uses_request_user_as_personal_kb_owner():
+    request = AskRequest(
+        channel="api",
+        user_id="real_user",
+        question="查找我的个人知识库内容",
+        knowledge_scope=["enterprise", "personal"],
+    )
+
+    with patch(
+        "app.orchestrator.orchestrator._prepare_rag_subquestions",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[]),
+    ) as mock_search, patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ):
+        await app_orchestrator._handle_rag(request, request.question, history=[])
+
+    assert mock_search.call_args.kwargs["owner_open_id"] == "real_user"
 
 
 def test_ask_rejects_invalid_trusted_channel(client):

@@ -436,7 +436,7 @@ class Orchestrator:
             standalone_question,
             request.top_k,
             request.knowledge_scope,
-            owner_open_id=request.user_id if request.channel == "feishu" else None,
+            owner_open_id=self._owner_open_id_for_request(request),
             subquestions=subquestions,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
@@ -564,6 +564,11 @@ class Orchestrator:
         keywords = ["主要内容", "时代演变", "历史影响", "有哪些", "列出", "简介", "概括"]
         return any(keyword in text for keyword in keywords)
 
+    def _owner_open_id_for_request(self, request: AskRequest) -> str | None:
+        """Use the trusted request user as personal knowledge-base owner."""
+        user_id = (request.user_id or "").strip()
+        return user_id or None
+
     async def _prepare_rag_subquestions(self, question: str) -> list[str] | None:
         """准备可选 LLM 子问题；规则可拆时交给 Retriever 处理。"""
         rule_variants = self.retriever._build_query_variants(question)
@@ -667,7 +672,7 @@ class Orchestrator:
             standalone_question,
             request.top_k,
             request.knowledge_scope,
-            owner_open_id=request.user_id if request.channel == "feishu" else None,
+            owner_open_id=self._owner_open_id_for_request(request),
             subquestions=subquestions,
         )
         retrieval_ms = (time.perf_counter() - start) * 1000
