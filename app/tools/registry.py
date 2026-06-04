@@ -5,6 +5,7 @@ from typing import List
 from app.schemas import ToolTrace
 from app.tools.calculator import calculate
 from app.tools.search import web_search
+from app.tools.summarize import summarize_uploaded_file_content
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,6 +26,7 @@ class ToolRegistry:
         self._tools = {
             "calculator": self._run_calculator,
             "web_search": self._run_web_search,
+            "summarize_uploaded_file": self._run_summarize_uploaded_file,
         }
 
     async def execute_with_result(self, tool_name: str, tool_input: dict) -> ToolExecution:
@@ -85,6 +87,16 @@ class ToolRegistry:
         """执行联网搜索"""
         query = tool_input.get("query", "")
         return await web_search(query, domains=tool_input.get("domains"))
+
+    async def _run_summarize_uploaded_file(self, tool_input: dict) -> dict:
+        """识别并总结已提供的文件内容。"""
+        filename = tool_input.get("filename", "")
+        content = tool_input.get("content", b"")
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        if not isinstance(content, bytes):
+            return {"success": False, "error": "content 必须是 bytes 或 string"}
+        return await summarize_uploaded_file_content(content, filename)
 
     def get_available_tools(self) -> List[str]:
         """获取可用工具列表"""

@@ -230,3 +230,24 @@ class TestToolRegistry:
         tools = tool_registry.get_available_tools()
         assert "calculator" in tools
         assert "web_search" in tools
+        assert "summarize_uploaded_file" in tools
+
+    @pytest.mark.asyncio
+    async def test_summarize_uploaded_file_tool(self):
+        with patch("app.tools.registry.summarize_uploaded_file_content", new=AsyncMock(return_value={
+            "success": True,
+            "resource_type": "txt",
+            "title": "test.txt",
+            "summary": "摘要",
+            "outline": ["片段1"],
+            "sample_text": "hello",
+            "warnings": [],
+        })) as mock_summary:
+            execution = await tool_registry.execute_with_result(
+                "summarize_uploaded_file",
+                {"filename": "test.txt", "content": "hello"},
+            )
+
+        assert execution.trace.status == "success"
+        assert execution.result["summary"] == "摘要"
+        mock_summary.assert_awaited_once_with(b"hello", "test.txt")

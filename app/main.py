@@ -28,6 +28,7 @@ from app.retrieval.ingest import (
     save_uploaded_file,
     validate_file_extension,
 )
+from app.tools.summarize import summarize_uploaded_file_content
 from app.observability.logging import get_logger
 from app.redis_client import log_redis_startup_health
 from app.security.auth import AuthContext, get_api_auth_context
@@ -356,6 +357,12 @@ def build_personal_file_confirm_card(filename: str, pending_id: str) -> dict:
                     },
                     {
                         "tag": "button",
+                        "text": {"tag": "plain_text", "content": "识别并总结"},
+                        "type": "default",
+                        "value": {"action": "summarize_file", "pending_id": pending_id},
+                    },
+                    {
+                        "tag": "button",
                         "text": {"tag": "plain_text", "content": "取消"},
                         "type": "default",
                         "value": {"action": "cancel_save_personal_file", "pending_id": pending_id},
@@ -390,6 +397,10 @@ async def process_feishu_card_action(action_data: dict) -> None:
         await feishu_adapter.send_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。")
         return
 
+    if action == "summarize_file":
+        await summarize_pending_feishu_file(pending)
+        return
+
     if action not in {"confirm_save_personal_file", "confirm_save_enterprise_file"}:
         return
 
@@ -403,6 +414,36 @@ async def process_feishu_card_action(action_data: dict) -> None:
         await save_feishu_file_to_enterprise_knowledge(pending)
     else:
         await save_feishu_file_to_personal_knowledge(pending)
+
+
+async def summarize_pending_feishu_file(pending: dict) -> None:
+    filename = pending.get("file_name")
+    chat_id = pending.get("chat_id")
+    try:
+        content = await feishu_adapter.download_message_resource(
+            pending.get("message_id"),
+            pending.get("file_key"),
+        )
+        if not content:
+            await feishu_adapter.send_message(chat_id, "文件下载失败，请稍后重试。")
+            return
+        result = await summarize_uploaded_file_content(content, filename)
+        if not result.get("success"):
+            await feishu_adapter.send_message(chat_id, result.get("error") or "文件识别总结失败。")
+            return
+        warnings = "\n".join(f"- {warning}" for warning in result.get("warnings", []))
+        message = (
+            f"文件识别结果：{result.get('title')}\n"
+            f"类型：{result.get('resource_type')}\n\n"
+            f"摘要：\n{result.get('summary')}\n\n"
+            f"结构/范围：{', '.join(result.get('outline') or []) or '未识别到明确结构'}"
+        )
+        if warnings:
+            message += f"\n\n注意：\n{warnings}"
+        await feishu_adapter.send_message(chat_id, message)
+    except Exception as e:
+        logger.error(f"飞书文件识别总结失败: {e}", exc_info=True)
+        await feishu_adapter.send_message(chat_id, "文件识别总结失败，请稍后重试。")
 
 
 async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:

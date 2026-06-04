@@ -737,9 +737,46 @@ class TestFeishuPersonalKnowledgeFiles:
         values = [action["value"]["action"] for action in actions]
         assert "confirm_save_personal_file" in values
         assert "confirm_save_enterprise_file" in values
+        assert "summarize_file" in values
         assert "cancel_save_personal_file" in values
         mock_ingest.assert_not_called()
         mock_download.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_summarize_card_downloads_and_summarizes_without_ingest_or_consuming_pending(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "message_id": "om_file456",
+            "file_key": "file_key_1",
+            "file_name": "资料.txt",
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.feishu_adapter.download_message_resource", new=AsyncMock(return_value=b"hello")) as mock_download, \
+             patch("app.main.summarize_uploaded_file_content", new=AsyncMock(return_value={
+                 "success": True,
+                 "title": "资料.txt",
+                 "resource_type": "txt",
+                 "summary": "这是摘要",
+                 "outline": ["片段1"],
+                 "warnings": [],
+             })) as mock_summary, \
+             patch("app.main.ingest_file") as mock_ingest, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "summarize_file",
+                "pending_id": "pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_download.assert_awaited_once_with("om_file456", "file_key_1")
+        mock_summary.assert_awaited_once_with(b"hello", "资料.txt")
+        mock_ingest.assert_not_called()
+        assert "pending_1" in pending_feishu_files
+        assert "文件识别结果" in mock_send.await_args.args[1]
+        assert "这是摘要" in mock_send.await_args.args[1]
 
     @pytest.mark.asyncio
     async def test_file_event_rejects_unsupported_extension(self):
