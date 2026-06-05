@@ -200,6 +200,8 @@ class TxtBackend(DocumentBackend):
                 if not op.value:
                     raise ValueError(f"append_lines 缺少 lines 或 value: {op.target}")
                 lines = [op.value]
+            if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
+                raise ValueError(f"append_lines 的 lines 必须是字符串列表: {op.target}")
             await self.append_lines(file_path, lines)
 
         elif action == "replace_text":

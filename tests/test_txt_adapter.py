@@ -433,6 +433,36 @@ class TestExecuteErrors:
         assert "缺少" in result.error
 
     @pytest.mark.asyncio
+    async def test_append_lines_string_rejected(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path=sample_doc,
+            backend_required=BackendType.TEXT_ADAPTER,
+            operations=[
+                DocumentOperation(action="append_lines", target={"lines": "abc"}, description="错误类型"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "字符串列表" in result.error
+
+    @pytest.mark.asyncio
+    async def test_append_lines_non_string_item_rejected(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path=sample_doc,
+            backend_required=BackendType.TEXT_ADAPTER,
+            operations=[
+                DocumentOperation(action="append_lines", target={"lines": ["ok", 123]}, description="错误元素"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "字符串列表" in result.error
+
+    @pytest.mark.asyncio
     async def test_partial_edit_no_output_file(self, backend, sample_doc):
         plan = DocumentPlan(
             intent=DocumentIntent.EDIT,
