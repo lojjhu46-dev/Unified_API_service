@@ -1,0 +1,251 @@
+"""文档工具接入主编排路径测试"""
+
+import json
+import pytest
+from unittest.mock import AsyncMock, patch
+from fastapi.testclient import TestClient
+from app.config import settings
+from app.main import app
+from app.documents.tools import set_executor, _reset_executor
+from app.documents.executor import DocumentOperationAgent
+from app.documents.models import BackendType
+from app.documents.adapters.docx import MockDocxBackend
+from app.documents.adapters.txt import MockTxtBackend
+from app.documents.adapters.pdf import MockPdfBackend
+
+
+@pytest.fixture
+def client():
+    with patch.object(settings, "api_key", None), patch.object(settings, "llm_provider", "mock"):
+        yield TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_executor():
+    _reset_executor()
+    yield
+    _reset_executor()
+
+
+def _setup_executor_with_txt():
+    """注入带 TXT mock 后端的执行器"""
+    executor = DocumentOperationAgent()
+    backend = MockTxtBackend()
+    backend.load_file("/tmp/test.txt", ["第一行", "第二行", "第三行"])
+    executor.register_backend(BackendType.TEXT_ADAPTER, backend)
+    set_executor(executor)
+    return executor
+
+
+# ---------------------------------------------------------------------------
+# 路由识别
+# ---------------------------------------------------------------------------
+
+class TestDocumentRouting:
+    def test_structured_file_path_routes_to_tool(self, client):
+        """传 document_file_path 应走 tool 路由"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "审阅文档",
+            "document_file_path": "/tmp/test.txt",
+            "document_action": "review",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "审阅" in data["answer"] or "文档" in data["answer"]
+
+    def test_natural_language_doc_path_routes_to_tool(self, client):
+        """自然语言中的文件路径 + 意图词应走 tool 路由"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "总结 /tmp/test.txt 的内容",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+
+    def test_document_plan_routes_to_tool(self, client):
+        """传 document_plan 应走 tool 路由"""
+        payload = {
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 1}, "value": "新内容"},
+                ],
+            },
+            "document_confirmed": True,
+        }
+        _setup_executor_with_txt()
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+
+    def test_normal_question_not_routed_to_document(self, client):
+        """普通问题不应走文档路由"""
+        payload = {
+            "user_id": "test_user",
+            "question": "什么是机器学习？",
+        }
+        with patch(
+            "app.orchestrator.orchestrator.llm.generate",
+            new=AsyncMock(return_value="机器学习是..."),
+        ):
+            response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "rag"
+
+    def test_calculator_not_affected(self, client):
+        """计算题不受文档路由影响"""
+        payload = {
+            "user_id": "test_user",
+            "question": "计算 2+3 等于多少",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "计算结果" in data["answer"]
+
+
+# ---------------------------------------------------------------------------
+# 文档操作执行
+# ---------------------------------------------------------------------------
+
+class TestDocumentOperations:
+    def test_extract_via_ask(self, client):
+        """通过 /ask 提取文档结构"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "提取文档结构",
+            "document_file_path": "/tmp/test.txt",
+            "document_action": "extract",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "提取成功" in data["answer"] or "结构" in data["answer"]
+
+    def test_review_via_ask(self, client):
+        """通过 /ask 审阅文档"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "审阅文档",
+            "document_file_path": "/tmp/test.txt",
+            "document_action": "review",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "审阅" in data["answer"] or "文档" in data["answer"]
+
+    def test_plan_via_ask(self, client):
+        """通过 /ask 生成编辑方案"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "把第一行改成新内容",
+            "document_file_path": "/tmp/test.txt",
+            "document_action": "plan",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+
+    def test_apply_confirmed_via_ask(self, client):
+        """通过 /ask 确认执行编辑"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 1}, "value": "新标题"},
+                ],
+            },
+            "document_confirmed": True,
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "成功" in data["answer"]
+
+    def test_apply_unconfirmed_returns_confirmation_prompt(self, client):
+        """未确认的编辑应返回确认提示"""
+        payload = {
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "risk_level": "high",
+                "requires_confirmation": True,
+                "operations": [
+                    {"action": "delete_line", "target": {"line": 1}},
+                ],
+            },
+            "document_confirmed": False,
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "确认" in data["answer"]
+
+    def test_apply_without_plan_returns_hint(self, client):
+        """apply 但没有 plan 应返回提示"""
+        payload = {
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_action": "apply",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "方案" in data["answer"]
+
+
+# ---------------------------------------------------------------------------
+# 工具轨迹
+# ---------------------------------------------------------------------------
+
+class TestToolTrace:
+    def test_document_tool_trace_present(self, client):
+        """文档操作应有 tool_trace"""
+        _setup_executor_with_txt()
+        payload = {
+            "user_id": "test_user",
+            "question": "审阅文档",
+            "document_file_path": "/tmp/test.txt",
+            "document_action": "review",
+            "return_trace": True,
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["tool_trace"]) > 0
+        assert data["tool_trace"][0]["tool_name"] == "document_review"

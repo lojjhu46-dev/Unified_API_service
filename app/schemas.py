@@ -15,6 +15,12 @@ class AskRequest(BaseModel):
     need_web: Literal["auto", "always", "never"] = Field(default="auto", description="是否需要联网搜索")
     top_k: int = Field(default=5, ge=1, le=20, description="检索返回来源数量")
     return_trace: bool = Field(default=False, description="是否返回工具调用轨迹")
+    # 文档工具字段（可选，保持旧请求兼容）
+    document_file_path: Optional[str] = Field(default=None, description="文档文件路径")
+    document_file_type: Optional[Literal["docx", "xlsx", "txt", "pdf"]] = Field(default=None, description="文档文件类型")
+    document_action: Literal["auto", "extract", "review", "plan", "apply"] = Field(default="auto", description="文档操作类型")
+    document_plan: Optional[dict] = Field(default=None, description="已生成的编辑方案（用于 apply）")
+    document_confirmed: bool = Field(default=False, description="是否确认执行高风险操作")
 
     @field_validator("question")
     @classmethod

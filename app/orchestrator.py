@@ -21,6 +21,7 @@ from app.memory.rewrite import _history_to_text, rewrite_question
 from app.tools.registry import tool_registry
 from app.tools.calculator import extract_math_expression
 from app.tools.search import format_search_results
+from app.documents.tools import document_extract, document_plan, document_apply_plan, document_review
 from app.config import settings
 from app.observability.logging import get_logger
 
@@ -353,7 +354,11 @@ class Orchestrator:
         if question in direct_phrases:
             return "direct"
 
-        # 显式联网优先级最高，避免被“多少”等词误判为计算。
+        # 文档操作优先于联网和计算（避免 .txt/.docx 被误判为 URL 域名）
+        if self._is_document_request(request):
+            return "tool"
+
+        # 显式联网优先级最高，避免被"多少"等词误判为计算。
         if request.need_web == "always":
             return "web"
         if request.need_web == "auto":
@@ -392,7 +397,7 @@ class Orchestrator:
             ):
                 return "agentic_rag"
 
-        # 需要计算。要求能提取出真实数学表达式，避免“今天气温多少”误入计算器。
+        # 需要计算。要求能提取出真实数学表达式，避免"今天气温多少"误入计算器。
         if self._is_calculation_question(question):
             return "tool"
 
@@ -408,6 +413,40 @@ class Orchestrator:
         has_operator = any(op in expression for op in ["+", "-", "*", "/", "%", "^", ">", "<", "="])
         has_math_word = any(word in question for word in ["计算", "换算", "加", "减", "乘", "除", "等于"])
         return has_digit and (has_operator or has_math_word)
+
+    # ---- 文档请求识别 ----
+
+    _DOC_EXTENSIONS = (".docx", ".xlsx", ".txt", ".pdf")
+    _DOC_EDIT_INTENT_WORDS = frozenset({
+        "修改", "编辑", "替换", "删除", "改写", "添加", "插入", "清空", "移除", "更新", "改动",
+        "edit", "replace", "delete", "modify", "remove", "clear",
+    })
+    _DOC_REVIEW_INTENT_WORDS = frozenset({
+        "审阅", "审阅文档", "提取", "提取结构", "总结", "总结文档", "查看", "查看结构",
+        "review", "extract", "summarize",
+    })
+
+    def _is_document_request(self, request: AskRequest) -> bool:
+        """判断是否为文档操作请求"""
+        # 结构化字段优先
+        if request.document_file_path:
+            return True
+        if request.document_plan:
+            return True
+        if request.document_action != "auto":
+            return True
+
+        # 自然语言识别：文件路径 + 意图词
+        question = request.question
+        has_doc_path = any(ext in question.lower() for ext in self._DOC_EXTENSIONS)
+        if not has_doc_path:
+            return False
+
+        has_intent = any(
+            word in question
+            for word in self._DOC_EDIT_INTENT_WORDS | self._DOC_REVIEW_INTENT_WORDS
+        )
+        return has_intent
 
     async def _handle_direct(self, request: AskRequest) -> dict:
         """处理直接问答"""
@@ -752,6 +791,10 @@ class Orchestrator:
         """处理工具调用"""
         tool_trace = []
 
+        # ---- 文档操作优先 ----
+        if self._is_document_request(request):
+            return await self._handle_document_tool(request, tool_trace)
+
         # 判断是否为计算问题
         expression = extract_math_expression(request.question)
         if expression:
@@ -770,6 +813,139 @@ class Orchestrator:
 
         # 降级为直接回答
         return await self._handle_direct(request)
+
+    async def _handle_document_tool(
+        self,
+        request: AskRequest,
+        tool_trace: list,
+    ) -> dict:
+        """处理文档工具调用"""
+        file_path = request.document_file_path or self._extract_file_path(request.question)
+        file_type = request.document_file_type
+        action = request.document_action
+
+        # apply：执行已有 plan
+        if action == "apply" or request.document_plan:
+            if not request.document_plan:
+                return {
+                    "answer": "请先通过 plan 操作生成编辑方案，再提交执行。",
+                    "sources": [],
+                    "tool_trace": tool_trace,
+                    "tool_ms": 0,
+                    "llm_ms": 0,
+                }
+            execution = await self.tools.execute_with_result("document_apply_plan", {
+                "plan": request.document_plan,
+                "confirmed": request.document_confirmed,
+            })
+            tool_trace.append(execution.trace)
+            result = execution.result
+            if result.get("success"):
+                output_file = result.get("result", {}).get("output_file", "")
+                summary = result.get("result", {}).get("summary", "")
+                answer = f"编辑执行成功。{summary}"
+                if output_file:
+                    answer += f"\n输出文件：{output_file}"
+            elif result.get("requires_confirmation"):
+                answer = "该操作风险较高，请确认后重新提交（设置 document_confirmed=true）。"
+            else:
+                answer = f"编辑执行失败：{result.get('error', '未知错误')}"
+            return {
+                "answer": answer,
+                "sources": [],
+                "tool_trace": tool_trace,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": 0,
+            }
+
+        # extract：提取结构
+        if action == "extract":
+            execution = await self.tools.execute_with_result("document_extract", {
+                "file_path": file_path,
+                "file_type": file_type,
+            })
+            tool_trace.append(execution.trace)
+            result = execution.result
+            if result.get("success"):
+                structure = result.get("structure", {})
+                answer = f"文档结构提取成功：\n类型：{result.get('file_type')}\n结构：{json.dumps(structure, ensure_ascii=False, indent=2)}"
+            else:
+                answer = f"文档结构提取失败：{result.get('error', '未知错误')}"
+            return {
+                "answer": answer,
+                "sources": [],
+                "tool_trace": tool_trace,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": 0,
+            }
+
+        # plan：生成编辑方案
+        if action == "plan" or (file_path and self._has_edit_intent(request.question)):
+            execution = await self.tools.execute_with_result("document_plan", {
+                "user_command": request.question,
+                "file_path": file_path,
+                "file_type": file_type,
+            })
+            tool_trace.append(execution.trace)
+            result = execution.result
+            if result.get("success"):
+                plan = result.get("plan", {})
+                answer = (
+                    "已生成编辑方案，请确认后执行：\n"
+                    f"```json\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n```"
+                )
+            else:
+                answer = f"编辑方案生成失败：{result.get('error', '未知错误')}"
+            return {
+                "answer": answer,
+                "sources": [],
+                "tool_trace": tool_trace,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": 0,
+            }
+
+        # 默认：review（审阅/总结）
+        execution = await self.tools.execute_with_result("document_review", {
+            "file_path": file_path,
+            "file_type": file_type,
+        })
+        tool_trace.append(execution.trace)
+        result = execution.result
+        if result.get("success"):
+            answer = f"文档审阅结果：\n{result.get('summary', '')}"
+            structure = result.get("structure")
+            if structure:
+                answer += f"\n\n文档结构：{json.dumps(structure, ensure_ascii=False)}"
+        else:
+            answer = f"文档审阅失败：{result.get('error', '未知错误')}"
+        return {
+            "answer": answer,
+            "sources": [],
+            "tool_trace": tool_trace,
+            "tool_ms": execution.trace.latency_ms,
+            "llm_ms": 0,
+        }
+
+    def _has_edit_intent(self, question: str) -> bool:
+        """判断问题是否包含编辑意图"""
+        return any(word in question for word in self._DOC_EDIT_INTENT_WORDS)
+
+    @staticmethod
+    def _extract_file_path(question: str) -> str:
+        """从自然语言中提取文件路径"""
+        # Windows 路径：D:\docs\file.docx
+        match = re.search(r'[A-Za-z]:\\[^\s，。？！]+', question)
+        if match:
+            return match.group(0)
+        # Linux/WSL 路径：/tmp/file.txt
+        match = re.search(r'/(?:tmp|home|root|mnt|opt|var)[^\s，。？！]+', question)
+        if match:
+            return match.group(0)
+        # 引号包裹路径
+        match = re.search(r'[""「]([^""」]+\.\w{3,4})[""」]', question)
+        if match:
+            return match.group(1)
+        return ""
 
     async def _handle_agentic_rag(
         self,
