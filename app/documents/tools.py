@@ -6,19 +6,12 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import Any
 
-from app.documents.adapters.docx import MockDocxBackend
-from app.documents.adapters.pdf import MockPdfBackend
-from app.documents.adapters.txt import MockTxtBackend
-from app.documents.adapters.xlsx import MockXlsxBackend
 from app.documents.executor import DocumentOperationAgent
 from app.documents.models import (
     BackendType,
     DocumentIntent,
-    DocumentOperationResult,
     DocumentPlan,
     FileType,
 )
@@ -28,7 +21,7 @@ from app.observability.logging import get_logger
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# 文件类型推断
+# 文件类型推断与解析
 # ---------------------------------------------------------------------------
 
 _EXT_TO_FILE_TYPE: dict[str, FileType] = {
@@ -43,6 +36,32 @@ def infer_file_type(file_path: str) -> FileType | None:
     """从文件扩展名推断 FileType"""
     ext = Path(file_path).suffix.lower()
     return _EXT_TO_FILE_TYPE.get(ext)
+
+
+def _resolve_file_type(file_path: str, file_type_str: str | None) -> tuple[FileType | None, str | None]:
+    """安全解析文件类型，返回 (FileType, error_message)。
+
+    优先使用显式传入的 file_type_str，其次从扩展名推断。
+    非法值返回 (None, error_message)，不抛异常。
+    """
+    if file_type_str:
+        try:
+            return FileType(file_type_str), None
+        except ValueError:
+            valid = ", ".join(t.value for t in FileType)
+            return None, f"不支持的文件类型: {file_type_str}，可选: {valid}"
+    ft = infer_file_type(file_path)
+    if ft is None:
+        return None, f"无法推断文件类型: {file_path}"
+    return ft, None
+
+
+_BACKEND_BY_FILE_TYPE: dict[FileType, BackendType] = {
+    FileType.DOCX: BackendType.DOCX_MCP,
+    FileType.XLSX: BackendType.XLSX_MCP,
+    FileType.TXT: BackendType.TEXT_ADAPTER,
+    FileType.PDF: BackendType.PDF_READER,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -64,11 +83,6 @@ def _get_executor() -> DocumentOperationAgent:
     global _executor
     if _executor is None:
         _executor = DocumentOperationAgent()
-        # 注册 mock 后端（真实 MCP 后端后续替换）
-        _executor.register_backend(BackendType.DOCX_MCP, MockDocxBackend())
-        _executor.register_backend(BackendType.XLSX_MCP, MockXlsxBackend())
-        _executor.register_backend(BackendType.TEXT_ADAPTER, MockTxtBackend())
-        _executor.register_backend(BackendType.PDF_READER, MockPdfBackend())
     return _executor
 
 
@@ -76,6 +90,12 @@ def set_executor(executor: DocumentOperationAgent) -> None:
     """注入自定义执行器（用于测试或替换后端）"""
     global _executor
     _executor = executor
+
+
+def _reset_executor() -> None:
+    """重置为默认空执行器（测试用）"""
+    global _executor
+    _executor = None
 
 
 # ---------------------------------------------------------------------------
@@ -92,18 +112,11 @@ async def document_extract(tool_input: dict) -> dict:
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 
-    file_type_str = tool_input.get("file_type")
-    file_type = FileType(file_type_str) if file_type_str else infer_file_type(file_path)
-    if file_type is None:
-        return {"success": False, "error": f"无法推断文件类型: {file_path}"}
+    file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
+    if err:
+        return {"success": False, "error": err}
 
-    backend_type = {
-        FileType.DOCX: BackendType.DOCX_MCP,
-        FileType.XLSX: BackendType.XLSX_MCP,
-        FileType.TXT: BackendType.TEXT_ADAPTER,
-        FileType.PDF: BackendType.PDF_READER,
-    }.get(file_type)
-
+    backend_type = _BACKEND_BY_FILE_TYPE.get(file_type)
     executor = _get_executor()
     backend = executor.get_backend(backend_type) if backend_type else None
     if backend is None:
@@ -136,16 +149,17 @@ async def document_plan(tool_input: dict) -> dict:
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 
-    file_type_str = tool_input.get("file_type")
-    file_type = FileType(file_type_str) if file_type_str else infer_file_type(file_path)
-    if file_type is None:
-        return {"success": False, "error": f"无法推断文件类型: {file_path}"}
+    file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
+    if err:
+        return {"success": False, "error": err}
 
     structure = tool_input.get("structure")
     planner = _get_planner()
 
     try:
         plan = await planner.plan(user_command, file_type, structure)
+        # 写回 file_path，确保 document_plan -> document_apply_plan 链路可用
+        plan = plan.model_copy(update={"file_path": file_path})
         return {
             "success": True,
             "plan": plan.model_dump(),
@@ -198,28 +212,17 @@ async def document_review(tool_input: dict) -> dict:
     """审阅文档（只读）
 
     input: { file_path: str, file_type?: str, user_command?: str }
-    output: { success, summary, structure }
+    output: { success, summary, structure, error }
     """
     file_path = tool_input.get("file_path", "")
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 
-    file_type_str = tool_input.get("file_type")
-    file_type = FileType(file_type_str) if file_type_str else infer_file_type(file_path)
-    if file_type is None:
-        return {"success": False, "error": f"无法推断文件类型: {file_path}"}
+    file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
+    if err:
+        return {"success": False, "error": err}
 
-    backend_type = {
-        FileType.DOCX: BackendType.DOCX_MCP,
-        FileType.XLSX: BackendType.XLSX_MCP,
-        FileType.TXT: BackendType.TEXT_ADAPTER,
-        FileType.PDF: BackendType.PDF_READER,
-    }.get(file_type)
-
-    executor = _get_executor()
-    backend = executor.get_backend(backend_type) if backend_type else None
-    if backend is None:
-        return {"success": False, "error": f"后端 {backend_type} 未注册"}
+    backend_type = _BACKEND_BY_FILE_TYPE.get(file_type)
 
     try:
         plan = DocumentPlan(
@@ -228,7 +231,8 @@ async def document_review(tool_input: dict) -> dict:
             file_path=file_path,
             backend_required=backend_type,
         )
-        result = await backend.execute(plan)
+        executor = _get_executor()
+        result = await executor.execute(plan)
         return {
             "success": result.success,
             "summary": result.summary,
