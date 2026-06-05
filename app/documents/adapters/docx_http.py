@@ -6,17 +6,12 @@
 
 from __future__ import annotations
 
-import uuid
-from pathlib import Path
 from typing import Any
 
 import httpx
 
 from app.documents.adapters.base import BackendUnavailableError
 from app.documents.adapters.docx import DocxBackend
-from app.observability.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 class HttpDocxBackend(DocxBackend):

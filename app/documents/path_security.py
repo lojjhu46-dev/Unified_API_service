@@ -5,13 +5,9 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from app.config import settings
-from app.observability.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 def get_allowed_dirs() -> list[Path]:

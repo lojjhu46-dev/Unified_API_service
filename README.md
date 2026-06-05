@@ -108,6 +108,21 @@ CORS_ALLOWED_ORIGINS=https://your-frontend.example.com
 CORS_ALLOW_CREDENTIALS=false
 ```
 
+## 文档 MCP 后端
+
+TXT 和 PDF 使用本地真实后端；DOCX 和 XLSX 编辑依赖独立的 HTTP MCP 服务。启用后，API 服务会把上传目录内的文件路径传给 MCP 服务，因此两边必须共享同一文件系统挂载或等价的网络文件系统。
+
+```env
+DOCUMENT_MCP_ENABLED=true
+DOCUMENT_MCP_TIMEOUT_SECONDS=30
+DOCX_MCP_BASE_URL=http://localhost:9100
+XLSX_MCP_BASE_URL=http://localhost:9101
+```
+
+MCP 服务需要按 `.env.example` 中列出的 HTTP 契约提供 DOCX/XLSX 读写端点，统一返回 `{success: bool, data?: object, error?: string}`。如果未启用 MCP 或未配置对应 URL，DOCX/XLSX 后端会明确返回未注册/不可用；不会回退到 mock 后端。
+
+文档工具只允许访问 `UPLOAD_DIR` 和 `PERSONAL_UPLOAD_DIR` 下的文件，输出副本由后端在源文件同目录生成，原文件不被覆盖。
+
 飞书文件确认 pending 状态和公开入口限流优先使用 Redis。生产环境请保证 `REDIS_URL` 可用；如果 Redis 不可用，服务会回退到本机内存，适合本地开发但不适合多实例生产：
 
 ```env

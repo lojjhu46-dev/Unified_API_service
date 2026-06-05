@@ -12,9 +12,6 @@ import httpx
 
 from app.documents.adapters.base import BackendUnavailableError
 from app.documents.adapters.xlsx import XlsxBackend
-from app.observability.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 class HttpXlsxBackend(XlsxBackend):
