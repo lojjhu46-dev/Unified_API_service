@@ -8,6 +8,7 @@ from app.channels.feishu_resources import extract_feishu_resource_links
 from app.tools.calculator import calculate
 from app.tools.search import web_search
 from app.tools.summarize import summarize_uploaded_file_content
+from app.documents.tools import document_extract, document_plan, document_apply_plan, document_review
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -30,6 +31,10 @@ class ToolRegistry:
             "web_search": self._run_web_search,
             "summarize_uploaded_file": self._run_summarize_uploaded_file,
             "feishu_resource_summarize": self._run_feishu_resource_summarize,
+            "document_extract": document_extract,
+            "document_plan": document_plan,
+            "document_apply_plan": document_apply_plan,
+            "document_review": document_review,
         }
 
     async def execute_with_result(self, tool_name: str, tool_input: dict) -> ToolExecution:
