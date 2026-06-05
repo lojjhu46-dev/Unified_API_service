@@ -8,15 +8,19 @@ MockDocxBackend 用于测试和无 MCP 环境时的开发验证。
 from __future__ import annotations
 
 import copy
+import uuid
+from abc import abstractmethod
 from pathlib import Path
 from typing import Any
 
 from app.documents.adapters.base import BackendUnavailableError, DocumentBackend
 from app.documents.models import (
+    BackendType,
     DocumentIntent,
     DocumentOperation,
     DocumentOperationResult,
     DocumentPlan,
+    FileType,
 )
 from app.observability.logging import get_logger
 
@@ -34,31 +38,32 @@ class DocxBackend(DocumentBackend):
     def name(self) -> str:
         return "docx_backend"
 
-    # ---- 子类需实现的原子操作 ----
+    # ---- 子类必须实现的原子操作 ----
 
-    async def read_structure(self, file_path: str) -> dict[str, Any]:
-        """读取 DOCX 文档结构（段落列表、标题、表格等）"""
-        raise NotImplementedError
-
+    @abstractmethod
     async def read_paragraph(self, file_path: str, index: int) -> str:
         """读取指定段落的文本"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def replace_paragraph(self, file_path: str, index: int, new_text: str) -> None:
         """替换指定段落的文本"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def delete_paragraph(self, file_path: str, index: int) -> None:
         """删除指定段落"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def append_paragraph(self, file_path: str, text: str) -> None:
         """在文档末尾追加段落"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def save_copy(self, file_path: str, output_path: str) -> str:
         """保存文档副本到指定路径，返回输出路径"""
-        raise NotImplementedError
+        ...
 
     # ---- 统一执行入口 ----
 
@@ -72,6 +77,18 @@ class DocxBackend(DocumentBackend):
             return DocumentOperationResult(
                 success=False,
                 error=f"{self.name} 不可用",
+            )
+
+        if plan.file_type != FileType.DOCX:
+            return DocumentOperationResult(
+                success=False,
+                error=f"{self.name} 不支持 {plan.file_type.value} 文件",
+            )
+
+        if plan.backend_required not in (BackendType.DOCX_MCP, None):
+            return DocumentOperationResult(
+                success=False,
+                error=f"{self.name} 不匹配后端 {plan.backend_required}",
             )
 
         if plan.intent == DocumentIntent.UNSUPPORTED:
@@ -181,9 +198,10 @@ class DocxBackend(DocumentBackend):
 
     @staticmethod
     def _build_output_path(file_path: str) -> str:
-        """生成副本路径：原文件名_副本.docx"""
+        """生成唯一副本路径：原文件名_副本_<uuid>.docx，避免连续执行覆盖。"""
         p = Path(file_path)
-        return str(p.parent / f"{p.stem}_副本{p.suffix}")
+        short_id = uuid.uuid4().hex[:8]
+        return str(p.parent / f"{p.stem}_副本_{short_id}{p.suffix}")
 
 
 class MockDocxBackend(DocxBackend):

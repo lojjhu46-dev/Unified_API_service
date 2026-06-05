@@ -368,3 +368,71 @@ class TestExecuteErrors:
         assert not result.success
         assert result.output_file is None
         assert result.verification.get("partial_output") is not None
+
+
+# ---------------------------------------------------------------------------
+# 文件类型 / 后端校验
+# ---------------------------------------------------------------------------
+
+class TestFileTypeValidation:
+    """execute() 校验 plan.file_type 和 backend_required"""
+
+    @pytest.mark.asyncio
+    async def test_non_docx_plan_rejected(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.XLSX,
+            file_path=sample_doc,
+            backend_required=BackendType.XLSX_MCP,
+            operations=[
+                DocumentOperation(action="modify_cell", target={"cell": "A1"}, value="x"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "xlsx" in result.error
+
+    @pytest.mark.asyncio
+    async def test_mismatched_backend_rejected(self, backend, sample_doc):
+        # 用 model_construct 绕过 model 层校验，测试 adapter 层防御
+        plan = DocumentPlan.model_construct(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.XLSX_MCP,
+            operations=[
+                DocumentOperation(action="replace_paragraph", target={"paragraph_index": 0}, value="x"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "xlsx_mcp" in result.error
+
+
+# ---------------------------------------------------------------------------
+# 输出副本唯一性
+# ---------------------------------------------------------------------------
+
+class TestOutputUniqueness:
+    """连续执行生成不同副本路径"""
+
+    @pytest.mark.asyncio
+    async def test_consecutive_executions_different_paths(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="append_text",
+                    target={},
+                    value="追加",
+                    description="追加",
+                ),
+            ],
+        )
+        result1 = await backend.execute(plan)
+        result2 = await backend.execute(plan)
+        assert result1.success and result2.success
+        assert result1.output_file != result2.output_file

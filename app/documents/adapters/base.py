@@ -39,17 +39,13 @@ class DocumentBackend(ABC):
 
     @abstractmethod
     async def execute(self, plan: DocumentPlan) -> DocumentOperationResult:
-        """执行文档操作方案
+        """执行文档操作方案。
 
-        Args:
-            plan: 规划智能体输出的 DocumentPlan
-
-        Returns:
-            DocumentOperationResult: 执行结果
-
-        Raises:
-            BackendUnavailableError: 后端不可用
-            BackendError: 执行过程中的其他错误
+        统一契约：
+        - 成功或可恢复的失败 → 返回 DocumentOperationResult（success=True/False）。
+        - 底层原子操作（read_paragraph 等）允许抛 BackendError / BackendUnavailableError，
+          由 execute() 内部捕获并转为 DocumentOperationResult。
+        - 调用方不应期望 execute() 向上抛出异常。
         """
         ...
 
