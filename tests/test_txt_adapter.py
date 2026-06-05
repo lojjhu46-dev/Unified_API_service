@@ -89,9 +89,25 @@ class TestAtomicOperations:
         assert "研究心得" in lines[2]
 
     @pytest.mark.asyncio
-    async def test_replace_text_no_match(self, backend, sample_doc):
-        count = await backend.replace_text(sample_doc, "不存在的文本", "新文本")
-        assert count == 0
+    async def test_replace_text_no_match_raises(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path=sample_doc,
+            backend_required=BackendType.TEXT_ADAPTER,
+            operations=[
+                DocumentOperation(
+                    action="replace_text",
+                    target={"old": "不存在的文本"},
+                    value="新文本",
+                    description="替换不存在的文本",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "未找到匹配" in result.error
+        assert result.output_file is None
 
     @pytest.mark.asyncio
     async def test_file_not_loaded(self, backend):
@@ -330,8 +346,8 @@ class TestExecuteErrors:
         assert "docx_mcp" in result.error
 
     @pytest.mark.asyncio
-    async def test_none_backend_allowed_for_txt(self, backend, sample_doc):
-        """TXT 是本地 adapter，backend_required=None 应被接受"""
+    async def test_none_backend_rejected(self, backend, sample_doc):
+        """TXT 也要求 BackendType.TEXT_ADAPTER，None 不被接受"""
         plan = DocumentPlan.model_construct(
             intent=DocumentIntent.EDIT,
             file_type=FileType.TXT,
@@ -342,7 +358,8 @@ class TestExecuteErrors:
             ],
         )
         result = await backend.execute(plan)
-        assert result.success
+        assert not result.success
+        assert "None" in result.error
 
     @pytest.mark.asyncio
     async def test_unsupported_intent(self, backend, sample_doc):
@@ -399,6 +416,21 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "old" in result.error
+
+    @pytest.mark.asyncio
+    async def test_append_lines_empty_input_raises(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path=sample_doc,
+            backend_required=BackendType.TEXT_ADAPTER,
+            operations=[
+                DocumentOperation(action="append_lines", target={}, description="空追加"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "缺少" in result.error
 
     @pytest.mark.asyncio
     async def test_partial_edit_no_output_file(self, backend, sample_doc):

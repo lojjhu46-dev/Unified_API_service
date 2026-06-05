@@ -97,7 +97,7 @@ class TxtBackend(DocumentBackend):
                 error="不支持的操作意图",
             )
 
-        if plan.backend_required not in (BackendType.TEXT_ADAPTER, None):
+        if plan.backend_required != BackendType.TEXT_ADAPTER:
             return DocumentOperationResult(
                 success=False,
                 error=f"{self.name} 不匹配后端 {plan.backend_required}",
@@ -197,7 +197,9 @@ class TxtBackend(DocumentBackend):
         elif action == "append_lines":
             lines = op.target.get("lines", [])
             if not lines:
-                lines = [op.value or ""]
+                if not op.value:
+                    raise ValueError(f"append_lines 缺少 lines 或 value: {op.target}")
+                lines = [op.value]
             await self.append_lines(file_path, lines)
 
         elif action == "replace_text":
@@ -206,7 +208,7 @@ class TxtBackend(DocumentBackend):
                 raise ValueError(f"replace_text 缺少 old: {op.target}")
             count = await self.replace_text(file_path, old, op.value or "")
             if count == 0:
-                logger.warning(f"replace_text 未找到匹配: {old}")
+                raise ValueError(f"replace_text 未找到匹配: {old}")
 
         else:
             raise ValueError(f"不支持的操作动作: {op.action}")
