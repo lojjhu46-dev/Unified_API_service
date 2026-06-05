@@ -62,28 +62,6 @@ def validate_file_path(file_path: str) -> tuple[Path | None, str | None]:
     return None, f"文件路径不在允许的目录内: {file_path}"
 
 
-def validate_output_path(output_path: str, source_path: Path) -> tuple[Path | None, str | None]:
-    """校验输出路径是否安全（与源文件同目录且在允许目录内）。
-
-    Returns:
-        (resolved_path, error_message)
-    """
-    try:
-        resolved = Path(output_path).resolve()
-    except Exception as e:
-        return None, f"输出路径解析失败: {e}"
-
-    # 输出文件必须与源文件同目录
-    if resolved.parent != source_path.parent:
-        return None, "输出文件必须与源文件同目录"
-
-    # 检查是否在允许目录内
-    allowed = get_allowed_dirs()
-    for allowed_dir in allowed:
-        try:
-            resolved.relative_to(allowed_dir)
-            return resolved, None
-        except ValueError:
-            continue
-
-    return None, f"输出路径不在允许的目录内: {output_path}"
+# validate_output_path 未使用：输出副本路径由 adapter 内部的 _build_output_path()
+# 生成，始终与源文件同目录。源文件路径已通过 validate_file_path 校验，
+# 因此输出路径自动继承相同的安全约束，无需额外校验。

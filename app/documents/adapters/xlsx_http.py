@@ -23,18 +23,17 @@ class HttpXlsxBackend(XlsxBackend):
     通过 HTTP JSON 调用独立的 XLSX MCP 服务。
     请求格式：POST {base_url}/{endpoint}，JSON body。
     响应格式：{success: bool, data?: object, error?: string}。
+
+    不缓存可用性状态：每次调用独立处理，临时网络抖动不会永久阻断。
     """
 
     def __init__(self, base_url: str, timeout: float = 30.0) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
-        self._available: bool | None = None
 
     @property
     def is_available(self) -> bool:
-        if self._available is not None:
-            return self._available
         return True
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -49,10 +48,8 @@ class HttpXlsxBackend(XlsxBackend):
         try:
             resp = await client.post(url, json=payload)
         except httpx.TimeoutException:
-            self._available = False
             raise BackendUnavailableError(f"XLSX MCP 超时: {url}")
         except httpx.RequestError as e:
-            self._available = False
             raise BackendUnavailableError(f"XLSX MCP 连接失败: {e}")
 
         if resp.status_code != 200:
@@ -66,7 +63,6 @@ class HttpXlsxBackend(XlsxBackend):
         if not body.get("success"):
             raise BackendUnavailableError(f"XLSX MCP 错误: {body.get('error', '未知')}")
 
-        self._available = True
         return body.get("data", {})
 
     async def read_structure(self, file_path: str) -> dict[str, Any]:

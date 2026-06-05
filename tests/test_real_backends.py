@@ -243,6 +243,22 @@ class TestHttpDocxBackend:
                 await backend.read_structure("/tmp/test.docx")
 
     @pytest.mark.asyncio
+    async def test_timeout_then_recovery(self, backend):
+        """超时后应能恢复，不永久阻断"""
+        fail_resp = httpx.Response(200, json={"success": True, "data": {"type": "docx", "paragraph_count": 3}})
+        ok_resp = httpx.Response(200, json={"success": True, "data": {"type": "docx", "paragraph_count": 5}})
+        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=[
+            httpx.TimeoutException("timeout"),
+            ok_resp,
+        ])):
+            from app.documents.adapters.base import BackendUnavailableError
+            with pytest.raises(BackendUnavailableError):
+                await backend.read_structure("/tmp/test.docx")
+            # 第二次调用应成功
+            structure = await backend.read_structure("/tmp/test.docx")
+            assert structure["paragraph_count"] == 5
+
+    @pytest.mark.asyncio
     async def test_success_false(self, backend):
         mock_resp = httpx.Response(200, json={
             "success": False,

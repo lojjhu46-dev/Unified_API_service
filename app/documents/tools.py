@@ -224,11 +224,12 @@ async def document_apply_plan(tool_input: dict) -> dict:
         return {"success": False, "error": f"plan 解析失败: {e}"}
 
     # 路径安全校验
-    if plan.file_path:
-        resolved_path, err = validate_file_path(plan.file_path)
-        if err:
-            return {"success": False, "error": err}
-        plan = plan.model_copy(update={"file_path": str(resolved_path)})
+    if not plan.file_path:
+        return {"success": False, "error": "plan 缺少 file_path"}
+    resolved_path, err = validate_file_path(plan.file_path)
+    if err:
+        return {"success": False, "error": err}
+    plan = plan.model_copy(update={"file_path": str(resolved_path)})
 
     if not plan.is_actionable:
         response = {
