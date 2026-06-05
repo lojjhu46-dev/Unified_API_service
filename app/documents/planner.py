@@ -223,6 +223,19 @@ class DocumentPlanningAgent:
         unsupported_reason = data.get("unsupported_reason")
         requires_confirmation = data.get("requires_confirmation", False)
 
+        # ---- unsupported 意图：清空所有执行相关字段 ----
+        if intent == DocumentIntent.UNSUPPORTED:
+            return DocumentPlan(
+                intent=DocumentIntent.UNSUPPORTED,
+                file_type=file_type,
+                operations=[],
+                backend_required=None,
+                risk_level=RiskLevel.LOW,
+                requires_confirmation=False,
+                clarification_question=None,
+                unsupported_reason=unsupported_reason or "规划智能体判定该操作不支持",
+            )
+
         # ---- 后处理：强制规则 ----
 
         # 高风险动作强制确认
@@ -257,7 +270,11 @@ class DocumentPlanningAgent:
 
     @staticmethod
     def _extract_json(raw: str) -> dict | None:
-        """从 LLM 输出中提取 JSON 对象。"""
+        """从 LLM 输出中提取第一个合法 JSON 对象。
+
+        优先尝试完整解析和 ```json 代码块，最后用 raw_decode
+        从第一个 '{' 位置逐个尝试，避免贪婪正则吞掉多个 JSON 块。
+        """
         text = (raw or "").strip()
         # 尝试直接解析
         try:
@@ -271,13 +288,20 @@ class DocumentPlanningAgent:
                 return json.loads(match.group(1).strip())
             except json.JSONDecodeError:
                 pass
-        # 尝试提取第一个 { ... }
-        match = re.search(r"\{[\s\S]*\}", text)
-        if match:
+        # 用 raw_decode 从每个 '{' 位置尝试解析第一个合法 JSON 对象
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(text):
+            brace = text.find("{", idx)
+            if brace == -1:
+                break
             try:
-                return json.loads(match.group(0))
+                obj, _ = decoder.raw_decode(text, brace)
+                if isinstance(obj, dict):
+                    return obj
             except json.JSONDecodeError:
                 pass
+            idx = brace + 1
         return None
 
     @staticmethod
@@ -305,16 +329,28 @@ class DocumentPlanningAgent:
 
     @staticmethod
     def _is_vague_target(command: str, operations: list[DocumentOperation]) -> bool:
-        """检查操作目标是否模糊。"""
-        # 命令中包含模糊表述且操作 target 为空或过于宽泛
+        """检查操作目标是否模糊。
+
+        命令含模糊表述时，不信任 LLM 猜测的 target（如 paragraph_index: 3），
+        除非 target 中包含用户提供的明确锚点（原文引号、具体行号等）。
+        """
         command_lower = command.lower()
         has_vague_marker = any(marker in command_lower for marker in _VAGUE_TARGET_MARKERS)
         if not has_vague_marker:
             return False
-        for op in operations:
-            if not op.target or all(v is None or v == "" for v in op.target.values()):
-                return True
-        return False
+
+        # 用户命令中是否包含明确锚点
+        has_explicit_anchor = bool(
+            re.search(r'["""「」『』]', command)  # 引号包裹的原文片段（ASCII + 中文）
+            or re.search(r"第\s*\d+\s*[段行节]", command)  # "第3段" "第5行"
+            or re.search(r"(?:行|段)\s*\d+", command)  # "行3" "段5"
+            or re.search(r"[A-Z]+\d+", command)  # 单元格引用如 B3
+        )
+        if has_explicit_anchor:
+            return False
+
+        # 有模糊标记且无明确锚点 → 强制澄清，不信任 LLM 猜测
+        return True
 
 
 planner = DocumentPlanningAgent()

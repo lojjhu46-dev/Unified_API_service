@@ -198,8 +198,8 @@ class TestParseLLMOutput:
         assert plan.needs_confirmation
 
     @pytest.mark.asyncio
-    async def test_vague_target_triggers_clarification(self):
-        """模糊定位触发澄清"""
+    async def test_vague_target_empty_target_triggers_clarification(self):
+        """模糊定位 + 空 target → 澄清"""
         mock_data = {
             "intent": "edit",
             "operations": [
@@ -225,6 +225,66 @@ class TestParseLLMOutput:
             )
         assert plan.clarification_question is not None
         assert len(plan.operations) == 0
+
+    @pytest.mark.asyncio
+    async def test_vague_target_llm_guessed_index_rejected(self):
+        """模糊表述 + LLM 猜测 paragraph_index → 仍触发澄清"""
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "delete_paragraph",
+                    "target": {"paragraph_index": 3},
+                    "value": None,
+                    "description": "删除第4段（LLM猜测）",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data)),
+        ):
+            plan = await planner.plan(
+                user_command="删除实验体会的内容",
+                file_type=FileType.DOCX,
+            )
+        # 模糊表述 + 无明确锚点 → 不信任 LLM 猜测
+        assert plan.clarification_question is not None
+        assert len(plan.operations) == 0
+
+    @pytest.mark.asyncio
+    async def test_vague_target_with_explicit_anchor_passes(self):
+        """用户提供了明确锚点（引号原文）→ 信任操作"""
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "replace_paragraph",
+                    "target": {"search_text": "实验体会的具体内容"},
+                    "value": "新内容",
+                    "description": "替换包含指定文本的段落",
+                },
+            ],
+            "risk_level": "medium",
+            "requires_confirmation": False,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data)),
+        ):
+            plan = await planner.plan(
+                user_command='删除包含"实验体会的具体内容"的那一段',
+                file_type=FileType.DOCX,
+            )
+        # 有引号锚点 → 信任
+        assert plan.clarification_question is None
+        assert len(plan.operations) == 1
 
     @pytest.mark.asyncio
     async def test_malformed_json_returns_unsupported(self):
@@ -261,6 +321,35 @@ class TestParseLLMOutput:
                 file_type=FileType.TXT,
             )
         assert plan.intent == DocumentIntent.SUMMARIZE
+
+    @pytest.mark.asyncio
+    async def test_unsupported_intent_clears_operations(self):
+        """LLM 返回 unsupported 时，清空 operations/risk/backend"""
+        mock_data = {
+            "intent": "unsupported",
+            "operations": [
+                {"action": "delete_paragraph", "target": {"paragraph_index": 0}},
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": "some question",
+            "unsupported_reason": "不支持的操作类型",
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data)),
+        ):
+            plan = await planner.plan(
+                user_command="做一些不支持的事",
+                file_type=FileType.DOCX,
+            )
+        assert plan.intent == DocumentIntent.UNSUPPORTED
+        assert plan.operations == []
+        assert plan.backend_required is None
+        assert plan.risk_level == RiskLevel.LOW
+        assert plan.requires_confirmation is False
+        assert plan.clarification_question is None
+        assert plan.unsupported_reason == "不支持的操作类型"
 
     @pytest.mark.asyncio
     async def test_xlsx_plan_uses_xlsx_mcp(self):
@@ -316,3 +405,19 @@ class TestExtractJson:
 
     def test_invalid_json_returns_none(self):
         assert planner._extract_json("{invalid json}") is None
+
+    def test_multiple_json_blocks_extracts_first(self):
+        """多个 JSON 块时提取第一个合法对象"""
+        first = {"intent": "edit", "operations": []}
+        second = {"intent": "review", "operations": []}
+        raw = f"前置文本 {json.dumps(first)} 中间文本 {json.dumps(second)} 后置文本"
+        result = planner._extract_json(raw)
+        assert result == first
+
+    def test_first_brace_is_invalid_skips_to_next(self):
+        """第一个 '{' 不是合法 JSON 时跳到下一个"""
+        invalid = "{not valid json}"
+        valid = {"intent": "extract"}
+        raw = f"{invalid} 然后 {json.dumps(valid)}"
+        result = planner._extract_json(raw)
+        assert result == valid
