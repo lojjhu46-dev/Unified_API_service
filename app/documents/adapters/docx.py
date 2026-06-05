@@ -85,16 +85,16 @@ class DocxBackend(DocumentBackend):
                 error=f"{self.name} 不支持 {plan.file_type.value} 文件",
             )
 
-        if plan.backend_required not in (BackendType.DOCX_MCP, None):
-            return DocumentOperationResult(
-                success=False,
-                error=f"{self.name} 不匹配后端 {plan.backend_required}",
-            )
-
         if plan.intent == DocumentIntent.UNSUPPORTED:
             return DocumentOperationResult(
                 success=False,
                 error="不支持的操作意图",
+            )
+
+        if plan.backend_required != BackendType.DOCX_MCP:
+            return DocumentOperationResult(
+                success=False,
+                error=f"{self.name} 不匹配后端 {plan.backend_required}",
             )
 
         # 只读操作

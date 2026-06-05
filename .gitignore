@@ -16,3 +16,4 @@ reports/
 .venv-wsl/
 .venv/
 .codegraph
+.claude/settings.local.json

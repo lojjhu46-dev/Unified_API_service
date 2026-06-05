@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/root/.venvs/unified_api_service/bin/python *)"
-    ]
-  }
-}

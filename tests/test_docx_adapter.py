@@ -408,6 +408,22 @@ class TestFileTypeValidation:
         assert not result.success
         assert "xlsx_mcp" in result.error
 
+    @pytest.mark.asyncio
+    async def test_missing_backend_rejected(self, backend, sample_doc):
+        # 用 model_construct 绕过 model 层校验，测试 adapter 层防御
+        plan = DocumentPlan.model_construct(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=None,
+            operations=[
+                DocumentOperation(action="replace_paragraph", target={"paragraph_index": 0}, value="x"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "None" in result.error
+
 
 # ---------------------------------------------------------------------------
 # 输出副本唯一性
