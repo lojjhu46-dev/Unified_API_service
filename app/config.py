@@ -106,6 +106,12 @@ class Settings(BaseSettings):
     feishu_sheet_sample_rows: int = 30
     feishu_bitable_sample_records: int = 50
 
+    # 文档 MCP 后端配置
+    docx_mcp_base_url: str = ""
+    xlsx_mcp_base_url: str = ""
+    document_mcp_timeout_seconds: int = 30
+    document_mcp_enabled: bool = False
+
     # 安全配置
     api_key: Optional[str] = None
     jwt_secret: Optional[str] = None

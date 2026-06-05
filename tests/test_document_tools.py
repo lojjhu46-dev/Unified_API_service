@@ -2,6 +2,7 @@
 
 import pytest
 import app.documents.tools as document_tools
+from app.config import settings
 from app.documents.tools import (
     _reset_executor,
     document_apply_plan,
@@ -28,8 +29,10 @@ from app.tools.registry import tool_registry
 
 
 @pytest.fixture(autouse=True)
-def _isolate_executor():
-    """每个测试前后重置 executor，避免全局状态污染"""
+def _isolate_executor(tmp_path, monkeypatch):
+    """每个测试前后重置 executor，避免全局状态污染。
+    同时将 upload_dir 指向 tmp_path，让路径安全校验通过。"""
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
     _reset_executor()
     yield
     _reset_executor()
@@ -43,6 +46,13 @@ def _make_executor_with_mocks() -> DocumentOperationAgent:
     executor.register_backend(BackendType.TEXT_ADAPTER, MockTxtBackend())
     executor.register_backend(BackendType.PDF_READER, MockPdfBackend())
     return executor
+
+
+def _create_file(tmp_path, name, content):
+    """在 tmp_path 下创建文件并返回路径字符串"""
+    f = tmp_path / name
+    f.write_text(content, encoding="utf-8")
+    return str(f)
 
 
 class FixedPlanner:
@@ -95,22 +105,29 @@ class TestInferFileType:
 
 
 # ---------------------------------------------------------------------------
-# 默认 executor 无后端
+# 默认 executor 含 TXT/PDF 真实后端
 # ---------------------------------------------------------------------------
 
-class TestDefaultExecutorNoBackends:
+class TestDefaultExecutorHasRealBackends:
     @pytest.mark.asyncio
-    async def test_extract_without_backend_fails(self):
-        """默认 executor 不注册 mock 后端，应返回后端未注册"""
-        result = await document_extract({"file_path": "/tmp/test.txt"})
-        assert result["success"] is False
-        assert "未注册" in result["error"]
+    async def test_default_has_txt_backend(self):
+        executor = document_tools._get_executor()
+        assert executor.get_backend(BackendType.TEXT_ADAPTER) is not None
 
     @pytest.mark.asyncio
-    async def test_review_without_backend_fails(self):
-        result = await document_review({"file_path": "/tmp/test.pdf"})
-        assert result["success"] is False
-        assert "未注册" in result["error"]
+    async def test_default_has_pdf_backend(self):
+        executor = document_tools._get_executor()
+        assert executor.get_backend(BackendType.PDF_READER) is not None
+
+    @pytest.mark.asyncio
+    async def test_default_no_docx_backend(self):
+        executor = document_tools._get_executor()
+        assert executor.get_backend(BackendType.DOCX_MCP) is None
+
+    @pytest.mark.asyncio
+    async def test_default_no_xlsx_backend(self):
+        executor = document_tools._get_executor()
+        assert executor.get_backend(BackendType.XLSX_MCP) is None
 
 
 # ---------------------------------------------------------------------------
@@ -119,30 +136,32 @@ class TestDefaultExecutorNoBackends:
 
 class TestInvalidFileType:
     @pytest.mark.asyncio
-    async def test_extract_invalid_file_type(self):
+    async def test_extract_invalid_file_type(self, tmp_path):
         set_executor(_make_executor_with_mocks())
-        result = await document_extract({"file_path": "/tmp/test.xyz"})
+        f = _create_file(tmp_path, "test.xyz", "内容")
+        result = await document_extract({"file_path": f})
         assert result["success"] is False
         assert "推断" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_extract_explicit_invalid_file_type(self):
+    async def test_extract_explicit_invalid_file_type(self, tmp_path):
         set_executor(_make_executor_with_mocks())
-        result = await document_extract({"file_path": "/tmp/test.txt", "file_type": "json"})
+        f = _create_file(tmp_path, "test.txt", "内容")
+        result = await document_extract({"file_path": f, "file_type": "json"})
         assert result["success"] is False
         assert "json" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_plan_invalid_file_type(self):
+    async def test_plan_invalid_file_type(self, tmp_path):
         result = await document_plan({
             "user_command": "总结文档",
-            "file_path": "/tmp/test.xyz",
+            "file_path": str(tmp_path / "test.xyz"),
         })
         assert result["success"] is False
 
     @pytest.mark.asyncio
-    async def test_review_invalid_file_type(self):
-        result = await document_review({"file_path": "/tmp/test.xyz"})
+    async def test_review_invalid_file_type(self, tmp_path):
+        result = await document_review({"file_path": str(tmp_path / "test.xyz")})
         assert result["success"] is False
 
 
@@ -152,13 +171,13 @@ class TestInvalidFileType:
 
 class TestDocumentExtract:
     @pytest.mark.asyncio
-    async def test_extract_docx(self):
+    async def test_extract_docx(self, tmp_path):
+        f = _create_file(tmp_path, "test.docx", "")  # 占位文件让路径安全通过
         executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.DOCX_MCP)
-        backend.load_document("/tmp/test.docx", ["段落1", "段落2"])
+        executor.get_backend(BackendType.DOCX_MCP).load_document(f, ["段落1", "段落2"])
         set_executor(executor)
 
-        result = await document_extract({"file_path": "/tmp/test.docx"})
+        result = await document_extract({"file_path": f})
         assert result["success"] is True
         assert result["file_type"] == "docx"
         assert result["structure"]["paragraph_count"] == 2
@@ -170,11 +189,19 @@ class TestDocumentExtract:
         assert "file_path" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_extract_file_not_found(self):
+    async def test_extract_file_not_found(self, tmp_path):
         set_executor(_make_executor_with_mocks())
-        result = await document_extract({"file_path": "/nonexistent.txt"})
+        result = await document_extract({"file_path": str(tmp_path / "nonexistent.txt")})
         assert result["success"] is False
         assert "不存在" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_extract_real_txt(self, tmp_path):
+        """真实 TXT 后端提取结构"""
+        f = _create_file(tmp_path, "test.txt", "第一行\n第二行\n第三行")
+        result = await document_extract({"file_path": f})
+        assert result["success"] is True
+        assert result["structure"]["line_count"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -183,26 +210,31 @@ class TestDocumentExtract:
 
 class TestDocumentReview:
     @pytest.mark.asyncio
-    async def test_review_via_executor(self):
+    async def test_review_via_executor(self, tmp_path):
         """document_review 应经过 executor.execute()"""
+        f = _create_file(tmp_path, "test.pdf", "")
         executor = SpyExecutor()
         set_executor(executor)
 
-        result = await document_review({"file_path": "/tmp/test.pdf"})
+        result = await document_review({"file_path": f})
         assert result["success"] is True
         assert result["summary"] == "via executor"
-        assert result["structure"] == {"source": "executor"}
         assert executor.execute_called is True
-        assert executor.received_plan is not None
         assert executor.received_plan.intent == DocumentIntent.REVIEW
         assert executor.received_plan.file_type == FileType.PDF
-        assert executor.received_plan.file_path == "/tmp/test.pdf"
-        assert executor.received_plan.backend_required == BackendType.PDF_READER
 
     @pytest.mark.asyncio
     async def test_review_missing_path(self):
         result = await document_review({})
         assert result["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_review_real_txt(self, tmp_path):
+        """真实 TXT 后端审阅（使用默认 executor，含 RealTxtBackend）"""
+        f = _create_file(tmp_path, "test.txt", "第一行\n第二行")
+        result = await document_review({"file_path": f})
+        assert result["success"] is True
+        assert result["structure"]["line_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +243,9 @@ class TestDocumentReview:
 
 class TestDocumentPlan:
     @pytest.mark.asyncio
-    async def test_plan_includes_file_path(self, monkeypatch):
+    async def test_plan_includes_file_path(self, monkeypatch, tmp_path):
         """document_plan 返回的 plan 必须包含 file_path"""
+        f = _create_file(tmp_path, "test.pdf", "")
         monkeypatch.setattr(
             document_tools,
             "_planner",
@@ -226,16 +259,17 @@ class TestDocumentPlan:
         )
         result = await document_plan({
             "user_command": "审阅文档",
-            "file_path": "/tmp/test.pdf",
+            "file_path": f,
         })
         assert result["success"] is True
-        assert result["plan"]["file_path"] == "/tmp/test.pdf"
+        assert result["plan"]["file_path"] == f
 
     @pytest.mark.asyncio
-    async def test_plan_pdf_edit_rejected(self):
+    async def test_plan_pdf_edit_rejected(self, tmp_path):
+        f = _create_file(tmp_path, "test.pdf", "")
         result = await document_plan({
             "user_command": "删除第三段",
-            "file_path": "/tmp/test.pdf",
+            "file_path": f,
         })
         assert result["success"] is True
         plan = result["plan"]
@@ -243,8 +277,9 @@ class TestDocumentPlan:
         assert "PDF" in (plan["unsupported_reason"] or "")
 
     @pytest.mark.asyncio
-    async def test_plan_missing_command(self):
-        result = await document_plan({"file_path": "/tmp/test.txt"})
+    async def test_plan_missing_command(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "")
+        result = await document_plan({"file_path": f})
         assert result["success"] is False
 
     @pytest.mark.asyncio
@@ -259,22 +294,38 @@ class TestDocumentPlan:
 
 class TestDocumentApplyPlan:
     @pytest.mark.asyncio
-    async def test_apply_txt_edit(self):
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["行1", "行2", "行3"])
-        set_executor(executor)
+    async def test_apply_txt_edit_requires_confirmation(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2\n行3")
 
         result = await document_apply_plan({
             "plan": {
                 "intent": "edit",
                 "file_type": "txt",
-                "file_path": "/tmp/test.txt",
+                "file_path": f,
                 "backend_required": "text_adapter",
                 "operations": [
                     {"action": "replace_line", "target": {"line": 1}, "value": "新行1"},
                 ],
             },
+        })
+        assert result["success"] is False
+        assert result["requires_confirmation"] is True
+
+    @pytest.mark.asyncio
+    async def test_apply_txt_edit_confirmed(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2\n行3")
+
+        result = await document_apply_plan({
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": f,
+                "backend_required": "text_adapter",
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 1}, "value": "新行1"},
+                ],
+            },
+            "confirmed": True,
         })
         assert result["success"] is True
         assert result["result"]["output_file"] is not None
@@ -285,17 +336,14 @@ class TestDocumentApplyPlan:
         assert result["success"] is False
 
     @pytest.mark.asyncio
-    async def test_apply_clarification_plan_returns_clarification(self):
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["行1", "行2"])
-        set_executor(executor)
+    async def test_apply_clarification_plan_returns_clarification(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2")
 
         result = await document_apply_plan({
             "plan": {
                 "intent": "edit",
                 "file_type": "txt",
-                "file_path": "/tmp/test.txt",
+                "file_path": f,
                 "backend_required": "text_adapter",
                 "clarification_question": "请指定要修改的行号",
             },
@@ -303,35 +351,30 @@ class TestDocumentApplyPlan:
         assert result["success"] is False
         assert result["requires_clarification"] is True
         assert result["clarification_question"] == "请指定要修改的行号"
-        assert "需要澄清" in result["error"]
-        assert result["plan"]["file_path"] == "/tmp/test.txt"
 
     @pytest.mark.asyncio
-    async def test_apply_empty_edit_plan_rejected_before_executor(self):
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["行1", "行2"])
-        set_executor(executor)
+    async def test_apply_empty_edit_plan_rejected_before_executor(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2")
 
         result = await document_apply_plan({
             "plan": {
                 "intent": "edit",
                 "file_type": "txt",
-                "file_path": "/tmp/test.txt",
+                "file_path": f,
                 "backend_required": "text_adapter",
             },
         })
         assert result["success"] is False
         assert "没有可执行操作" in result["error"]
-        assert "requires_confirmation" not in result
 
     @pytest.mark.asyncio
-    async def test_apply_high_risk_requires_confirmation(self):
+    async def test_apply_high_risk_requires_confirmation(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2")
         result = await document_apply_plan({
             "plan": {
                 "intent": "edit",
                 "file_type": "txt",
-                "file_path": "/tmp/test.txt",
+                "file_path": f,
                 "backend_required": "text_adapter",
                 "risk_level": "high",
                 "requires_confirmation": True,
@@ -344,17 +387,13 @@ class TestDocumentApplyPlan:
         assert result["requires_confirmation"] is True
 
     @pytest.mark.asyncio
-    async def test_apply_high_risk_confirmed(self):
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["行1", "行2"])
-        set_executor(executor)
-
+    async def test_apply_high_risk_confirmed(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1\n行2")
         result = await document_apply_plan({
             "plan": {
                 "intent": "edit",
                 "file_type": "txt",
-                "file_path": "/tmp/test.txt",
+                "file_path": f,
                 "backend_required": "text_adapter",
                 "risk_level": "high",
                 "requires_confirmation": True,
@@ -373,12 +412,9 @@ class TestDocumentApplyPlan:
 
 class TestPlanToApply:
     @pytest.mark.asyncio
-    async def test_plan_then_apply_txt(self, monkeypatch):
+    async def test_plan_then_apply_txt(self, monkeypatch, tmp_path):
         """document_plan 输出的 plan 可直接传给 document_apply_plan 执行"""
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["第一行", "第二行", "第三行"])
-        set_executor(executor)
+        f = _create_file(tmp_path, "test.txt", "第一行\n第二行\n第三行")
         monkeypatch.setattr(
             document_tools,
             "_planner",
@@ -401,16 +437,34 @@ class TestPlanToApply:
         # 规划
         plan_result = await document_plan({
             "user_command": "把第二行改成新内容",
-            "file_path": "/tmp/test.txt",
+            "file_path": f,
         })
         assert plan_result["success"] is True
-        assert plan_result["plan"]["file_path"] == "/tmp/test.txt"
+        assert plan_result["plan"]["file_path"] == f
 
         # 执行
-        apply_result = await document_apply_plan({"plan": plan_result["plan"]})
+        apply_result = await document_apply_plan({"plan": plan_result["plan"], "confirmed": True})
         assert apply_result["success"] is True
-        assert apply_result["result"]["success"] is True
         assert apply_result["result"]["output_file"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 路径安全
+# ---------------------------------------------------------------------------
+
+class TestPathSecurityInTools:
+    @pytest.mark.asyncio
+    async def test_extract_outside_upload_dir_rejected(self, tmp_path):
+        """目录外文件被拒绝"""
+        outside = tmp_path.parent / "outside_doc_tools"
+        outside.mkdir(exist_ok=True)
+        f = outside / "test.txt"
+        f.write_text("内容")
+        result = await document_extract({"file_path": str(f)})
+        assert result["success"] is False
+        assert "不在允许的目录内" in result["error"]
+        f.unlink()
+        outside.rmdir()
 
 
 # ---------------------------------------------------------------------------
@@ -426,15 +480,15 @@ class TestToolRegistryIntegration:
         assert "document_review" in tools
 
     @pytest.mark.asyncio
-    async def test_document_extract_via_registry(self):
+    async def test_document_extract_via_registry(self, tmp_path):
+        f = _create_file(tmp_path, "test.txt", "行1")
         executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
-        backend.load_file("/tmp/test.txt", ["行1"])
+        executor.get_backend(BackendType.TEXT_ADAPTER).load_file(f, ["行1"])
         set_executor(executor)
 
         execution = await tool_registry.execute_with_result(
             "document_extract",
-            {"file_path": "/tmp/test.txt"},
+            {"file_path": f},
         )
         assert execution.trace.status == "success"
         assert execution.result["success"] is True

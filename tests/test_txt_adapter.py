@@ -279,7 +279,7 @@ class TestExecuteReadonly:
         result = await backend.execute(plan)
         assert result.success
         assert result.output_file is None
-        assert result.verification["line_count"] == 5
+        assert result.verification["structure"]["line_count"] == 5
 
     @pytest.mark.asyncio
     async def test_summarize_returns_line_count(self, backend, sample_doc):

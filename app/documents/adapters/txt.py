@@ -126,10 +126,11 @@ class TxtBackend(DocumentBackend):
                     selected = lines[max(0, start - 1):min(end, len(lines))]
                     summary_parts.append(f"第{start}-{end}行：{'、'.join(selected[:5])}")
 
+            structure = await self.read_structure(plan.file_path)
             return DocumentOperationResult(
                 success=True,
                 summary="；".join(summary_parts) if summary_parts else "只读操作完成",
-                verification={"line_count": len(lines)},
+                verification={"structure": structure},
             )
         except Exception as e:
             logger.error(f"只读操作失败: {e}")

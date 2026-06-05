@@ -21,8 +21,15 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_executor():
+def _isolate_executor(monkeypatch):
+    """重置 executor 并 mock 路径安全（集成测试用虚拟路径）"""
+    from pathlib import Path
     _reset_executor()
+    # 集成测试使用 /tmp/ 虚拟路径，mock 路径安全使其通过
+    monkeypatch.setattr(
+        "app.documents.tools.validate_file_path",
+        lambda fp: (Path(fp), None),
+    )
     yield
     _reset_executor()
 

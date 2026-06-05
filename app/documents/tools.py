@@ -15,7 +15,9 @@ from app.documents.models import (
     DocumentPlan,
     FileType,
 )
+from app.documents.path_security import validate_file_path
 from app.documents.planner import DocumentPlanningAgent
+from app.config import settings
 from app.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -82,8 +84,35 @@ def _get_planner() -> DocumentPlanningAgent:
 def _get_executor() -> DocumentOperationAgent:
     global _executor
     if _executor is None:
-        _executor = DocumentOperationAgent()
+        _executor = _create_default_executor()
     return _executor
+
+
+def _create_default_executor() -> DocumentOperationAgent:
+    """创建默认 executor，注册真实后端。"""
+    from app.documents.adapters.pdf_real import RealPdfBackend
+    from app.documents.adapters.txt_real import RealTxtBackend
+
+    executor = DocumentOperationAgent()
+    executor.register_backend(BackendType.TEXT_ADAPTER, RealTxtBackend())
+    executor.register_backend(BackendType.PDF_READER, RealPdfBackend())
+
+    # DOCX/XLSX HTTP MCP 后端（配置启用时注册）
+    if settings.document_mcp_enabled:
+        if settings.docx_mcp_base_url:
+            from app.documents.adapters.docx_http import HttpDocxBackend
+            executor.register_backend(
+                BackendType.DOCX_MCP,
+                HttpDocxBackend(settings.docx_mcp_base_url, settings.document_mcp_timeout_seconds),
+            )
+        if settings.xlsx_mcp_base_url:
+            from app.documents.adapters.xlsx_http import HttpXlsxBackend
+            executor.register_backend(
+                BackendType.XLSX_MCP,
+                HttpXlsxBackend(settings.xlsx_mcp_base_url, settings.document_mcp_timeout_seconds),
+            )
+
+    return executor
 
 
 def set_executor(executor: DocumentOperationAgent) -> None:
@@ -111,6 +140,11 @@ async def document_extract(tool_input: dict) -> dict:
     file_path = tool_input.get("file_path", "")
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
+
+    resolved_path, err = validate_file_path(file_path)
+    if err:
+        return {"success": False, "error": err}
+    file_path = str(resolved_path)
 
     file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
     if err:
@@ -149,6 +183,11 @@ async def document_plan(tool_input: dict) -> dict:
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 
+    resolved_path, err = validate_file_path(file_path)
+    if err:
+        return {"success": False, "error": err}
+    file_path = str(resolved_path)
+
     file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
     if err:
         return {"success": False, "error": err}
@@ -184,6 +223,13 @@ async def document_apply_plan(tool_input: dict) -> dict:
     except Exception as e:
         return {"success": False, "error": f"plan 解析失败: {e}"}
 
+    # 路径安全校验
+    if plan.file_path:
+        resolved_path, err = validate_file_path(plan.file_path)
+        if err:
+            return {"success": False, "error": err}
+        plan = plan.model_copy(update={"file_path": str(resolved_path)})
+
     if not plan.is_actionable:
         response = {
             "success": False,
@@ -195,16 +241,24 @@ async def document_apply_plan(tool_input: dict) -> dict:
             response["clarification_question"] = plan.clarification_question
         return response
 
-    # 高风险操作需要确认
-    if plan.needs_confirmation:
-        confirmed = tool_input.get("confirmed", False)
-        if not confirmed:
-            return {
-                "success": False,
-                "error": "高风险操作需要确认",
-                "requires_confirmation": True,
-                "plan": plan.model_dump(),
-            }
+    confirmed = bool(tool_input.get("confirmed", False))
+    if plan.intent == DocumentIntent.EDIT and not confirmed:
+        error = "高风险操作需要确认" if plan.needs_confirmation else "编辑操作需要确认"
+        return {
+            "success": False,
+            "error": error,
+            "requires_confirmation": True,
+            "plan": plan.model_dump(),
+        }
+
+    # 非编辑但显式标记需要确认的计划，也不能绕过确认。
+    if plan.needs_confirmation and not confirmed:
+        return {
+            "success": False,
+            "error": "高风险操作需要确认",
+            "requires_confirmation": True,
+            "plan": plan.model_dump(),
+        }
 
     executor = _get_executor()
 
@@ -228,6 +282,11 @@ async def document_review(tool_input: dict) -> dict:
     file_path = tool_input.get("file_path", "")
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
+
+    resolved_path, err = validate_file_path(file_path)
+    if err:
+        return {"success": False, "error": err}
+    file_path = str(resolved_path)
 
     file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
     if err:
