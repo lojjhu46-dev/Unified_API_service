@@ -154,19 +154,82 @@ class TestDocumentOperations:
         assert data["route"] == "tool"
         assert "审阅" in data["answer"] or "文档" in data["answer"]
 
-    def test_plan_via_ask(self, client):
-        """通过 /ask 生成编辑方案"""
+    def test_plan_via_ask_returns_edit_plan(self, client):
+        """通过 /ask 生成编辑方案，应返回可执行 edit plan"""
         _setup_executor_with_txt()
+        # 模拟 planner 返回可执行 edit plan
+        mock_plan_data = {
+            "intent": "edit",
+            "file_type": "txt",
+            "file_path": "/tmp/test.txt",
+            "backend_required": "text_adapter",
+            "operations": [
+                {"action": "replace_line", "target": {"line": 1}, "value": "新内容", "description": "替换第一行"},
+            ],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_plan_data)),
+        ):
+            payload = {
+                "user_id": "test_user",
+                "question": "把第一行改成新内容",
+                "document_file_path": "/tmp/test.txt",
+                "document_action": "plan",
+            }
+            response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "编辑方案" in data["answer"]
+        assert "确认" in data["answer"]
+
+    def test_plan_unsupported_via_ask(self, client):
+        """PDF 编辑方案应返回 unsupported 提示"""
         payload = {
             "user_id": "test_user",
-            "question": "把第一行改成新内容",
-            "document_file_path": "/tmp/test.txt",
+            "question": "删除第三段",
+            "document_file_path": "/tmp/test.pdf",
             "document_action": "plan",
         }
         response = client.post("/ask", json=payload)
         assert response.status_code == 200
         data = response.json()
         assert data["route"] == "tool"
+        assert "无法生成" in data["answer"] or "不支持" in data["answer"]
+
+    def test_plan_clarification_via_ask(self, client):
+        """模糊命令应返回澄清问题"""
+        mock_plan_data = {
+            "intent": "edit",
+            "file_type": "txt",
+            "file_path": "/tmp/test.txt",
+            "backend_required": "text_adapter",
+            "operations": [],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "clarification_question": "请指定要删除的行号范围",
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_plan_data)),
+        ):
+            payload = {
+                "user_id": "test_user",
+                "question": "删除实验体会的内容",
+                "document_file_path": "/tmp/test.txt",
+                "document_action": "plan",
+            }
+            response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "补充信息" in data["answer"] or "请指定" in data["answer"]
 
     def test_apply_confirmed_via_ask(self, client):
         """通过 /ask 确认执行编辑"""
@@ -191,8 +254,32 @@ class TestDocumentOperations:
         assert data["route"] == "tool"
         assert "成功" in data["answer"]
 
-    def test_apply_unconfirmed_returns_confirmation_prompt(self, client):
-        """未确认的编辑应返回确认提示"""
+    def test_apply_unconfirmed_edit_requires_confirmation(self, client):
+        """低风险编辑未确认也应返回确认提示"""
+        payload = {
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "risk_level": "low",
+                "requires_confirmation": False,
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 1}, "value": "新内容"},
+                ],
+            },
+            "document_confirmed": False,
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "确认" in data["answer"]
+
+    def test_apply_unconfirmed_high_risk_requires_confirmation(self, client):
+        """高风险编辑未确认也应返回确认提示"""
         payload = {
             "user_id": "test_user",
             "question": "执行编辑",

@@ -21,7 +21,6 @@ from app.memory.rewrite import _history_to_text, rewrite_question
 from app.tools.registry import tool_registry
 from app.tools.calculator import extract_math_expression
 from app.tools.search import format_search_results
-from app.documents.tools import document_extract, document_plan, document_apply_plan, document_review
 from app.config import settings
 from app.observability.logging import get_logger
 
@@ -834,6 +833,16 @@ class Orchestrator:
                     "tool_ms": 0,
                     "llm_ms": 0,
                 }
+            # 所有 EDIT plan 都需要确认，不只是高风险
+            plan_intent = request.document_plan.get("intent", "")
+            if plan_intent == "edit" and not request.document_confirmed:
+                return {
+                    "answer": "编辑方案已收到，请确认后执行（设置 document_confirmed=true）。",
+                    "sources": [],
+                    "tool_trace": tool_trace,
+                    "tool_ms": 0,
+                    "llm_ms": 0,
+                }
             execution = await self.tools.execute_with_result("document_apply_plan", {
                 "plan": request.document_plan,
                 "confirmed": request.document_confirmed,
@@ -890,10 +899,18 @@ class Orchestrator:
             result = execution.result
             if result.get("success"):
                 plan = result.get("plan", {})
-                answer = (
-                    "已生成编辑方案，请确认后执行：\n"
-                    f"```json\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n```"
-                )
+                plan_intent = plan.get("intent", "")
+                unsupported_reason = plan.get("unsupported_reason")
+                clarification = plan.get("clarification_question")
+                if plan_intent == "unsupported":
+                    answer = f"无法生成编辑方案：{unsupported_reason or '该操作不支持'}"
+                elif clarification:
+                    answer = f"需要补充信息：{clarification}"
+                else:
+                    answer = (
+                        "已生成编辑方案，请确认后执行（设置 document_confirmed=true）：\n"
+                        f"```json\n{json.dumps(plan, ensure_ascii=False, indent=2)}\n```"
+                    )
             else:
                 answer = f"编辑方案生成失败：{result.get('error', '未知错误')}"
             return {
