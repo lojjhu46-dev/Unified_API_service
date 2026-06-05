@@ -233,3 +233,37 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "docx_mcp" in result.error
+
+    @pytest.mark.asyncio
+    async def test_read_page_missing_page_raises(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EXTRACT,
+            file_type=FileType.PDF,
+            file_path=sample_doc,
+            backend_required=BackendType.PDF_READER,
+            operations=[
+                DocumentOperation(action="read_page", target={}, description="缺页码"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "缺少 page" in result.error
+
+    @pytest.mark.asyncio
+    async def test_extract_text_single_element_page_range_raises(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EXTRACT,
+            file_type=FileType.PDF,
+            file_path=sample_doc,
+            backend_required=BackendType.PDF_READER,
+            operations=[
+                DocumentOperation(
+                    action="extract_text",
+                    target={"page_range": [2]},
+                    description="畸形参数",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "page_range" in result.error

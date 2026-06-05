@@ -7,8 +7,6 @@ PDF 永远只读，不支持编辑、删除、生成已编辑副本。
 
 from __future__ import annotations
 
-import uuid
-from pathlib import Path
 from typing import Any
 
 from app.documents.adapters.base import BackendUnavailableError, DocumentBackend
@@ -100,7 +98,9 @@ class PdfBackend(DocumentBackend):
             for op in plan.operations:
                 if op.action == "extract_text":
                     page_range = op.target.get("page_range")
-                    if page_range and len(page_range) >= 2:
+                    if page_range is not None:
+                        if not isinstance(page_range, list) or len(page_range) < 2:
+                            raise ValueError(f"extract_text 的 page_range 需要至少 2 个元素: {page_range}")
                         text = await self.extract_text(plan.file_path, page_range[0], page_range[1])
                         preview = text[:200] + ("..." if len(text) > 200 else "")
                         summary_parts.append(f"第{page_range[0]}-{page_range[1]}页：{preview}")
@@ -111,10 +111,11 @@ class PdfBackend(DocumentBackend):
 
                 elif op.action == "read_page":
                     page = op.target.get("page")
-                    if page:
-                        text = await self.read_page(plan.file_path, int(page))
-                        preview = text[:200] + ("..." if len(text) > 200 else "")
-                        summary_parts.append(f"第{page}页：{preview}")
+                    if page is None:
+                        raise ValueError(f"read_page 缺少 page: {op.target}")
+                    text = await self.read_page(plan.file_path, int(page))
+                    preview = text[:200] + ("..." if len(text) > 200 else "")
+                    summary_parts.append(f"第{page}页：{preview}")
 
             return DocumentOperationResult(
                 success=True,
