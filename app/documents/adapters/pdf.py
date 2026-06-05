@@ -7,13 +7,13 @@ PDF 永远只读，不支持编辑、删除、生成已编辑副本。
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import Any
 
 from app.documents.adapters.base import BackendUnavailableError, DocumentBackend
 from app.documents.models import (
     BackendType,
     DocumentIntent,
-    DocumentOperation,
     DocumentOperationResult,
     DocumentPlan,
     FileType,
@@ -36,17 +36,20 @@ class PdfBackend(DocumentBackend):
 
     # ---- 子类必须实现的只读原子操作 ----
 
+    @abstractmethod
     async def read_structure(self, file_path: str) -> dict[str, Any]:
         """读取 PDF 文档结构（页数、目录等）"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def read_page(self, file_path: str, page: int) -> str:
         """读取指定页的文本内容（1-based）"""
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def extract_text(self, file_path: str, start: int = 1, end: int | None = None) -> str:
         """提取指定范围的文本（1-based，包含 start 和 end）"""
-        raise NotImplementedError
+        ...
 
     # ---- 统一执行入口 ----
 
@@ -116,6 +119,9 @@ class PdfBackend(DocumentBackend):
                     text = await self.read_page(plan.file_path, int(page))
                     preview = text[:200] + ("..." if len(text) > 200 else "")
                     summary_parts.append(f"第{page}页：{preview}")
+
+                else:
+                    raise ValueError(f"不支持的操作动作: {op.action}")
 
             return DocumentOperationResult(
                 success=True,

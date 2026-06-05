@@ -2,7 +2,7 @@
 
 import pytest
 from app.documents.adapters.base import BackendUnavailableError
-from app.documents.adapters.pdf import MockPdfBackend
+from app.documents.adapters.pdf import MockPdfBackend, PdfBackend
 from app.documents.models import (
     BackendType,
     DocumentIntent,
@@ -45,6 +45,21 @@ class TestReadStructure:
         backend.set_available(False)
         with pytest.raises(BackendUnavailableError):
             await backend.read_structure(sample_doc)
+
+
+# ---------------------------------------------------------------------------
+# 抽象接口
+# ---------------------------------------------------------------------------
+
+class TestAbstractBackend:
+    def test_incomplete_backend_cannot_be_instantiated(self):
+        class IncompletePdfBackend(PdfBackend):
+            @property
+            def is_available(self) -> bool:
+                return True
+
+        with pytest.raises(TypeError):
+            IncompletePdfBackend()
 
 
 # ---------------------------------------------------------------------------
@@ -267,3 +282,18 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "page_range" in result.error
+
+    @pytest.mark.asyncio
+    async def test_unknown_readonly_action_rejected(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EXTRACT,
+            file_type=FileType.PDF,
+            file_path=sample_doc,
+            backend_required=BackendType.PDF_READER,
+            operations=[
+                DocumentOperation(action="unknown_action", target={}, description="未知动作"),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "不支持的操作动作" in result.error
