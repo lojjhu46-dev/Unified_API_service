@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.documents.executor import DocumentOperationAgent
+from app.documents.executor import DocumentOperationAgent, describe_non_actionable_plan
 from app.documents.models import (
     BackendType,
     DocumentIntent,
@@ -183,6 +183,17 @@ async def document_apply_plan(tool_input: dict) -> dict:
         plan = DocumentPlan.model_validate(plan_data)
     except Exception as e:
         return {"success": False, "error": f"plan 解析失败: {e}"}
+
+    if not plan.is_actionable:
+        response = {
+            "success": False,
+            "error": describe_non_actionable_plan(plan),
+            "plan": plan.model_dump(),
+        }
+        if plan.clarification_question:
+            response["requires_clarification"] = True
+            response["clarification_question"] = plan.clarification_question
+        return response
 
     # 高风险操作需要确认
     if plan.needs_confirmation:

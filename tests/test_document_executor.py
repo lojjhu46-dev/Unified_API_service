@@ -161,6 +161,53 @@ class TestErrors:
         assert not result.success
         assert "未注册" in result.error
 
+    @pytest.mark.asyncio
+    async def test_clarification_plan_not_executed(self, agent):
+        backend = agent.get_backend(BackendType.TEXT_ADAPTER)
+        backend.load_file("/tmp/test.txt", ["行1", "行2"])
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path="/tmp/test.txt",
+            backend_required=BackendType.TEXT_ADAPTER,
+            clarification_question="请指定要修改的行号",
+        )
+        result = await agent.execute(plan)
+        assert not result.success
+        assert result.output_file is None
+        assert "需要澄清" in result.error
+        assert "请指定要修改的行号" in result.error
+
+    @pytest.mark.asyncio
+    async def test_empty_edit_plan_not_executed(self, agent):
+        backend = agent.get_backend(BackendType.TEXT_ADAPTER)
+        backend.load_file("/tmp/test.txt", ["行1", "行2"])
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.TXT,
+            file_path="/tmp/test.txt",
+            backend_required=BackendType.TEXT_ADAPTER,
+        )
+        result = await agent.execute(plan)
+        assert not result.success
+        assert result.output_file is None
+        assert "没有可执行操作" in result.error
+
+    @pytest.mark.asyncio
+    async def test_readonly_without_operations_still_executes(self, agent):
+        backend = agent.get_backend(BackendType.TEXT_ADAPTER)
+        backend.load_file("/tmp/test.txt", ["行1", "行2"])
+        plan = DocumentPlan(
+            intent=DocumentIntent.REVIEW,
+            file_type=FileType.TXT,
+            file_path="/tmp/test.txt",
+            backend_required=BackendType.TEXT_ADAPTER,
+        )
+        result = await agent.execute(plan)
+        assert result.success
+        assert result.output_file is None
+        assert result.summary == "只读操作完成"
+
 
 # ---------------------------------------------------------------------------
 # 执行后校验 warnings

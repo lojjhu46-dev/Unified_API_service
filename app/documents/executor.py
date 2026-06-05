@@ -23,6 +23,15 @@ from app.observability.logging import get_logger
 logger = get_logger(__name__)
 
 
+def describe_non_actionable_plan(plan: DocumentPlan) -> str:
+    """返回不可执行方案的人类可读原因。"""
+    if plan.clarification_question:
+        return f"方案需要澄清：{plan.clarification_question}"
+    if plan.intent == DocumentIntent.EDIT and not plan.operations:
+        return "编辑方案没有可执行操作"
+    return "方案不可执行"
+
+
 class DocumentOperationAgent:
     """执行智能体：接收 DocumentPlan，分发到对应后端执行。
 
@@ -79,6 +88,13 @@ class DocumentOperationAgent:
             return DocumentOperationResult(
                 success=False,
                 error="backend_required 为空，无法执行",
+            )
+
+        # 最终防线：需要澄清或没有操作的编辑方案不能进入后端执行
+        if not plan.is_actionable:
+            return DocumentOperationResult(
+                success=False,
+                error=describe_non_actionable_plan(plan),
             )
 
         # 查找后端

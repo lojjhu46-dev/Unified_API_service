@@ -207,11 +207,35 @@ class DocumentPlanningAgent:
         except ValueError:
             intent = DocumentIntent.UNSUPPORTED
 
-        operations = [
-            DocumentOperation(**op)
-            for op in data.get("operations", [])
-            if isinstance(op, dict)
-        ]
+        raw_operations = data.get("operations", [])
+        if raw_operations is None:
+            raw_operations = []
+        if not isinstance(raw_operations, list):
+            logger.warning(f"规划 LLM 输出 operations 不是列表: {raw_operations!r}")
+            return DocumentPlan(
+                intent=DocumentIntent.UNSUPPORTED,
+                file_type=file_type,
+                unsupported_reason="规划智能体输出 operation 格式错误",
+            )
+
+        operations: list[DocumentOperation] = []
+        for op in raw_operations:
+            if not isinstance(op, dict):
+                logger.warning(f"规划 LLM 输出 operation 不是对象: {op!r}")
+                return DocumentPlan(
+                    intent=DocumentIntent.UNSUPPORTED,
+                    file_type=file_type,
+                    unsupported_reason="规划智能体输出 operation 格式错误",
+                )
+            try:
+                operations.append(DocumentOperation(**op))
+            except Exception as e:
+                logger.warning(f"规划 LLM 输出 operation 格式错误: {e}")
+                return DocumentPlan(
+                    intent=DocumentIntent.UNSUPPORTED,
+                    file_type=file_type,
+                    unsupported_reason="规划智能体输出 operation 格式错误",
+                )
 
         risk_str = data.get("risk_level", "low")
         try:

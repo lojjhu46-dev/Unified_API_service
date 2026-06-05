@@ -285,6 +285,47 @@ class TestDocumentApplyPlan:
         assert result["success"] is False
 
     @pytest.mark.asyncio
+    async def test_apply_clarification_plan_returns_clarification(self):
+        executor = _make_executor_with_mocks()
+        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
+        backend.load_file("/tmp/test.txt", ["行1", "行2"])
+        set_executor(executor)
+
+        result = await document_apply_plan({
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "clarification_question": "请指定要修改的行号",
+            },
+        })
+        assert result["success"] is False
+        assert result["requires_clarification"] is True
+        assert result["clarification_question"] == "请指定要修改的行号"
+        assert "需要澄清" in result["error"]
+        assert result["plan"]["file_path"] == "/tmp/test.txt"
+
+    @pytest.mark.asyncio
+    async def test_apply_empty_edit_plan_rejected_before_executor(self):
+        executor = _make_executor_with_mocks()
+        backend = executor.get_backend(BackendType.TEXT_ADAPTER)
+        backend.load_file("/tmp/test.txt", ["行1", "行2"])
+        set_executor(executor)
+
+        result = await document_apply_plan({
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+            },
+        })
+        assert result["success"] is False
+        assert "没有可执行操作" in result["error"]
+        assert "requires_confirmation" not in result
+
+    @pytest.mark.asyncio
     async def test_apply_high_risk_requires_confirmation(self):
         result = await document_apply_plan({
             "plan": {

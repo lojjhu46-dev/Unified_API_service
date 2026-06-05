@@ -306,6 +306,54 @@ class TestParseLLMOutput:
         assert "格式错误" in (plan.unsupported_reason or "")
 
     @pytest.mark.asyncio
+    async def test_malformed_operation_missing_action_returns_unsupported(self):
+        """LLM 返回缺 action 的 operation 时降级，不抛异常"""
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {"target": {"line": 1}, "value": "新内容"},
+            ],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data)),
+        ):
+            plan = await planner.plan(
+                user_command="把第一行改成新内容",
+                file_type=FileType.TXT,
+            )
+        assert plan.intent == DocumentIntent.UNSUPPORTED
+        assert "operation 格式错误" in (plan.unsupported_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_non_dict_operation_returns_unsupported(self):
+        """LLM 返回非对象 operation 时降级，不抛异常"""
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                "replace first line",
+            ],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data)),
+        ):
+            plan = await planner.plan(
+                user_command="把第一行改成新内容",
+                file_type=FileType.TXT,
+            )
+        assert plan.intent == DocumentIntent.UNSUPPORTED
+        assert "operation 格式错误" in (plan.unsupported_reason or "")
+
+    @pytest.mark.asyncio
     async def test_json_in_code_block(self):
         """LLM 输出包含在 ```json 代码块中"""
         mock_data = {
