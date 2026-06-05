@@ -1,6 +1,7 @@
 """Phase 8: 文档智能体工具测试"""
 
 import pytest
+import app.documents.tools as document_tools
 from app.documents.tools import (
     _reset_executor,
     document_apply_plan,
@@ -11,7 +12,14 @@ from app.documents.tools import (
     set_executor,
 )
 from app.documents.executor import DocumentOperationAgent
-from app.documents.models import BackendType, FileType
+from app.documents.models import (
+    BackendType,
+    DocumentIntent,
+    DocumentOperation,
+    DocumentOperationResult,
+    DocumentPlan,
+    FileType,
+)
 from app.documents.adapters.docx import MockDocxBackend
 from app.documents.adapters.txt import MockTxtBackend
 from app.documents.adapters.pdf import MockPdfBackend
@@ -35,6 +43,34 @@ def _make_executor_with_mocks() -> DocumentOperationAgent:
     executor.register_backend(BackendType.TEXT_ADAPTER, MockTxtBackend())
     executor.register_backend(BackendType.PDF_READER, MockPdfBackend())
     return executor
+
+
+class FixedPlanner:
+    """返回固定 DocumentPlan 的测试 planner，避免单测依赖真实 LLM。"""
+
+    def __init__(self, plan: DocumentPlan) -> None:
+        self._plan = plan
+
+    async def plan(self, user_command: str, file_type: FileType, structure: dict | None = None) -> DocumentPlan:
+        return self._plan
+
+
+class SpyExecutor(DocumentOperationAgent):
+    """记录 execute() 调用的测试 executor。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.execute_called = False
+        self.received_plan: DocumentPlan | None = None
+
+    async def execute(self, plan: DocumentPlan) -> DocumentOperationResult:
+        self.execute_called = True
+        self.received_plan = plan
+        return DocumentOperationResult(
+            success=True,
+            summary="via executor",
+            verification={"structure": {"source": "executor"}},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -149,14 +185,19 @@ class TestDocumentReview:
     @pytest.mark.asyncio
     async def test_review_via_executor(self):
         """document_review 应经过 executor.execute()"""
-        executor = _make_executor_with_mocks()
-        backend = executor.get_backend(BackendType.PDF_READER)
-        backend.load_document("/tmp/test.pdf", ["页1", "页2", "页3"])
+        executor = SpyExecutor()
         set_executor(executor)
 
         result = await document_review({"file_path": "/tmp/test.pdf"})
         assert result["success"] is True
-        assert result["structure"]["page_count"] == 3
+        assert result["summary"] == "via executor"
+        assert result["structure"] == {"source": "executor"}
+        assert executor.execute_called is True
+        assert executor.received_plan is not None
+        assert executor.received_plan.intent == DocumentIntent.REVIEW
+        assert executor.received_plan.file_type == FileType.PDF
+        assert executor.received_plan.file_path == "/tmp/test.pdf"
+        assert executor.received_plan.backend_required == BackendType.PDF_READER
 
     @pytest.mark.asyncio
     async def test_review_missing_path(self):
@@ -170,8 +211,19 @@ class TestDocumentReview:
 
 class TestDocumentPlan:
     @pytest.mark.asyncio
-    async def test_plan_includes_file_path(self):
+    async def test_plan_includes_file_path(self, monkeypatch):
         """document_plan 返回的 plan 必须包含 file_path"""
+        monkeypatch.setattr(
+            document_tools,
+            "_planner",
+            FixedPlanner(
+                DocumentPlan(
+                    intent=DocumentIntent.REVIEW,
+                    file_type=FileType.PDF,
+                    backend_required=BackendType.PDF_READER,
+                )
+            ),
+        )
         result = await document_plan({
             "user_command": "审阅文档",
             "file_path": "/tmp/test.pdf",
@@ -280,12 +332,30 @@ class TestDocumentApplyPlan:
 
 class TestPlanToApply:
     @pytest.mark.asyncio
-    async def test_plan_then_apply_txt(self):
+    async def test_plan_then_apply_txt(self, monkeypatch):
         """document_plan 输出的 plan 可直接传给 document_apply_plan 执行"""
         executor = _make_executor_with_mocks()
         backend = executor.get_backend(BackendType.TEXT_ADAPTER)
         backend.load_file("/tmp/test.txt", ["第一行", "第二行", "第三行"])
         set_executor(executor)
+        monkeypatch.setattr(
+            document_tools,
+            "_planner",
+            FixedPlanner(
+                DocumentPlan(
+                    intent=DocumentIntent.EDIT,
+                    file_type=FileType.TXT,
+                    backend_required=BackendType.TEXT_ADAPTER,
+                    operations=[
+                        DocumentOperation(
+                            action="replace_line",
+                            target={"line": 2},
+                            value="新内容",
+                        ),
+                    ],
+                )
+            ),
+        )
 
         # 规划
         plan_result = await document_plan({
@@ -297,9 +367,9 @@ class TestPlanToApply:
 
         # 执行
         apply_result = await document_apply_plan({"plan": plan_result["plan"]})
-        # 可能成功也可能因 LLM mock 返回 unsupported 而失败，
-        # 但关键验证 plan 中 file_path 非空
-        assert "plan" in plan_result or "result" in apply_result
+        assert apply_result["success"] is True
+        assert apply_result["result"]["success"] is True
+        assert apply_result["result"]["output_file"] is not None
 
 
 # ---------------------------------------------------------------------------
