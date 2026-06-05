@@ -2,7 +2,7 @@
 
 import pytest
 from app.documents.adapters.base import BackendUnavailableError
-from app.documents.adapters.xlsx import MockXlsxBackend
+from app.documents.adapters.xlsx import MockXlsxBackend, _column_name
 from app.documents.models import (
     BackendType,
     DocumentIntent,
@@ -90,6 +90,16 @@ class TestAtomicOperations:
         assert await backend.read_cell(sample_doc, "Sheet1", "C2") == "8000"
 
     @pytest.mark.asyncio
+    async def test_delete_row_zero_rejected(self, backend, sample_doc):
+        with pytest.raises(ValueError, match="行号必须 >= 1"):
+            await backend.delete_row(sample_doc, "Sheet1", 0)
+
+    @pytest.mark.asyncio
+    async def test_delete_row_negative_rejected(self, backend, sample_doc):
+        with pytest.raises(ValueError, match="行号必须 >= 1"):
+            await backend.delete_row(sample_doc, "Sheet1", -1)
+
+    @pytest.mark.asyncio
     async def test_file_not_loaded(self, backend):
         with pytest.raises(FileNotFoundError):
             await backend.read_cell("/nonexistent.xlsx", "Sheet1", "A1")
@@ -98,6 +108,56 @@ class TestAtomicOperations:
     async def test_sheet_not_exist(self, backend, sample_doc):
         with pytest.raises(KeyError):
             await backend.read_cell(sample_doc, "不存在的表", "A1")
+
+    @pytest.mark.asyncio
+    async def test_append_row_27_columns(self, backend, sample_doc):
+        """第27列应为 AA，不是 [ """
+        values = [f"col{i}" for i in range(27)]
+        await backend.append_row(sample_doc, "Sheet1", values)
+        assert await backend.read_cell(sample_doc, "Sheet1", "A4") == "col0"
+        assert await backend.read_cell(sample_doc, "Sheet1", "Z4") == "col25"
+        assert await backend.read_cell(sample_doc, "Sheet1", "AA4") == "col26"
+
+
+# ---------------------------------------------------------------------------
+# _column_name 辅助函数
+# ---------------------------------------------------------------------------
+
+class TestColumnName:
+    def test_single_letter(self):
+        assert _column_name(0) == "A"
+        assert _column_name(25) == "Z"
+
+    def test_double_letter(self):
+        assert _column_name(26) == "AA"
+        assert _column_name(27) == "AB"
+        assert _column_name(51) == "AZ"
+
+    def test_triple_letter(self):
+        assert _column_name(52) == "BA"
+        assert _column_name(701) == "ZZ"
+        assert _column_name(702) == "AAA"
+
+
+# ---------------------------------------------------------------------------
+# 表头推断
+# ---------------------------------------------------------------------------
+
+class TestHeaderInference:
+    @pytest.mark.asyncio
+    async def test_a11_not_misidentified_as_header(self, backend):
+        """A11 不应被误认为第一行表头"""
+        backend.load_workbook("/tmp/header_test.xlsx", {
+            "Sheet1": {
+                "A1": "正确表头",
+                "A11": "第11行数据",
+                "B21": "第21行数据",
+            },
+        })
+        structure = await backend.read_structure("/tmp/header_test.xlsx")
+        headers = structure["sheets_info"]["Sheet1"]["headers"]
+        assert headers == ["正确表头"]
+        assert "第11行数据" not in headers
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +424,32 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "sheet" in result.error
+
+    @pytest.mark.asyncio
+    async def test_replace_range_missing_cell_raises(self, backend, sample_doc):
+        """replace_range 中任何 replacement 缺少 cell 都应报错"""
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.XLSX,
+            file_path=sample_doc,
+            backend_required=BackendType.XLSX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="replace_range",
+                    target={
+                        "sheet": "Sheet1",
+                        "replacements": [
+                            {"cell": "A1", "value": "新值"},
+                            {"value": "没有cell"},  # 缺少 cell
+                        ],
+                    },
+                    description="批量替换",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "缺少 cell" in result.error
 
     @pytest.mark.asyncio
     async def test_partial_edit_no_output_file(self, backend, sample_doc):

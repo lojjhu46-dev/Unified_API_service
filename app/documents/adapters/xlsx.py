@@ -218,11 +218,12 @@ class XlsxBackend(DocumentBackend):
             replacements = op.target.get("replacements", [])
             if not sheet:
                 raise ValueError(f"replace_range 缺少 sheet: {op.target}")
-            for rep in replacements:
+            for i, rep in enumerate(replacements):
                 cell = rep.get("cell")
+                if not cell:
+                    raise ValueError(f"replace_range 第 {i + 1} 项缺少 cell: {rep}")
                 value = rep.get("value", "")
-                if cell:
-                    await self.modify_cell(file_path, sheet, cell, value)
+                await self.modify_cell(file_path, sheet, cell, value)
 
         else:
             raise ValueError(f"不支持的操作动作: {op.action}")
@@ -233,6 +234,17 @@ class XlsxBackend(DocumentBackend):
         p = Path(file_path)
         short_id = uuid.uuid4().hex[:8]
         return str(p.parent / f"{p.stem}_副本_{short_id}{p.suffix}")
+
+
+def _column_name(index: int) -> str:
+    """将 0-based 列索引转换为 Excel 列名：0→A, 25→Z, 26→AA, 27→AB, ..."""
+    name = ""
+    while True:
+        name = chr(ord("A") + index % 26) + name
+        index = index // 26 - 1
+        if index < 0:
+            break
+    return name
 
 
 class MockXlsxBackend(XlsxBackend):
@@ -284,7 +296,7 @@ class MockXlsxBackend(XlsxBackend):
         sheets_info = {}
         for sheet_name, cells in wb.items():
             # 推断表头：第一行非空单元格
-            row1 = {k: v for k, v in cells.items() if k[-1] == "1" or (len(k) > 1 and k[1:] == "1")}
+            row1 = {k: v for k, v in cells.items() if self._row_of(k) == 1}
             headers = [v for _, v in sorted(row1.items())]
             sheets_info[sheet_name] = {
                 "headers": headers,
@@ -324,12 +336,14 @@ class MockXlsxBackend(XlsxBackend):
         ws = self._get_sheet(file_path, sheet)
         next_row = self._count_rows(ws) + 1
         for i, val in enumerate(values):
-            col_letter = chr(ord("A") + i)
-            ws[f"{col_letter}{next_row}"] = val
+            col_name = _column_name(i)
+            ws[f"{col_name}{next_row}"] = val
 
     async def delete_row(self, file_path: str, sheet: str, row: int) -> None:
         if not self.is_available:
             raise BackendUnavailableError("MockXlsxBackend 不可用")
+        if row < 1:
+            raise ValueError(f"行号必须 >= 1，当前为 {row}")
         ws = self._get_sheet(file_path, sheet)
         # 删除指定行：移除该行所有单元格，下方行上移
         to_delete = [k for k in ws if self._row_of(k) == row]
