@@ -138,6 +138,10 @@ class TestColumnName:
         assert _column_name(701) == "ZZ"
         assert _column_name(702) == "AAA"
 
+    def test_negative_index_rejected(self):
+        with pytest.raises(ValueError, match="列索引必须 >= 0"):
+            _column_name(-1)
+
 
 # ---------------------------------------------------------------------------
 # 表头推断
@@ -450,6 +454,26 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "缺少 cell" in result.error
+
+    @pytest.mark.asyncio
+    async def test_replace_range_empty_replacements_raises(self, backend, sample_doc):
+        """replace_range 的 replacements 不能为空"""
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.XLSX,
+            file_path=sample_doc,
+            backend_required=BackendType.XLSX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="replace_range",
+                    target={"sheet": "Sheet1", "replacements": []},
+                    description="空批量替换",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert "缺少 replacements" in result.error
 
     @pytest.mark.asyncio
     async def test_partial_edit_no_output_file(self, backend, sample_doc):

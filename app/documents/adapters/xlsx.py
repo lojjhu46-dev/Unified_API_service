@@ -218,6 +218,8 @@ class XlsxBackend(DocumentBackend):
             replacements = op.target.get("replacements", [])
             if not sheet:
                 raise ValueError(f"replace_range 缺少 sheet: {op.target}")
+            if not replacements:
+                raise ValueError(f"replace_range 缺少 replacements: {op.target}")
             for i, rep in enumerate(replacements):
                 cell = rep.get("cell")
                 if not cell:
@@ -238,6 +240,8 @@ class XlsxBackend(DocumentBackend):
 
 def _column_name(index: int) -> str:
     """将 0-based 列索引转换为 Excel 列名：0→A, 25→Z, 26→AA, 27→AB, ..."""
+    if index < 0:
+        raise ValueError(f"列索引必须 >= 0，当前为 {index}")
     name = ""
     while True:
         name = chr(ord("A") + index % 26) + name
