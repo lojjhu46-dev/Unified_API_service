@@ -107,7 +107,7 @@ class DocumentOperationAgent:
     def _validate_result(plan: DocumentPlan, result: DocumentOperationResult) -> None:
         """执行后校验：检查结果一致性。
 
-        不修改 result，只记录 warnings。
+        只追加 warnings，不改变 success / output_file。
         """
         warnings = result.warnings
 

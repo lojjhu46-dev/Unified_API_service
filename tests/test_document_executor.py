@@ -1,6 +1,9 @@
 """Phase 7: 执行智能体测试"""
 
+from typing import Any
+
 import pytest
+from app.documents.adapters.base import DocumentBackend
 from app.documents.adapters.docx import MockDocxBackend
 from app.documents.adapters.pdf import MockPdfBackend
 from app.documents.adapters.txt import MockTxtBackend
@@ -10,10 +13,32 @@ from app.documents.models import (
     BackendType,
     DocumentIntent,
     DocumentOperation,
+    DocumentOperationResult,
     DocumentPlan,
     FileType,
     RiskLevel,
 )
+
+
+class FixedResultBackend(DocumentBackend):
+    """返回固定结果的测试后端，用于覆盖执行后校验分支。"""
+
+    def __init__(self, result: DocumentOperationResult) -> None:
+        self._result = result
+
+    @property
+    def name(self) -> str:
+        return "fixed_result_backend"
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    async def execute(self, plan: DocumentPlan) -> DocumentOperationResult:
+        return self._result
+
+    async def read_structure(self, file_path: str) -> dict[str, Any]:
+        return {}
 
 
 @pytest.fixture
@@ -143,26 +168,35 @@ class TestErrors:
 
 class TestPostValidation:
     @pytest.mark.asyncio
-    async def test_readonly_with_output_file_warns(self, agent):
-        """只读操作不应生成 output_file"""
-        backend = agent.get_backend(BackendType.PDF_READER)
-        backend.load_document("/tmp/test.pdf", ["页1"])
+    async def test_edit_success_without_output_file_warns(self):
+        """编辑成功时应生成 output_file，否则记录 warning。"""
+        agent = DocumentOperationAgent()
+        agent.register_backend(
+            BackendType.DOCX_MCP,
+            FixedResultBackend(DocumentOperationResult(success=True)),
+        )
         plan = DocumentPlan(
-            intent=DocumentIntent.REVIEW,
-            file_type=FileType.PDF,
-            file_path="/tmp/test.pdf",
-            backend_required=BackendType.PDF_READER,
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path="/tmp/test.docx",
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(action="replace_paragraph", target={"paragraph_index": 0}, value="新内容"),
+            ],
         )
         result = await agent.execute(plan)
         assert result.success
-        # 正常情况下只读不生成 output_file，无 warning
         assert result.output_file is None
+        assert "编辑操作成功但 output_file 为空" in result.warnings
 
     @pytest.mark.asyncio
-    async def test_pdf_with_output_file_warns(self, agent):
-        """PDF 不应生成 output_file（即使后端 bug 导致生成了）"""
-        backend = agent.get_backend(BackendType.PDF_READER)
-        backend.load_document("/tmp/test.pdf", ["页1"])
+    async def test_readonly_pdf_with_output_file_warns(self):
+        """只读 PDF 生成 output_file 时应同时记录两个 warning。"""
+        agent = DocumentOperationAgent()
+        agent.register_backend(
+            BackendType.PDF_READER,
+            FixedResultBackend(DocumentOperationResult(success=True, output_file="/tmp/bad.pdf")),
+        )
         plan = DocumentPlan(
             intent=DocumentIntent.SUMMARIZE,
             file_type=FileType.PDF,
@@ -171,7 +205,9 @@ class TestPostValidation:
         )
         result = await agent.execute(plan)
         assert result.success
-        assert result.output_file is None
+        assert result.output_file == "/tmp/bad.pdf"
+        assert "只读操作不应生成 output_file" in result.warnings
+        assert "PDF 操作不应生成 output_file" in result.warnings
 
 
 # ---------------------------------------------------------------------------
