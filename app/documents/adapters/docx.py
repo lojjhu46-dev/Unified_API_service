@@ -8,7 +8,6 @@ MockDocxBackend 用于测试和无 MCP 环境时的开发验证。
 from __future__ import annotations
 
 import copy
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -128,10 +127,10 @@ class DocxBackend(DocumentBackend):
                 except Exception as e:
                     return DocumentOperationResult(
                         success=False,
-                        output_file=output_path,
                         summary=f"操作 {i + 1}/{len(plan.operations)} 失败",
                         error=str(e),
                         warnings=warnings,
+                        verification={"partial_output": output_path},
                     )
 
             return DocumentOperationResult(
@@ -154,22 +153,31 @@ class DocxBackend(DocumentBackend):
         action = op.action.lower()
 
         if action in ("replace_paragraph", "replace_text"):
-            index = op.target.get("paragraph_index") or op.target.get("index")
+            index = self._extract_index(op)
             if index is None:
                 raise ValueError(f"replace_paragraph 缺少 paragraph_index: {op.target}")
-            await self.replace_paragraph(file_path, int(index), op.value or "")
+            await self.replace_paragraph(file_path, index, op.value or "")
 
         elif action in ("delete_paragraph", "delete_text"):
-            index = op.target.get("paragraph_index") or op.target.get("index")
+            index = self._extract_index(op)
             if index is None:
                 raise ValueError(f"delete_paragraph 缺少 paragraph_index: {op.target}")
-            await self.delete_paragraph(file_path, int(index))
+            await self.delete_paragraph(file_path, index)
 
         elif action in ("append_text", "append_paragraph"):
             await self.append_paragraph(file_path, op.value or "")
 
         else:
             raise ValueError(f"不支持的操作动作: {op.action}")
+
+    @staticmethod
+    def _extract_index(op: DocumentOperation) -> int | None:
+        """从 target 中提取段落索引，显式判断 key 存在（0 是合法索引）。"""
+        target = op.target
+        for key in ("paragraph_index", "index"):
+            if key in target:
+                return int(target[key])
+        return None
 
     @staticmethod
     def _build_output_path(file_path: str) -> str:
@@ -205,7 +213,7 @@ class MockDocxBackend(DocxBackend):
     async def read_structure(self, file_path: str) -> dict[str, Any]:
         if not self.is_available:
             raise BackendUnavailableError("MockDocxBackend 不可用")
-        paras = self._documents.get(file_path, [])
+        paras = self._get_paras(file_path)
         return {
             "type": "docx",
             "paragraph_count": len(paras),

@@ -96,6 +96,11 @@ class TestAtomicOperations:
         with pytest.raises(FileNotFoundError):
             await backend.read_paragraph("/nonexistent.docx", 0)
 
+    @pytest.mark.asyncio
+    async def test_read_structure_file_not_loaded(self, backend):
+        with pytest.raises(FileNotFoundError):
+            await backend.read_structure("/nonexistent.docx")
+
 
 # ---------------------------------------------------------------------------
 # execute() 编辑操作
@@ -174,6 +179,49 @@ class TestExecuteEdit:
         assert result.success
         copy_structure = await backend.read_structure(result.output_file)
         assert copy_structure["paragraph_count"] == 8
+
+    @pytest.mark.asyncio
+    async def test_replace_first_paragraph(self, backend, sample_doc):
+        """paragraph_index=0 是合法索引，不应被误判为缺失"""
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="replace_paragraph",
+                    target={"paragraph_index": 0},
+                    value="新标题",
+                    description="替换第1段",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert result.success
+        copy_text = await backend.read_paragraph(result.output_file, 0)
+        assert copy_text == "新标题"
+
+    @pytest.mark.asyncio
+    async def test_delete_first_paragraph(self, backend, sample_doc):
+        """paragraph_index=0 删除第一段"""
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="delete_paragraph",
+                    target={"paragraph_index": 0},
+                    description="删除第1段",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert result.success
+        copy_structure = await backend.read_structure(result.output_file)
+        assert copy_structure["paragraph_count"] == 6
 
     @pytest.mark.asyncio
     async def test_multiple_operations(self, backend, sample_doc):
@@ -292,3 +340,31 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "paragraph_index" in result.error
+
+    @pytest.mark.asyncio
+    async def test_partial_edit_no_output_file(self, backend, sample_doc):
+        """多操作失败时不应返回可交付的 output_file"""
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="replace_paragraph",
+                    target={"paragraph_index": 0},
+                    value="新标题",
+                    description="成功操作",
+                ),
+                DocumentOperation(
+                    action="replace_paragraph",
+                    target={"paragraph_index": 999},
+                    value="失败",
+                    description="索引越界",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert result.output_file is None
+        assert result.verification.get("partial_output") is not None
