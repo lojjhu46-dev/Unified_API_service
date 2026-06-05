@@ -309,8 +309,8 @@ class DocumentPlanningAgent:
         """判断命令是否看起来像编辑操作。"""
         edit_keywords = [
             "修改", "编辑", "替换", "删除", "改写", "添加", "插入",
-            "清空", "移除", "更新", "改动", "edit", "replace", "delete",
-            "modify", "remove", "clear", "insert", "append",
+            "清空", "移除", "更新", "改动", "改成", "改为", "edit",
+            "replace", "delete", "modify", "remove", "clear", "insert", "append",
         ]
         text = command.lower()
         return any(kw in text for kw in edit_keywords)
@@ -341,7 +341,7 @@ class DocumentPlanningAgent:
 
         # 用户命令中是否包含明确锚点
         has_explicit_anchor = bool(
-            re.search(r'["""「」『』]', command)  # 引号包裹的原文片段（ASCII + 中文）
+            re.search(r'["“”「」『』]', command)  # 引号包裹的原文片段（ASCII + 中文）
             or re.search(r"第\s*\d+\s*[段行节]", command)  # "第3段" "第5行"
             or re.search(r"(?:行|段)\s*\d+", command)  # "行3" "段5"
             or re.search(r"[A-Z]+\d+", command)  # 单元格引用如 B3

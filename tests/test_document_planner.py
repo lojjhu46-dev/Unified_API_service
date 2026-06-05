@@ -80,13 +80,18 @@ class TestHardRules:
     @pytest.mark.asyncio
     async def test_pdf_edit_rejected_without_llm(self):
         """PDF 编辑请求应直接拒绝，不调用 LLM"""
-        plan = await planner.plan(
-            user_command="把第三段的内容改成新文本",
-            file_type=FileType.PDF,
-        )
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(),
+        ) as mock_generate:
+            plan = await planner.plan(
+                user_command="把第三段的内容改成新文本",
+                file_type=FileType.PDF,
+            )
         assert plan.intent == DocumentIntent.UNSUPPORTED
         assert plan.is_actionable is False
         assert "PDF" in (plan.unsupported_reason or "")
+        mock_generate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_pdf_review_passes_through(self):
