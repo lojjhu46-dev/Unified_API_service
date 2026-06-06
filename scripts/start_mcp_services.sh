@@ -13,11 +13,11 @@ export MCP_ALLOWED_DIR="${MCP_ALLOWED_DIR:-./data/uploads,./data/personal_upload
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 echo "启动 DOCX MCP 服务 (端口 9100)..."
-/root/.venvs/unified_api_service/bin/python -m uvicorn services.docx_mcp.main:app --host 0.0.0.0 --port 9100 &
+/root/.venvs/unified_api_service/bin/python -m uvicorn services.docx_mcp.main:app --host 127.0.0.1 --port 9100 &
 DOCX_PID=$!
 
 echo "启动 XLSX MCP 服务 (端口 9101)..."
-/root/.venvs/unified_api_service/bin/python -m uvicorn services.xlsx_mcp.main:app --host 0.0.0.0 --port 9101 &
+/root/.venvs/unified_api_service/bin/python -m uvicorn services.xlsx_mcp.main:app --host 127.0.0.1 --port 9101 &
 XLSX_PID=$!
 
 echo "MCP 服务已启动："

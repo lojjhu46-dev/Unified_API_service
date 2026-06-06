@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     xlsx_mcp_base_url: str = ""
     document_mcp_timeout_seconds: int = 30
     document_mcp_enabled: bool = False
+    mcp_api_key: Optional[str] = None
 
     # 安全配置
     api_key: Optional[str] = None

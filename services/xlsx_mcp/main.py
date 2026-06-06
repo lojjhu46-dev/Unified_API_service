@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from services.mcp_common.auth import verify_api_key
 from services.mcp_common.health import add_health_endpoint
 from services.mcp_common.logging import setup_logging
 from services.mcp_common.models import fail, ok
@@ -46,8 +47,13 @@ async def _run_in_executor(func, *args) -> Any:
 
 
 @app.post("/xlsx/read_structure")
-async def read_structure(body: dict) -> dict:
+async def read_structure(request: Request, body: dict) -> dict:
     """读取 XLSX 工作簿结构"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     resolved, err = validate_file_path(file_path)
     if err:
@@ -62,8 +68,13 @@ async def read_structure(body: dict) -> dict:
 
 
 @app.post("/xlsx/read_cell")
-async def read_cell(body: dict) -> dict:
+async def read_cell(request: Request, body: dict) -> dict:
     """读取指定单元格的值"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
     cell = body.get("cell", "")
@@ -88,8 +99,13 @@ async def read_cell(body: dict) -> dict:
 
 
 @app.post("/xlsx/modify_cell")
-async def modify_cell(body: dict) -> dict:
+async def modify_cell(request: Request, body: dict) -> dict:
     """修改指定单元格的值"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
     cell = body.get("cell", "")
@@ -115,8 +131,13 @@ async def modify_cell(body: dict) -> dict:
 
 
 @app.post("/xlsx/append_row")
-async def append_row(body: dict) -> dict:
+async def append_row(request: Request, body: dict) -> dict:
     """在指定工作表末尾追加一行"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
     values = body.get("values", [])
@@ -139,8 +160,13 @@ async def append_row(body: dict) -> dict:
 
 
 @app.post("/xlsx/delete_row")
-async def delete_row(body: dict) -> dict:
+async def delete_row(request: Request, body: dict) -> dict:
     """删除指定行（1-based）"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
     row = body.get("row")
@@ -165,8 +191,13 @@ async def delete_row(body: dict) -> dict:
 
 
 @app.post("/xlsx/save_copy")
-async def save_copy(body: dict) -> dict:
+async def save_copy(request: Request, body: dict) -> dict:
     """保存文档副本到指定路径"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     output_path = body.get("output_path", "")
 

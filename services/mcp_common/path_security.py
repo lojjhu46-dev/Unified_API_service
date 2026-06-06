@@ -1,6 +1,7 @@
 """MCP 服务路径安全校验
 
 限制文档操作只能访问允许目录下的文件。
+支持路径映射：主应用传来的宿主路径可转换为 MCP 容器路径。
 """
 
 from __future__ import annotations
@@ -8,6 +9,36 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional
+
+
+def _get_path_map() -> dict[str, str]:
+    """获取路径映射配置
+
+    格式：MCP_PATH_MAP=/mnt/d/...=/data/uploads,/mnt/d/...=/data/personal_uploads
+    """
+    path_map_str = os.environ.get("MCP_PATH_MAP", "")
+    path_map = {}
+    if path_map_str:
+        for mapping in path_map_str.split(","):
+            mapping = mapping.strip()
+            if "=" in mapping:
+                host_path, container_path = mapping.split("=", 1)
+                path_map[host_path.strip()] = container_path.strip()
+    return path_map
+
+
+def _apply_path_map(file_path: str) -> str:
+    """应用路径映射，将宿主路径转换为容器路径"""
+    path_map = _get_path_map()
+    if not path_map:
+        return file_path
+
+    for host_path, container_path in path_map.items():
+        if file_path.startswith(host_path):
+            # 替换前缀
+            return container_path + file_path[len(host_path):]
+
+    return file_path
 
 
 def get_allowed_dirs() -> list[Path]:
@@ -33,8 +64,11 @@ def validate_file_path(file_path: str) -> tuple[Optional[Path], Optional[str]]:
     if not file_path:
         return None, "缺少 file_path"
 
+    # 应用路径映射
+    mapped_path = _apply_path_map(file_path)
+
     try:
-        resolved = Path(file_path).resolve()
+        resolved = Path(mapped_path).resolve()
     except Exception as e:
         return None, f"路径解析失败: {e}"
 
@@ -68,8 +102,11 @@ def validate_output_path(output_path: str) -> tuple[Optional[Path], Optional[str
     if not output_path:
         return None, "缺少 output_path"
 
+    # 应用路径映射
+    mapped_path = _apply_path_map(output_path)
+
     try:
-        resolved = Path(output_path).resolve()
+        resolved = Path(mapped_path).resolve()
     except Exception as e:
         return None, f"路径解析失败: {e}"
 

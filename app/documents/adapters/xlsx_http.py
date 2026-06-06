@@ -24,9 +24,10 @@ class HttpXlsxBackend(XlsxBackend):
     不缓存可用性状态：每次调用独立处理，临时网络抖动不会永久阻断。
     """
 
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 30.0, api_key: str = "") -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._api_key = api_key
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -42,8 +43,11 @@ class HttpXlsxBackend(XlsxBackend):
         """调用 MCP 服务端点，返回 data 字段或抛异常。"""
         client = await self._get_client()
         url = f"{self._base_url}{endpoint}"
+        headers = {}
+        if self._api_key:
+            headers["X-MCP-API-Key"] = self._api_key
         try:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, headers=headers)
         except httpx.TimeoutException:
             raise BackendUnavailableError(f"XLSX MCP 超时: {url}")
         except httpx.RequestError as e:

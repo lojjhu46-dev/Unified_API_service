@@ -56,19 +56,56 @@ def build_structure_brief(structure: dict[str, Any]) -> str:
         para_count = structure.get("paragraph_count", 0)
         if para_count:
             parts.append(f"共 {para_count} 个段落")
+
+        # 段落详情（新增）
+        paragraphs = structure.get("paragraphs", [])
+        if paragraphs:
+            parts.append("段落：")
+            for p in paragraphs[:50]:  # 最多显示前 50 段
+                index = p.get("index", 0)
+                text = p.get("text", "")
+                # 截断过长的文本显示
+                if len(text) > 100:
+                    text = text[:100] + "..."
+                parts.append(f"  [{index}] {text}")
+
+        # tables 兼容 list 和 int 两种格式
         tables = structure.get("tables", [])
-        if tables:
-            parts.append(f"含 {len(tables)} 个表格")
+        if isinstance(tables, list):
+            if tables:
+                parts.append(f"含 {len(tables)} 个表格")
+                for t in tables[:5]:  # 最多显示前 5 个表格
+                    idx = t.get("index", 0)
+                    rows = t.get("rows", 0)
+                    cols = t.get("cols", 0)
+                    parts.append(f"  表格[{idx}]: {rows}行 x {cols}列")
+        elif isinstance(tables, int) and tables > 0:
+            parts.append(f"含 {tables} 个表格")
+
     elif doc_type == "xlsx":
         sheets = structure.get("sheets", [])
         if sheets:
             parts.append("工作表：" + ", ".join(sheets[:10]))
-        headers = structure.get("headers", [])
-        if headers:
-            parts.append("表头：" + ", ".join(headers[:15]))
-        row_count = structure.get("row_count", 0)
-        if row_count:
-            parts.append(f"约 {row_count} 行数据")
+
+        # 优先读取 sheets_info，同时兼容顶层 headers/row_count
+        sheets_info = structure.get("sheets_info", {})
+        if sheets_info:
+            for sheet_name, info in list(sheets_info.items())[:5]:  # 最多显示前 5 个 sheet
+                headers = info.get("headers", [])
+                row_count = info.get("row_count", 0)
+                if headers:
+                    parts.append(f"[{sheet_name}] 表头：" + ", ".join(headers[:15]))
+                if row_count:
+                    parts.append(f"[{sheet_name}] 约 {row_count} 行数据")
+        else:
+            # 兼容顶层 headers/row_count
+            headers = structure.get("headers", [])
+            if headers:
+                parts.append("表头：" + ", ".join(headers[:15]))
+            row_count = structure.get("row_count", 0)
+            if row_count:
+                parts.append(f"约 {row_count} 行数据")
+
     elif doc_type == "txt":
         line_count = structure.get("line_count", 0)
         if line_count:

@@ -18,15 +18,39 @@ def read_structure(file_path: str) -> dict[str, Any]:
     paragraphs = doc.paragraphs
 
     headings = []
-    for p in paragraphs:
+    paragraphs_info = []
+    max_paragraphs = 200  # 最多返回前 200 段
+    max_text_length = 500  # 每段最多 500 字
+
+    for i, p in enumerate(paragraphs[:max_paragraphs]):
+        text = p.text
+        # 截断过长的文本
+        if len(text) > max_text_length:
+            text = text[:max_text_length] + "..."
+
+        paragraphs_info.append({
+            "index": i,
+            "text": text,
+        })
+
         if p.style and p.style.name and p.style.name.startswith("Heading"):
             headings.append(p.text)
+
+    # tables 改为列表格式
+    tables_info = []
+    for i, table in enumerate(doc.tables):
+        tables_info.append({
+            "index": i,
+            "rows": len(table.rows),
+            "cols": len(table.columns),
+        })
 
     return {
         "type": "docx",
         "paragraph_count": len(paragraphs),
+        "paragraphs": paragraphs_info,
         "headings": headings,
-        "tables": len(doc.tables),
+        "tables": tables_info,
     }
 
 

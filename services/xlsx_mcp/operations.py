@@ -30,6 +30,10 @@ def read_structure(file_path: str) -> dict[str, Any]:
     wb = load_workbook(file_path, read_only=True)
     sheets_info = {}
 
+    # 顶层字段默认取第一个 sheet
+    first_sheet_headers = []
+    first_sheet_row_count = 0
+
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         # 读取表头（第一行）
@@ -37,16 +41,25 @@ def read_structure(file_path: str) -> dict[str, Any]:
         for cell in ws[1]:
             headers.append(str(cell.value) if cell.value is not None else "")
 
+        row_count = ws.max_row or 0
+
         sheets_info[sheet_name] = {
             "headers": headers,
-            "row_count": ws.max_row or 0,
+            "row_count": row_count,
         }
+
+        # 第一个 sheet 的数据作为顶层默认值
+        if not first_sheet_headers:
+            first_sheet_headers = headers
+            first_sheet_row_count = row_count
 
     wb.close()
 
     return {
         "type": "xlsx",
         "sheets": list(wb.sheetnames),
+        "headers": first_sheet_headers,
+        "row_count": first_sheet_row_count,
         "sheets_info": sheets_info,
     }
 

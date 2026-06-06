@@ -128,17 +128,18 @@ def _create_default_executor() -> DocumentOperationAgent:
 
     # DOCX/XLSX HTTP MCP 后端（配置启用时注册）
     if settings.document_mcp_enabled:
+        mcp_api_key = settings.mcp_api_key or ""
         if settings.docx_mcp_base_url:
             from app.documents.adapters.docx_http import HttpDocxBackend
             executor.register_backend(
                 BackendType.DOCX_MCP,
-                HttpDocxBackend(settings.docx_mcp_base_url, settings.document_mcp_timeout_seconds),
+                HttpDocxBackend(settings.docx_mcp_base_url, settings.document_mcp_timeout_seconds, mcp_api_key),
             )
         if settings.xlsx_mcp_base_url:
             from app.documents.adapters.xlsx_http import HttpXlsxBackend
             executor.register_backend(
                 BackendType.XLSX_MCP,
-                HttpXlsxBackend(settings.xlsx_mcp_base_url, settings.document_mcp_timeout_seconds),
+                HttpXlsxBackend(settings.xlsx_mcp_base_url, settings.document_mcp_timeout_seconds, mcp_api_key),
             )
 
     return executor

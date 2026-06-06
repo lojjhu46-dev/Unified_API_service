@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from services.mcp_common.auth import verify_api_key
 from services.mcp_common.health import add_health_endpoint
 from services.mcp_common.logging import setup_logging
 from services.mcp_common.models import fail, ok
@@ -46,8 +47,13 @@ async def _run_in_executor(func, *args) -> Any:
 
 
 @app.post("/docx/read_structure")
-async def read_structure(body: dict) -> dict:
+async def read_structure(request: Request, body: dict) -> dict:
     """读取 DOCX 文档结构"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     resolved, err = validate_file_path(file_path)
     if err:
@@ -62,8 +68,13 @@ async def read_structure(body: dict) -> dict:
 
 
 @app.post("/docx/read_paragraph")
-async def read_paragraph(body: dict) -> dict:
+async def read_paragraph(request: Request, body: dict) -> dict:
     """读取指定段落的文本"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     index = body.get("index")
 
@@ -85,8 +96,13 @@ async def read_paragraph(body: dict) -> dict:
 
 
 @app.post("/docx/replace_paragraph")
-async def replace_paragraph(body: dict) -> dict:
+async def replace_paragraph(request: Request, body: dict) -> dict:
     """替换指定段落的文本"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     index = body.get("index")
     new_text = body.get("new_text", "")
@@ -109,8 +125,13 @@ async def replace_paragraph(body: dict) -> dict:
 
 
 @app.post("/docx/delete_paragraph")
-async def delete_paragraph(body: dict) -> dict:
+async def delete_paragraph(request: Request, body: dict) -> dict:
     """删除指定段落"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     index = body.get("index")
 
@@ -132,8 +153,13 @@ async def delete_paragraph(body: dict) -> dict:
 
 
 @app.post("/docx/append_paragraph")
-async def append_paragraph(body: dict) -> dict:
+async def append_paragraph(request: Request, body: dict) -> dict:
     """在文档末尾追加段落"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     text = body.get("text", "")
 
@@ -150,8 +176,13 @@ async def append_paragraph(body: dict) -> dict:
 
 
 @app.post("/docx/save_copy")
-async def save_copy(body: dict) -> dict:
+async def save_copy(request: Request, body: dict) -> dict:
     """保存文档副本到指定路径"""
+    try:
+        verify_api_key(request)
+    except Exception as e:
+        return fail(str(e))
+
     file_path = body.get("file_path", "")
     output_path = body.get("output_path", "")
 

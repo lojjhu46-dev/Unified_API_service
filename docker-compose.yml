@@ -62,7 +62,7 @@ services:
       - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
       - LOG_LEVEL=INFO
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:9100/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/health').read()"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -81,7 +81,7 @@ services:
       - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
       - LOG_LEVEL=INFO
     healthcheck:
-      test: ["CMD", "curl", "-fs", "http://localhost:9101/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9101/health').read()"]
       interval: 10s
       timeout: 5s
       retries: 5
