@@ -48,6 +48,44 @@ services:
       retries: 30
       start_period: 40s
 
+  docx-mcp:
+    build:
+      context: .
+      dockerfile: services/docker/docx_mcp/Dockerfile
+    container_name: unified-api-docx-mcp
+    ports:
+      - "9100:9100"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/personal_uploads:/data/personal_uploads
+    environment:
+      - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9100/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  xlsx-mcp:
+    build:
+      context: .
+      dockerfile: services/docker/xlsx_mcp/Dockerfile
+    container_name: unified-api-xlsx-mcp
+    ports:
+      - "9101:9101"
+    volumes:
+      - ./data/uploads:/data/uploads
+      - ./data/personal_uploads:/data/personal_uploads
+    environment:
+      - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
+      - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9101/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   redis-data:
   opensearch-data:
