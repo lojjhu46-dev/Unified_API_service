@@ -7,6 +7,7 @@ from app.documents.tools import (
     _reset_executor,
     document_apply_plan,
     document_extract,
+    document_list_personal_files,
     document_plan,
     document_review,
     infer_file_type,
@@ -580,3 +581,74 @@ class TestRealEditPermission:
         result = validate_edit_permission(seeded_registry / "test.txt", "")
         assert result is not None
         assert "认证" in result
+
+
+# ---------------------------------------------------------------------------
+# document_id 入口与列表脱敏
+# ---------------------------------------------------------------------------
+
+class TestPersonalDocumentId:
+    @pytest.fixture
+    def registry_with_personal_file(self, tmp_path, monkeypatch):
+        from app.retrieval.document_registry import DocumentRegistry
+
+        f = tmp_path / "test.txt"
+        f.write_text("第一行\n第二行", encoding="utf-8")
+
+        reg = DocumentRegistry(db_path=str(tmp_path / "reg.sqlite3"))
+        reg.init()
+        reg.create_processing(
+            document_id="doc_public_id",
+            tenant_id="default",
+            knowledge_base_type="personal",
+            owner_user_id="owner1",
+            original_filename="test.txt",
+            stored_filename="test.txt",
+            stored_path=str(f),
+        )
+        reg.mark_ready("doc_public_id", chunk_count=2)
+        monkeypatch.setattr("app.retrieval.document_registry.document_registry", reg)
+        return f
+
+    @pytest.mark.asyncio
+    async def test_document_list_does_not_expose_stored_path(self, registry_with_personal_file):
+        result = await document_list_personal_files({
+            "owner_user_id": "owner1",
+        })
+        assert result["success"] is True
+        assert result["files"] == [{
+            "document_id": "doc_public_id",
+            "original_filename": "test.txt",
+            "created_at": result["files"][0]["created_at"],
+        }]
+        assert "stored_path" not in result["files"][0]
+
+    @pytest.mark.asyncio
+    async def test_document_plan_resolves_document_id(self, monkeypatch, registry_with_personal_file):
+        monkeypatch.setattr(
+            document_tools,
+            "_planner",
+            FixedPlanner(
+                DocumentPlan(
+                    intent=DocumentIntent.REVIEW,
+                    file_type=FileType.TXT,
+                    backend_required=BackendType.TEXT_ADAPTER,
+                )
+            ),
+        )
+        result = await document_plan({
+            "user_command": "审阅文档",
+            "document_id": "doc_public_id",
+            "owner_user_id": "owner1",
+        })
+        assert result["success"] is True
+        assert result["plan"]["file_path"] == str(registry_with_personal_file.resolve())
+
+    @pytest.mark.asyncio
+    async def test_document_review_resolves_document_id(self, registry_with_personal_file):
+        result = await document_review({
+            "document_id": "doc_public_id",
+            "owner_user_id": "owner1",
+        })
+        assert result["success"] is True
+        assert result["structure"]["line_count"] == 2

@@ -1076,6 +1076,148 @@ class TestFeishuPersonalKnowledgeFiles:
         assert "文件确认已过期" in mock_send.await_args.args[1]
         assert "pending_1" not in pending_feishu_files
 
+    @pytest.mark.asyncio
+    async def test_document_edit_message_sends_confirm_card_without_orchestrator(self):
+        plan = {
+            "intent": "edit",
+            "file_type": "docx",
+            "file_path": "/tmp/doc.docx",
+            "backend_required": "docx_mcp",
+            "operations": [
+                {"action": "delete_paragraph", "target": {"paragraph_index": 3}, "description": "删除实验目的段落"},
+            ],
+        }
+        extract_execution = SimpleNamespace(result={
+            "success": True,
+            "structure": {
+                "type": "docx",
+                "paragraph_count": 8,
+                "headings": ["实验目的"],
+            },
+        })
+        plan_execution = SimpleNamespace(result={"success": True, "plan": plan})
+
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.tool_registry.execute_with_result", new=AsyncMock(side_effect=[extract_execution, plan_execution])) as mock_tool, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock(return_value=True)) as mock_card, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_doc_edit",
+                "text": "编辑 document_id: doc123，把实验目的的内容删除",
+                "dedupe_key": "event_doc_edit",
+            })
+
+        assert mock_tool.await_count == 2
+        extract_call, plan_call = mock_tool.await_args_list
+        assert extract_call.args[0] == "document_extract"
+        assert extract_call.args[1]["document_id"] == "doc123"
+        assert plan_call.args[0] == "document_plan"
+        assert plan_call.args[1]["document_id"] == "doc123"
+        assert plan_call.args[1]["structure"]["headings"] == ["实验目的"]
+        mock_process.assert_not_awaited()
+        mock_card.assert_awaited_once()
+        card = mock_card.await_args.args[1]
+        actions = card["elements"][1]["actions"]
+        values = [button["value"]["action"] for button in actions]
+        assert values == ["confirm_document_edit", "cancel_document_edit"]
+        pending_id = actions[0]["value"]["pending_id"]
+        assert pending_feishu_files[pending_id]["type"] == "document_edit"
+        assert "编辑确认卡片" in mock_reply.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_document_edit_message_stops_when_structure_extract_fails(self):
+        extract_execution = SimpleNamespace(result={"success": False, "error": "后端未注册"})
+
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.tool_registry.execute_with_result", new=AsyncMock(return_value=extract_execution)) as mock_tool, \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.send_interactive_card", new=AsyncMock()) as mock_card, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_doc_edit_extract_failed",
+                "text": "编辑 document_id: doc123，把实验目的的内容删除",
+                "dedupe_key": "event_doc_edit_extract_failed",
+            })
+
+        mock_tool.assert_awaited_once()
+        assert mock_tool.await_args.args[0] == "document_extract"
+        mock_process.assert_not_awaited()
+        mock_card.assert_not_awaited()
+        assert "文档结构提取失败" in mock_reply.await_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_confirm_document_edit_card_executes_plan_once(self):
+        pending_feishu_files["edit_pending_1"] = {
+            "type": "document_edit",
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "document_id": "doc123",
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "operations": [{"action": "delete_line", "target": {"line": 1}}],
+            },
+            "expires_at": 9999999999,
+        }
+        execution = SimpleNamespace(result={
+            "success": True,
+            "result": {
+                "summary": "已完成 1 项操作",
+                "output_file": "/tmp/test_edited.txt",
+            },
+        })
+
+        with patch("app.main.tool_registry.execute_with_result", new=AsyncMock(return_value=execution)) as mock_tool, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "confirm_document_edit",
+                "pending_id": "edit_pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_tool.assert_awaited_once()
+        assert mock_tool.await_args.args[0] == "document_apply_plan"
+        assert mock_tool.await_args.args[1]["document_id"] == "doc123"
+        assert mock_tool.await_args.args[1]["confirmed"] is True
+        assert "edit_pending_1" not in pending_feishu_files
+        message = mock_send.await_args.args[1]
+        assert "文档编辑执行成功" in message
+        assert "/tmp/test_edited.txt" in message
+
+    @pytest.mark.asyncio
+    async def test_cancel_document_edit_card_does_not_execute_plan(self):
+        pending_feishu_files["edit_pending_1"] = {
+            "type": "document_edit",
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "document_id": "doc123",
+            "plan": {"intent": "edit"},
+            "expires_at": 9999999999,
+        }
+
+        with patch("app.main.tool_registry.execute_with_result", new=AsyncMock()) as mock_tool, \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=True)) as mock_send:
+            await process_feishu_card_action({
+                "action": "cancel_document_edit",
+                "pending_id": "edit_pending_1",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+            })
+
+        mock_tool.assert_not_awaited()
+        assert "edit_pending_1" not in pending_feishu_files
+        assert "已取消文档编辑" in mock_send.await_args.args[1]
+
     def test_parse_card_action(self):
         action = parse_feishu_card_action(_card_action("pending_1"))
         assert action == {

@@ -483,17 +483,23 @@ class Orchestrator:
         "review", "extract", "summarize",
     })
     _DOC_LIST_VERBS = frozenset({
-        "列出", "查看", "看看", "有哪些", "有什么", "显示", "展示",
-        "list", "show", "view",
+        "列出", "有哪些", "有什么", "显示", "展示",
+        "list", "show",
     })
     _DOC_LIST_OBJECTS = frozenset({
-        "文件", "文档", "个人知识库文件", "知识库文件", "保存的文件", "已保存",
+        "文件", "文档", "文件列表", "文档列表", "个人知识库文件", "知识库文件", "保存的文件", "已保存",
         "files", "documents",
+    })
+    _DOC_LIST_DIRECT_PHRASES = frozenset({
+        "文件列表", "文档列表", "我的文件", "我的文档", "个人知识库文件",
+        "list files", "show files", "my files", "my documents",
     })
 
     def _is_list_intent(self, question: str) -> bool:
-        """判断是否为列出文件意图：必须同时命中动词和对象词"""
+        """判断是否为列出文件意图，避免“查看个人知识库文档里的 X”劫持 RAG。"""
         q = question.lower()
+        if any(phrase in q for phrase in self._DOC_LIST_DIRECT_PHRASES):
+            return True
         has_verb = any(v in q for v in self._DOC_LIST_VERBS)
         has_obj = any(o in q for o in self._DOC_LIST_OBJECTS)
         return has_verb and has_obj
@@ -501,6 +507,8 @@ class Orchestrator:
     def _is_document_request(self, request: AskRequest) -> bool:
         """判断是否为文档操作请求"""
         # 结构化字段优先
+        if request.document_id:
+            return True
         if request.document_file_path:
             return True
         if request.document_plan:
@@ -900,6 +908,7 @@ class Orchestrator:
         tool_trace: list,
     ) -> dict:
         """处理文档工具调用"""
+        document_id = request.document_id
         file_path = request.document_file_path or self._extract_file_path(request.question)
         file_type = request.document_file_type
         action = request.document_action
@@ -914,7 +923,7 @@ class Orchestrator:
             if result.get("success") and result.get("files"):
                 files = result["files"]
                 file_list = "\n".join(
-                    f"  {i+1}. {f['original_filename']}（保存于 {f['created_at'][:19]}）"
+                    f"  {i+1}. {f['original_filename']}（document_id: {f['document_id']}，保存于 {f['created_at'][:19]}）"
                     for i, f in enumerate(files)
                 )
                 answer = f"您的个人知识库文件（共 {result['count']} 个）：\n{file_list}"
@@ -952,6 +961,7 @@ class Orchestrator:
                 }
             execution = await self.tools.execute_with_result("document_apply_plan", {
                 "plan": request.document_plan,
+                "document_id": document_id,
                 "confirmed": request.document_confirmed,
                 "owner_user_id": request.user_id,
             })
@@ -975,7 +985,7 @@ class Orchestrator:
                 "llm_ms": 0,
             }
 
-        if not file_path and action in {"auto", "plan", "extract", "review"}:
+        if not file_path and not document_id and action in {"auto", "plan", "extract", "review"}:
             # 提示用户查看个人知识库文件列表
             list_result = await self.tools.execute_with_result("document_list_personal_files", {
                 "owner_user_id": request.user_id,
@@ -984,11 +994,11 @@ class Orchestrator:
             if list_result.result.get("success") and list_result.result.get("files"):
                 files = list_result.result["files"]
                 file_list = "\n".join(
-                    f"  - {f['original_filename']}（{f['created_at'][:10]}）" for f in files
+                    f"  - {f['original_filename']}（document_id: {f['document_id']}，{f['created_at'][:10]}）" for f in files
                 )
-                answer = f"请指定要处理的文件路径。您个人知识库中的文件：\n{file_list}"
+                answer = f"请指定要处理的 document_id 或文件路径。您个人知识库中的文件：\n{file_list}"
             else:
-                answer = "请补充要处理的文档文件路径。可通过 document_file_path 传入已上传文件路径，或先上传文件到个人知识库。"
+                answer = "请补充要处理的 document_id 或文档文件路径。可先上传文件到个人知识库。"
             return {
                 "answer": answer,
                 "sources": [],
@@ -1000,8 +1010,10 @@ class Orchestrator:
         # extract：提取结构
         if action == "extract":
             execution = await self.tools.execute_with_result("document_extract", {
+                "document_id": document_id,
                 "file_path": file_path,
                 "file_type": file_type,
+                "owner_user_id": request.user_id,
             })
             tool_trace.append(execution.trace)
             result = execution.result
@@ -1022,6 +1034,7 @@ class Orchestrator:
         if action == "plan" or (file_path and self._has_edit_intent(request.question)):
             execution = await self.tools.execute_with_result("document_plan", {
                 "user_command": request.question,
+                "document_id": document_id,
                 "file_path": file_path,
                 "file_type": file_type,
                 "owner_user_id": request.user_id,
@@ -1054,8 +1067,10 @@ class Orchestrator:
 
         # 默认：review（审阅/总结）
         execution = await self.tools.execute_with_result("document_review", {
+            "document_id": document_id,
             "file_path": file_path,
             "file_type": file_type,
+            "owner_user_id": request.user_id,
         })
         tool_trace.append(execution.trace)
         result = execution.result

@@ -30,6 +30,7 @@ from app.retrieval.ingest import (
     validate_file_extension,
 )
 from app.tools.summarize import summarize_uploaded_file_content
+from app.tools.registry import tool_registry
 from app.observability.logging import get_logger
 from app.redis_client import log_redis_startup_health
 from app.security.auth import AuthContext, get_api_auth_context
@@ -119,6 +120,20 @@ def _looks_like_feishu_document_command(text: str | None) -> bool:
     return any(word in question for word in subject_words) and any(word in question for word in action_words)
 
 
+def _looks_like_feishu_document_edit_command(text: str | None) -> bool:
+    question = text or ""
+    edit_words = ["删除", "删掉", "清空", "替换", "修改", "改成", "追加", "插入", "编辑"]
+    return bool(_extract_document_id_from_text(question)) and any(word in question for word in edit_words)
+
+
+def _extract_document_id_from_text(text: str | None) -> str:
+    import re
+
+    question = text or ""
+    match = re.search(r"(?:document_id|文档ID|文档id)\s*[:：]\s*([A-Za-z0-9_-]+)", question)
+    return match.group(1) if match else ""
+
+
 async def _get_pending_file_hint_for_feishu_command(text: str | None, open_id: str | None, chat_id: str | None) -> str | None:
     if not open_id or not chat_id or not _looks_like_feishu_document_command(text):
         return None
@@ -131,6 +146,101 @@ async def _get_pending_file_hint_for_feishu_command(text: str | None, open_id: s
         "当前不会自动下载或导入，因此还没有可用于编辑的本地文件路径。\n\n"
         "请先在文件卡片中选择“识别并总结”，或确认保存后再提供已保存文件路径执行编辑。"
     )
+
+
+def build_document_edit_confirm_card(plan: dict, pending_id: str) -> dict:
+    operations = plan.get("operations") or []
+    descriptions = []
+    for index, op in enumerate(operations[:5], start=1):
+        desc = op.get("description") or op.get("action") or "编辑操作"
+        descriptions.append(f"{index}. {desc}")
+    operation_text = "\n".join(descriptions) or "未生成可展示的操作明细。"
+    if len(operations) > 5:
+        operation_text += f"\n... 另有 {len(operations) - 5} 项操作"
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "orange",
+            "title": {"tag": "plain_text", "content": "确认编辑文档"},
+        },
+        "elements": [
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        "已生成文档编辑方案。请确认是否执行以下操作：\n\n"
+                        f"{operation_text}\n\n"
+                        "确认后会生成编辑后的副本，不会覆盖原文件。"
+                    ),
+                },
+            },
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "确认执行"},
+                        "type": "primary",
+                        "value": {"action": "confirm_document_edit", "pending_id": pending_id},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "取消"},
+                        "type": "default",
+                        "value": {"action": "cancel_document_edit", "pending_id": pending_id},
+                    },
+                ],
+            },
+        ],
+    }
+
+
+async def _handle_feishu_document_edit_confirmation(text: str, open_id: str | None, chat_id: str | None) -> str | None:
+    if not open_id or not chat_id or not _looks_like_feishu_document_edit_command(text):
+        return None
+
+    document_id = _extract_document_id_from_text(text)
+    extract_execution = await tool_registry.execute_with_result("document_extract", {
+        "document_id": document_id,
+        "owner_user_id": open_id,
+    })
+    extract_result = extract_execution.result
+    if not extract_result.get("success"):
+        return f"文档结构提取失败：{extract_result.get('error', '未知错误')}"
+
+    execution = await tool_registry.execute_with_result("document_plan", {
+        "user_command": text,
+        "document_id": document_id,
+        "owner_user_id": open_id,
+        "structure": extract_result.get("structure"),
+    })
+    result = execution.result
+    if not result.get("success"):
+        return f"编辑方案生成失败：{result.get('error', '未知错误')}"
+
+    plan = result.get("plan", {})
+    if plan.get("intent") == "unsupported":
+        return f"无法生成编辑方案：{plan.get('unsupported_reason') or '该操作不支持'}"
+    if plan.get("clarification_question"):
+        return f"需要补充信息：{plan.get('clarification_question')}"
+    if plan.get("intent") != "edit":
+        return None
+
+    pending_id = str(uuid.uuid4())[:12]
+    pending = {
+        "type": "document_edit",
+        "open_id": open_id,
+        "chat_id": chat_id,
+        "document_id": document_id,
+        "plan": plan,
+        "created_at": time.time(),
+        "expires_at": time.time() + settings.feishu_pending_file_ttl_seconds,
+    }
+    await pending_file_store.create(pending_id, pending, settings.feishu_pending_file_ttl_seconds)
+    await feishu_adapter.send_interactive_card(chat_id, build_document_edit_confirm_card(plan, pending_id))
+    return "已生成编辑确认卡片，请点击“确认执行”或“取消”。"
 
 
 async def _handle_feishu_resource_links(text: str, session_id: str, open_id: str) -> str | None:
@@ -410,24 +520,28 @@ async def process_feishu_message(event_data: dict) -> None:
     try:
         try:
             session_id = feishu_adapter.generate_session_id(open_id, chat_id)
-            resource_answer = await _handle_feishu_resource_links(text, session_id, open_id)
-            if resource_answer is not None:
-                answer = resource_answer
+            document_edit_answer = await _handle_feishu_document_edit_confirmation(text, open_id, chat_id)
+            if document_edit_answer is not None:
+                answer = document_edit_answer
             else:
-                pending_hint = await _get_pending_file_hint_for_feishu_command(text, open_id, chat_id)
-                if pending_hint is not None:
-                    answer = pending_hint
+                resource_answer = await _handle_feishu_resource_links(text, session_id, open_id)
+                if resource_answer is not None:
+                    answer = resource_answer
                 else:
-                    knowledge_scope = decide_feishu_knowledge_scope(text)
-                    ask_request = AskRequest(
-                        channel="feishu",
-                        user_id=open_id,
-                        session_id=session_id,
-                        question=text,
-                        knowledge_scope=knowledge_scope,
-                    )
-                    response = await orchestrator.process(ask_request)
-                    answer = response.answer
+                    pending_hint = await _get_pending_file_hint_for_feishu_command(text, open_id, chat_id)
+                    if pending_hint is not None:
+                        answer = pending_hint
+                    else:
+                        knowledge_scope = decide_feishu_knowledge_scope(text)
+                        ask_request = AskRequest(
+                            channel="feishu",
+                            user_id=open_id,
+                            session_id=session_id,
+                            question=text,
+                            knowledge_scope=knowledge_scope,
+                        )
+                        response = await orchestrator.process(ask_request)
+                        answer = response.answer
         except Exception as e:
             logger.error(f"飞书消息处理失败: {e}", exc_info=True)
             answer = "抱歉，处理您的问题时出现错误，请稍后重试。"
@@ -548,7 +662,10 @@ async def process_feishu_card_action(action_data: dict) -> None:
     if not pending:
         chat_id = action_data.get("chat_id")
         if chat_id:
-            await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+            if action in {"confirm_document_edit", "cancel_document_edit"}:
+                await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+            else:
+                await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
         return
     if pending.get("expires_at", 0) < time.time():
         await pending_file_store.delete(pending_id)
@@ -559,10 +676,18 @@ async def process_feishu_card_action(action_data: dict) -> None:
         )
         chat_id = action_data.get("chat_id") or pending.get("chat_id")
         if chat_id:
-            await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+            if pending.get("type") == "document_edit":
+                await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+            else:
+                await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
         return
     if not action_data.get("open_id") or action_data.get("open_id") != pending.get("open_id"):
-        await feishu_adapter.send_message(pending.get("chat_id"), "只有上传文件的用户可以确认保存。")
+        message = "只有发起编辑的用户可以确认执行。" if pending.get("type") == "document_edit" else "只有上传文件的用户可以确认保存。"
+        await feishu_adapter.send_message(pending.get("chat_id"), message)
+        return
+
+    if pending.get("type") == "document_edit":
+        await process_feishu_document_edit_card_action(action_data, pending)
         return
 
     if action == "cancel_save_personal_file":
@@ -597,6 +722,42 @@ async def process_feishu_card_action(action_data: dict) -> None:
         await save_feishu_file_to_enterprise_knowledge(pending)
     else:
         await save_feishu_file_to_personal_knowledge(pending)
+
+
+async def process_feishu_document_edit_card_action(action_data: dict, pending: dict) -> None:
+    action = action_data.get("action")
+    pending_id = action_data.get("pending_id")
+    chat_id = pending.get("chat_id")
+
+    if action == "cancel_document_edit":
+        await pending_file_store.delete(pending_id)
+        await feishu_adapter.send_message(chat_id, "已取消文档编辑。")
+        return
+
+    if action != "confirm_document_edit":
+        return
+
+    pending = await pending_file_store.consume(pending_id)
+    if not pending:
+        await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+        return
+
+    execution = await tool_registry.execute_with_result("document_apply_plan", {
+        "plan": pending.get("plan"),
+        "document_id": pending.get("document_id"),
+        "owner_user_id": pending.get("open_id"),
+        "confirmed": True,
+    })
+    result = execution.result
+    if result.get("success"):
+        output_file = result.get("result", {}).get("output_file") or ""
+        summary = result.get("result", {}).get("summary") or "编辑已完成。"
+        message = f"文档编辑执行成功：{summary}"
+        if output_file:
+            message += f"\n输出文件：{output_file}"
+        await feishu_adapter.send_message(chat_id, message)
+    else:
+        await feishu_adapter.send_message(chat_id, f"文档编辑执行失败：{result.get('error', '未知错误')}")
 
 
 async def summarize_pending_feishu_file(pending: dict) -> None:

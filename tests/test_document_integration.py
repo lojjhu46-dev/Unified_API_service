@@ -117,6 +117,53 @@ class TestDocumentRouting:
         data = response.json()
         assert data["route"] == "rag"
 
+    def test_personal_knowledge_query_not_routed_to_document_list(self, client):
+        """查询个人知识库内容不应被列文件意图劫持。"""
+        payload = {
+            "user_id": "test_user",
+            "question": "查看个人知识库文档里的排序算法",
+        }
+        with patch(
+            "app.orchestrator.orchestrator.llm.generate",
+            new=AsyncMock(return_value="排序算法相关内容..."),
+        ):
+            response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "rag"
+
+    def test_document_id_routes_to_tool(self, client, monkeypatch, tmp_path):
+        """传 document_id 应走文档工具，由服务端解析内部路径。"""
+        from app.retrieval.document_registry import DocumentRegistry
+
+        f = tmp_path / "test.txt"
+        f.write_text("第一行\n第二行", encoding="utf-8")
+        reg = DocumentRegistry(db_path=str(tmp_path / "reg.sqlite3"))
+        reg.init()
+        reg.create_processing(
+            document_id="doc_public_id",
+            tenant_id="default",
+            knowledge_base_type="personal",
+            owner_user_id="test_user",
+            original_filename="test.txt",
+            stored_filename="test.txt",
+            stored_path=str(f),
+        )
+        reg.mark_ready("doc_public_id", chunk_count=2)
+        monkeypatch.setattr("app.retrieval.document_registry.document_registry", reg)
+
+        payload = {
+            "user_id": "test_user",
+            "question": "审阅文档",
+            "document_id": "doc_public_id",
+            "document_action": "review",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "文档审阅结果" in data["answer"]
+
     def test_calculator_not_affected(self, client):
         """计算题不受文档路由影响"""
         payload = {
@@ -153,6 +200,39 @@ class TestDocumentRouting:
 # ---------------------------------------------------------------------------
 
 class TestDocumentOperations:
+    def test_list_personal_files_via_ask_shows_document_id(self, client, monkeypatch, tmp_path):
+        """列表入口只展示 document_id、文件名和保存时间，不展示 stored_path。"""
+        from app.retrieval.document_registry import DocumentRegistry
+
+        f = tmp_path / "test.txt"
+        f.write_text("内容", encoding="utf-8")
+        reg = DocumentRegistry(db_path=str(tmp_path / "reg.sqlite3"))
+        reg.init()
+        reg.create_processing(
+            document_id="doc_public_id",
+            tenant_id="default",
+            knowledge_base_type="personal",
+            owner_user_id="test_user",
+            original_filename="test.txt",
+            stored_filename="test.txt",
+            stored_path=str(f),
+        )
+        reg.mark_ready("doc_public_id", chunk_count=1)
+        monkeypatch.setattr("app.retrieval.document_registry.document_registry", reg)
+
+        payload = {
+            "user_id": "test_user",
+            "question": "列出我的文件",
+            "document_action": "list",
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "doc_public_id" in data["answer"]
+        assert "test.txt" in data["answer"]
+        assert str(f) not in data["answer"]
+
     def test_extract_via_ask(self, client):
         """通过 /ask 提取文档结构"""
         _setup_executor_with_txt()

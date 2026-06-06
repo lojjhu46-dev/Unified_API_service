@@ -69,6 +69,24 @@ def _looks_like_edit(command: str) -> bool:
     return any(kw in command.lower() for kw in _EDIT_KEYWORDS)
 
 
+def _resolve_personal_document_path(tool_input: dict) -> tuple[str, str | None]:
+    """用 document_id 解析当前用户个人知识库 ready 文件路径，不向外暴露 stored_path。"""
+    document_id = (tool_input.get("document_id") or "").strip()
+    if not document_id:
+        return tool_input.get("file_path", ""), None
+
+    owner_user_id = (tool_input.get("owner_user_id") or "").strip()
+    if not owner_user_id:
+        return "", "缺少 owner_user_id"
+
+    from app.retrieval.document_registry import document_registry
+
+    record = document_registry.find_personal_ready_by_id(owner_user_id, document_id)
+    if record is None:
+        return "", "未找到当前用户个人知识库中状态为 ready 的文档"
+    return record["stored_path"], None
+
+
 _BACKEND_BY_FILE_TYPE: dict[FileType, BackendType] = {
     FileType.DOCX: BackendType.DOCX_MCP,
     FileType.XLSX: BackendType.XLSX_MCP,
@@ -148,7 +166,9 @@ async def document_extract(tool_input: dict) -> dict:
     input: { file_path: str, file_type?: str }
     output: { success, structure, file_type }
     """
-    file_path = tool_input.get("file_path", "")
+    file_path, err = _resolve_personal_document_path(tool_input)
+    if err:
+        return {"success": False, "error": err}
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 
@@ -188,7 +208,9 @@ async def document_plan(tool_input: dict) -> dict:
     output: { success, plan: DocumentPlan.model_dump() }
     """
     user_command = tool_input.get("user_command", "")
-    file_path = tool_input.get("file_path", "")
+    file_path, err = _resolve_personal_document_path(tool_input)
+    if err:
+        return {"success": False, "error": err}
     if not user_command:
         return {"success": False, "error": "缺少 user_command"}
     if not file_path:
@@ -240,6 +262,12 @@ async def document_apply_plan(tool_input: dict) -> dict:
         plan = DocumentPlan.model_validate(plan_data)
     except Exception as e:
         return {"success": False, "error": f"plan 解析失败: {e}"}
+
+    document_id_path, err = _resolve_personal_document_path(tool_input)
+    if err:
+        return {"success": False, "error": err}
+    if document_id_path:
+        plan = plan.model_copy(update={"file_path": document_id_path})
 
     # 路径安全校验
     if not plan.file_path:
@@ -305,7 +333,9 @@ async def document_review(tool_input: dict) -> dict:
     input: { file_path: str, file_type?: str, user_command?: str }
     output: { success, summary, structure, error }
     """
-    file_path = tool_input.get("file_path", "")
+    file_path, err = _resolve_personal_document_path(tool_input)
+    if err:
+        return {"success": False, "error": err}
     if not file_path:
         return {"success": False, "error": "缺少 file_path"}
 

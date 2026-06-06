@@ -172,6 +172,27 @@ class DocumentRegistry:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_personal_ready_by_id(
+        self,
+        owner_user_id: str,
+        document_id: str,
+    ) -> dict[str, Any] | None:
+        """按 document_id 查找当前用户 personal ready 文件，用于公开 ID 到内部路径解析。"""
+        self.init()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM documents
+                WHERE document_id = ?
+                  AND owner_user_id = ?
+                  AND knowledge_base_type = 'personal'
+                  AND status = 'ready'
+                LIMIT 1
+                """,
+                (document_id, owner_user_id),
+            ).fetchone()
+        return dict(row) if row else None
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
