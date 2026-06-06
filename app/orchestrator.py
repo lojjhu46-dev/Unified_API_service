@@ -68,16 +68,20 @@ class Orchestrator:
         )
 
         try:
-            # 读取历史
-            history = await self.memory.get_history(session_id)
-
             # 决定路由
             route = self._decide_route(request)
             standalone_question = request.question
             rewrite_ms = 0
+            reuse_history = []
+            rewrite_history = []
+            prompt_history = []
 
             if route == "rag":
-                reuse_decision = self._evaluate_recent_answer_reuse(request.question, history)
+                reuse_history = await self.memory.get_history(
+                    session_id,
+                    self._memory_reuse_window_messages(),
+                )
+                reuse_decision = self._evaluate_recent_answer_reuse(request.question, reuse_history)
                 if reuse_decision["hit"]:
                     result = {
                         "answer": reuse_decision["answer"],
@@ -99,6 +103,10 @@ class Orchestrator:
                             "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
                             "recent_answer_reuse_threshold": reuse_decision["threshold"],
                             "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
+                            "memory_reuse_history_count": len(reuse_history),
+                            "memory_rewrite_history_count": 0,
+                            "memory_prompt_history_count": 0,
+                            "memory_max_messages": settings.memory_max_messages,
                         },
                     )
                     await self.memory.append_turn(session_id, request.question, result["answer"])
@@ -132,9 +140,36 @@ class Orchestrator:
                         "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
                         "recent_answer_reuse_threshold": reuse_decision["threshold"],
                         "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
+                        "memory_reuse_history_count": len(reuse_history),
+                        "memory_rewrite_history_count": 0,
+                        "memory_prompt_history_count": 0,
+                        "memory_max_messages": settings.memory_max_messages,
                     },
                 )
-            elif history:
+
+            if route in {"rag", "web", "agentic_rag"}:
+                rewrite_history = await self.memory.get_history(
+                    session_id,
+                    self._memory_rewrite_window_messages(),
+                )
+                prompt_history = await self.memory.get_history(
+                    session_id,
+                    self._memory_prompt_window_messages(),
+                )
+                logger.info(
+                    "Memory context windows loaded",
+                    extra={
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "route": route,
+                        "memory_reuse_history_count": len(reuse_history),
+                        "memory_rewrite_history_count": len(rewrite_history),
+                        "memory_prompt_history_count": len(prompt_history),
+                        "memory_max_messages": settings.memory_max_messages,
+                    },
+                )
+
+            if route != "rag" and rewrite_history:
                 logger.info(
                     "Recent answer reuse skipped",
                     extra={
@@ -143,26 +178,29 @@ class Orchestrator:
                         "route": route,
                         "recent_answer_reuse_hit": False,
                         "recent_answer_reuse_miss_reason": "route_not_rag",
+                        "memory_rewrite_history_count": len(rewrite_history),
+                        "memory_prompt_history_count": len(prompt_history),
+                        "memory_max_messages": settings.memory_max_messages,
                     },
                 )
 
             # 追问改写
-            if history and route in {"rag", "web", "agentic_rag"}:
+            if rewrite_history and route in {"rag", "web", "agentic_rag"}:
                 start = time.perf_counter()
-                standalone_question = await rewrite_question(request.question, history)
+                standalone_question = await rewrite_question(request.question, rewrite_history)
                 rewrite_ms = (time.perf_counter() - start) * 1000
 
             # 执行对应路由
             if route == "direct":
                 result = await self._handle_direct(request)
             elif route == "rag":
-                result = await self._handle_rag(request, standalone_question, history)
+                result = await self._handle_rag(request, standalone_question, prompt_history)
             elif route == "web":
-                result = await self._handle_web(request, standalone_question, history)
+                result = await self._handle_web(request, standalone_question, prompt_history)
             elif route == "tool":
                 result = await self._handle_tool(request)
             elif route == "agentic_rag":
-                result = await self._handle_agentic_rag(request, standalone_question, history)
+                result = await self._handle_agentic_rag(request, standalone_question, prompt_history)
             else:
                 result = await self._handle_direct(request)
 
@@ -185,7 +223,7 @@ class Orchestrator:
                     llm_ms=result.get("llm_ms", 0),
                     total_ms=total_ms,
                 ),
-                standalone_question=standalone_question if history else None,
+                standalone_question=standalone_question if rewrite_history else None,
             )
         except Exception as e:
             logger.error(
@@ -203,6 +241,23 @@ class Orchestrator:
             for char in normalized
             if unicodedata.category(char)[0] not in {"P", "Z", "S"}
         )
+
+    def _memory_window(self, value: int | None) -> int:
+        """Return a positive history window, falling back to the legacy setting."""
+        fallback = max(int(settings.memory_window_messages), 1)
+        try:
+            return max(int(value if value is not None else fallback), 1)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _memory_reuse_window_messages(self) -> int:
+        return self._memory_window(getattr(settings, "memory_reuse_window_messages", None))
+
+    def _memory_rewrite_window_messages(self) -> int:
+        return self._memory_window(getattr(settings, "memory_rewrite_window_messages", None))
+
+    def _memory_prompt_window_messages(self) -> int:
+        return self._memory_window(getattr(settings, "memory_prompt_window_messages", None))
 
     def _iter_recent_turns(self, history: list[dict]) -> list[dict]:
         """从消息历史中重建问答轮次。"""
@@ -410,7 +465,10 @@ class Orchestrator:
             return False
         has_digit = any(ch.isdigit() for ch in expression)
         has_operator = any(op in expression for op in ["+", "-", "*", "/", "%", "^", ">", "<", "="])
-        has_math_word = any(word in question for word in ["计算", "换算", "加", "减", "乘", "除", "等于"])
+        has_math_word = bool(
+            re.search(r"(计算|换算|等于|加上|减去|乘以|除以)", question)
+            or re.search(r"(?<!删)[加减乘除](?![一-龥A-Za-z])", question)
+        )
         return has_digit and (has_operator or has_math_word)
 
     # ---- 文档请求识别 ----
@@ -424,6 +482,10 @@ class Orchestrator:
         "审阅", "审阅文档", "提取", "提取结构", "总结", "总结文档", "查看", "查看结构",
         "review", "extract", "summarize",
     })
+    _DOC_LIST_INTENT_WORDS = frozenset({
+        "列出", "查看文件", "我的文件", "个人知识库", "知识库文件",
+        "list files", "my files", "personal",
+    })
 
     def _is_document_request(self, request: AskRequest) -> bool:
         """判断是否为文档操作请求"""
@@ -435,17 +497,25 @@ class Orchestrator:
         if request.document_action != "auto":
             return True
 
-        # 自然语言识别：文件路径 + 意图词
         question = request.question
-        has_doc_path = any(ext in question.lower() for ext in self._DOC_EXTENSIONS)
-        if not has_doc_path:
-            return False
 
+        # 自然语言识别：列出个人知识库文件
+        if any(word in question for word in self._DOC_LIST_INTENT_WORDS):
+            return True
+
+        # 自然语言识别：文件路径 + 意图词
+        has_doc_path = any(ext in question.lower() for ext in self._DOC_EXTENSIONS)
         has_intent = any(
             word in question
             for word in self._DOC_EDIT_INTENT_WORDS | self._DOC_REVIEW_INTENT_WORDS
         )
-        return has_intent
+        if has_doc_path:
+            return has_intent
+
+        # 用户明确说“文档/文件/内容”并带编辑意图时，仍走文档工具，
+        # 由工具层提示补充 file_path，避免编号文本被误判成计算。
+        has_document_subject = any(word in question for word in ["文档", "文件", "正文"])
+        return has_document_subject and self._has_edit_intent(question)
 
     async def _handle_direct(self, request: AskRequest) -> dict:
         """处理直接问答"""
@@ -823,6 +893,32 @@ class Orchestrator:
         file_type = request.document_file_type
         action = request.document_action
 
+        # 列出个人知识库文件
+        if action == "list" or (not file_path and not request.document_plan and self._is_list_intent(request.question)):
+            execution = await self.tools.execute_with_result("document_list_personal_files", {
+                "owner_user_id": request.user_id,
+            })
+            tool_trace.append(execution.trace)
+            result = execution.result
+            if result.get("success") and result.get("files"):
+                files = result["files"]
+                file_list = "\n".join(
+                    f"  {i+1}. {f['original_filename']}（保存于 {f['created_at'][:19]}）"
+                    for i, f in enumerate(files)
+                )
+                answer = f"您的个人知识库文件（共 {result['count']} 个）：\n{file_list}"
+            elif result.get("success"):
+                answer = "您的个人知识库暂无文件。"
+            else:
+                answer = f"查询失败：{result.get('error', '未知错误')}"
+            return {
+                "answer": answer,
+                "sources": [],
+                "tool_trace": tool_trace,
+                "tool_ms": execution.trace.latency_ms,
+                "llm_ms": 0,
+            }
+
         # apply：执行已有 plan
         if action == "apply" or request.document_plan:
             if not request.document_plan:
@@ -846,6 +942,7 @@ class Orchestrator:
             execution = await self.tools.execute_with_result("document_apply_plan", {
                 "plan": request.document_plan,
                 "confirmed": request.document_confirmed,
+                "owner_user_id": request.user_id,
             })
             tool_trace.append(execution.trace)
             result = execution.result
@@ -864,6 +961,26 @@ class Orchestrator:
                 "sources": [],
                 "tool_trace": tool_trace,
                 "tool_ms": execution.trace.latency_ms,
+                "llm_ms": 0,
+            }
+
+        if not file_path and action in {"auto", "plan", "extract", "review"}:
+            # 提示用户查看个人知识库文件列表
+            list_result = await self.tools.execute_with_result("document_list_personal_files", {
+                "owner_user_id": request.user_id,
+                "limit": 10,
+            })
+            if list_result.result.get("success") and list_result.result.get("files"):
+                files = list_result.result["files"]
+                file_list = "\n".join(f"  - {f['original_filename']} ({f['stored_path']})" for f in files)
+                answer = f"请指定要处理的文件路径。您个人知识库中的文件：\n{file_list}"
+            else:
+                answer = "请补充要处理的文档文件路径。可通过 document_file_path 传入已上传文件路径，或先上传文件到个人知识库。"
+            return {
+                "answer": answer,
+                "sources": [],
+                "tool_trace": tool_trace,
+                "tool_ms": 0,
                 "llm_ms": 0,
             }
 
@@ -894,6 +1011,7 @@ class Orchestrator:
                 "user_command": request.question,
                 "file_path": file_path,
                 "file_type": file_type,
+                "owner_user_id": request.user_id,
             })
             tool_trace.append(execution.trace)
             result = execution.result
@@ -946,6 +1064,10 @@ class Orchestrator:
     def _has_edit_intent(self, question: str) -> bool:
         """判断问题是否包含编辑意图"""
         return any(word in question for word in self._DOC_EDIT_INTENT_WORDS)
+
+    def _is_list_intent(self, question: str) -> bool:
+        """判断问题是否为列出文件意图"""
+        return any(word in question for word in self._DOC_LIST_INTENT_WORDS)
 
     @staticmethod
     def _extract_file_path(question: str) -> str:

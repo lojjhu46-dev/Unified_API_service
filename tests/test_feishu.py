@@ -20,6 +20,7 @@ from app.channels.token_cache import (
 from app.config import settings
 from app.security import rate_limit as rate_limit_module
 from app.security.rate_limit import InMemoryRateLimitBackend, RateLimiter
+from app.channels.pending_store import pending_feishu_latest_files
 from app.main import (
     app,
     decide_feishu_knowledge_scope,
@@ -792,9 +793,11 @@ class TestFeishuPersonalKnowledgeFiles:
 
     def setup_method(self):
         pending_feishu_files.clear()
+        pending_feishu_latest_files.clear()
 
     def teardown_method(self):
         pending_feishu_files.clear()
+        pending_feishu_latest_files.clear()
 
     def test_decide_feishu_knowledge_scope_defaults_to_combined(self):
         assert decide_feishu_knowledge_scope("儒家大同思想是什么") == ["enterprise", "personal"]
@@ -831,6 +834,43 @@ class TestFeishuPersonalKnowledgeFiles:
         assert "cancel_save_personal_file" in values
         mock_ingest.assert_not_called()
         mock_download.assert_not_awaited()
+        assert pending_feishu_latest_files["ou_test123:oc_test789"] in pending_feishu_files
+
+    @pytest.mark.asyncio
+    async def test_document_edit_after_pending_file_replies_file_specific_hint_without_orchestrator(self):
+        pending_feishu_files["pending_1"] = {
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "message_id": "om_file456",
+            "file_key": "file_key_1",
+            "file_name": "实验二_.docx",
+            "expires_at": 9999999999,
+        }
+        pending_feishu_latest_files["ou_test123:oc_test789"] = "pending_1"
+
+        command = (
+            "删除文档中的内容：\n"
+            "实验目的：\n"
+            "（1）掌握 Pandas 读取数据及 Matplotlib 绘制散点图、折线图、饼图等多类型图表的方法；"
+        )
+
+        with patch.object(settings, "feishu_heartbeat_enabled", False), \
+             patch("app.main.orchestrator.process", new=AsyncMock()) as mock_process, \
+             patch("app.main.feishu_adapter.reply_message", new=AsyncMock(return_value=True)) as mock_reply:
+            await process_feishu_message({
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+                "chat_type": "p2p",
+                "message_id": "om_edit_command",
+                "text": command,
+                "dedupe_key": "event_edit_pending",
+            })
+
+        mock_process.assert_not_awaited()
+        answer = mock_reply.await_args.args[1]
+        assert "实验二_.docx" in answer
+        assert "待确认状态" in answer
+        assert "计算结果" not in answer
 
     @pytest.mark.asyncio
     async def test_summarize_card_downloads_and_summarizes_without_ingest_or_consuming_pending(self):

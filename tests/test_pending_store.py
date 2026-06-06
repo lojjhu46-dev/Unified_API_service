@@ -40,6 +40,38 @@ async def test_in_memory_pending_store_consumes_once():
     assert await store.consume("pending_1") is None
 
 
+@pytest.mark.asyncio
+async def test_in_memory_pending_store_latest_pending_index():
+    backing = {}
+    latest = {}
+    store = InMemoryPendingFileStore(backing, latest)
+    pending = {
+        "open_id": "ou_owner",
+        "chat_id": "oc_chat",
+        "file_name": "资料.docx",
+        "expires_at": time.time() + 60,
+    }
+    await store.create("pending_1", pending, ttl_seconds=60)
+    await store.set_latest_pending("ou_owner", "oc_chat", "pending_1", ttl_seconds=60)
+
+    assert await store.get_latest_pending("ou_owner", "oc_chat") == pending
+
+    await store.delete("pending_1")
+    assert await store.get_latest_pending("ou_owner", "oc_chat") is None
+    assert latest == {}
+
+
+@pytest.mark.asyncio
+async def test_in_memory_pending_store_latest_pending_ignores_mismatched_clear():
+    latest = {}
+    store = InMemoryPendingFileStore({}, latest)
+    await store.set_latest_pending("ou_owner", "oc_chat", "pending_1", ttl_seconds=60)
+
+    await store.clear_latest_pending("ou_owner", "oc_chat", "other_pending")
+
+    assert latest == {"ou_owner:oc_chat": "pending_1"}
+
+
 class FakeRedis:
     def __init__(self):
         self.values = {}
@@ -87,6 +119,28 @@ async def test_redis_pending_store_consumes_once():
     assert await store.consume("pending_1") is None
 
 
+@pytest.mark.asyncio
+async def test_redis_pending_store_latest_pending_index():
+    redis = FakeRedis()
+    store = RedisPendingFileStore(redis)
+    pending = {
+        "open_id": "ou_owner",
+        "chat_id": "oc_chat",
+        "file_name": "资料.docx",
+        "expires_at": time.time() + 60,
+    }
+    await store.create("pending_1", pending, ttl_seconds=30)
+    await store.set_latest_pending("ou_owner", "oc_chat", "pending_1", ttl_seconds=30)
+
+    latest_key = "unified_rag:feishu_pending_latest:ou_owner:oc_chat"
+    assert redis.values[latest_key] == "pending_1"
+    assert redis.expirations[latest_key] == 30
+    assert await store.get_latest_pending("ou_owner", "oc_chat") == pending
+
+    await store.clear_latest_pending("ou_owner", "oc_chat", "pending_1")
+    assert latest_key not in redis.values
+
+
 class RecoveringPendingStore:
     def __init__(self):
         self.fail = True
@@ -111,6 +165,16 @@ class RecoveringPendingStore:
     async def consume(self, pending_id: str) -> dict | None:
         self._maybe_fail()
         return self.values.pop(pending_id, None)
+
+    async def set_latest_pending(self, open_id: str, chat_id: str, pending_id: str, ttl_seconds: int) -> None:
+        self._maybe_fail()
+
+    async def get_latest_pending(self, open_id: str, chat_id: str) -> dict | None:
+        self._maybe_fail()
+        return None
+
+    async def clear_latest_pending(self, open_id: str, chat_id: str, pending_id: str | None = None) -> None:
+        self._maybe_fail()
 
     async def health(self) -> dict:
         self._maybe_fail()

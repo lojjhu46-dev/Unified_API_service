@@ -47,6 +47,8 @@ class InMemoryStore(MemoryStore):
             self._sessions[session_id] = []
         self._sessions[session_id].append({"role": "user", "content": question})
         self._sessions[session_id].append({"role": "assistant", "content": answer})
+        max_messages = max(int(settings.memory_max_messages), 1)
+        self._sessions[session_id] = self._sessions[session_id][-max_messages:]
 
     async def create_session(self) -> str:
         session_id = str(uuid.uuid4())[:12]
@@ -65,6 +67,10 @@ class InMemoryStore(MemoryStore):
             "fallback_active": False,
             "degraded": False,
             "session_count": len(self._sessions),
+            "max_messages": settings.memory_max_messages,
+            "reuse_window_messages": settings.memory_reuse_window_messages,
+            "rewrite_window_messages": settings.memory_rewrite_window_messages,
+            "prompt_window_messages": settings.memory_prompt_window_messages,
         }
 
 
@@ -129,6 +135,10 @@ class RedisStore(MemoryStore):
             "fallback_active": False,
             "degraded": False,
             "ttl_seconds": settings.memory_session_ttl_seconds,
+            "max_messages": settings.memory_max_messages,
+            "reuse_window_messages": settings.memory_reuse_window_messages,
+            "rewrite_window_messages": settings.memory_rewrite_window_messages,
+            "prompt_window_messages": settings.memory_prompt_window_messages,
         }
 
 

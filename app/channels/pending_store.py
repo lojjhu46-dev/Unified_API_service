@@ -10,6 +10,7 @@ from app.redis_client import RedisFallbackState, create_redis_client, redis_key
 logger = get_logger(__name__)
 
 pending_feishu_files: dict[str, dict] = {}
+pending_feishu_latest_files: dict[str, str] = {}
 
 
 class PendingFileStore(Protocol):
@@ -25,13 +26,26 @@ class PendingFileStore(Protocol):
     async def consume(self, pending_id: str) -> dict | None:
         ...
 
+    async def set_latest_pending(self, open_id: str, chat_id: str, pending_id: str, ttl_seconds: int) -> None:
+        ...
+
+    async def get_latest_pending(self, open_id: str, chat_id: str) -> dict | None:
+        ...
+
+    async def clear_latest_pending(self, open_id: str, chat_id: str, pending_id: str | None = None) -> None:
+        ...
+
     async def health(self) -> dict:
         ...
 
 
 class InMemoryPendingFileStore:
-    def __init__(self, storage: dict[str, dict] | None = None):
+    def __init__(self, storage: dict[str, dict] | None = None, latest_storage: dict[str, str] | None = None):
         self._storage = storage if storage is not None else {}
+        self._latest_storage = latest_storage if latest_storage is not None else {}
+
+    def _latest_key(self, open_id: str, chat_id: str) -> str:
+        return f"{open_id}:{chat_id}"
 
     async def create(self, pending_id: str, pending: dict, ttl_seconds: int) -> None:
         self._storage[pending_id] = dict(pending)
@@ -47,13 +61,39 @@ class InMemoryPendingFileStore:
 
     async def delete(self, pending_id: str) -> None:
         self._storage.pop(pending_id, None)
+        for key, latest_pending_id in list(self._latest_storage.items()):
+            if latest_pending_id == pending_id:
+                self._latest_storage.pop(key, None)
 
     async def consume(self, pending_id: str) -> dict | None:
         pending = await self.get(pending_id)
         if not pending:
             return None
-        self._storage.pop(pending_id, None)
+        await self.delete(pending_id)
         return pending
+
+    async def set_latest_pending(self, open_id: str, chat_id: str, pending_id: str, ttl_seconds: int) -> None:
+        if open_id and chat_id and pending_id:
+            self._latest_storage[self._latest_key(open_id, chat_id)] = pending_id
+
+    async def get_latest_pending(self, open_id: str, chat_id: str) -> dict | None:
+        if not open_id or not chat_id:
+            return None
+        pending_id = self._latest_storage.get(self._latest_key(open_id, chat_id))
+        if not pending_id:
+            return None
+        pending = await self.get(pending_id)
+        if not pending:
+            await self.clear_latest_pending(open_id, chat_id, pending_id)
+        return pending
+
+    async def clear_latest_pending(self, open_id: str, chat_id: str, pending_id: str | None = None) -> None:
+        if not open_id or not chat_id:
+            return
+        latest_key = self._latest_key(open_id, chat_id)
+        if pending_id is not None and self._latest_storage.get(latest_key) != pending_id:
+            return
+        self._latest_storage.pop(latest_key, None)
 
     async def health(self) -> dict:
         return {
@@ -61,6 +101,7 @@ class InMemoryPendingFileStore:
             "fallback_active": False,
             "degraded": False,
             "local_key_count": len(self._storage),
+            "latest_key_count": len(self._latest_storage),
         }
 
 
@@ -70,6 +111,9 @@ class RedisPendingFileStore:
 
     def _key(self, pending_id: str) -> str:
         return redis_key("feishu_pending", pending_id)
+
+    def _latest_key(self, open_id: str, chat_id: str) -> str:
+        return redis_key("feishu_pending_latest", open_id, chat_id)
 
     async def create(self, pending_id: str, pending: dict, ttl_seconds: int) -> None:
         payload = json.dumps(pending, ensure_ascii=False)
@@ -108,6 +152,40 @@ class RedisPendingFileStore:
         if pending.get("expires_at", 0) < time.time():
             return None
         return pending
+
+    async def set_latest_pending(self, open_id: str, chat_id: str, pending_id: str, ttl_seconds: int) -> None:
+        if not open_id or not chat_id or not pending_id:
+            return
+        await self._redis.set(
+            self._latest_key(open_id, chat_id),
+            pending_id,
+            ex=max(int(ttl_seconds), 1),
+        )
+
+    async def get_latest_pending(self, open_id: str, chat_id: str) -> dict | None:
+        if not open_id or not chat_id:
+            return None
+        pending_id = await self._redis.get(self._latest_key(open_id, chat_id))
+        if not pending_id:
+            return None
+        if isinstance(pending_id, bytes):
+            pending_id = pending_id.decode("utf-8")
+        pending = await self.get(pending_id)
+        if not pending:
+            await self.clear_latest_pending(open_id, chat_id, pending_id)
+        return pending
+
+    async def clear_latest_pending(self, open_id: str, chat_id: str, pending_id: str | None = None) -> None:
+        if not open_id or not chat_id:
+            return
+        latest_key = self._latest_key(open_id, chat_id)
+        if pending_id is not None:
+            current = await self._redis.get(latest_key)
+            if isinstance(current, bytes):
+                current = current.decode("utf-8")
+            if current != pending_id:
+                return
+        await self._redis.delete(latest_key)
 
     async def health(self) -> dict:
         ping = getattr(self._redis, "ping", None)
@@ -162,6 +240,18 @@ class FallbackPendingFileStore:
         fallback_pending = await self._fallback.consume(pending_id)
         return pending or fallback_pending
 
+    async def set_latest_pending(self, open_id: str, chat_id: str, pending_id: str, ttl_seconds: int) -> None:
+        await self._try_primary("set_latest_pending", open_id, chat_id, pending_id, ttl_seconds)
+        await self._fallback.set_latest_pending(open_id, chat_id, pending_id, ttl_seconds)
+
+    async def get_latest_pending(self, open_id: str, chat_id: str) -> dict | None:
+        pending = await self._try_primary("get_latest_pending", open_id, chat_id)
+        return pending or await self._fallback.get_latest_pending(open_id, chat_id)
+
+    async def clear_latest_pending(self, open_id: str, chat_id: str, pending_id: str | None = None) -> None:
+        await self._try_primary("clear_latest_pending", open_id, chat_id, pending_id)
+        await self._fallback.clear_latest_pending(open_id, chat_id, pending_id)
+
     async def health(self) -> dict:
         if self._state.should_try_primary():
             try:
@@ -176,7 +266,7 @@ class FallbackPendingFileStore:
 
 
 def get_pending_file_store() -> PendingFileStore:
-    fallback = InMemoryPendingFileStore(pending_feishu_files)
+    fallback = InMemoryPendingFileStore(pending_feishu_files, pending_feishu_latest_files)
     try:
         client = create_redis_client()
         return FallbackPendingFileStore(RedisPendingFileStore(client), fallback)

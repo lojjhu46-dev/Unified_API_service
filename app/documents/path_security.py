@@ -61,3 +61,31 @@ def validate_file_path(file_path: str) -> tuple[Path | None, str | None]:
 # validate_output_path 未使用：输出副本路径由 adapter 内部的 _build_output_path()
 # 生成，始终与源文件同目录。源文件路径已通过 validate_file_path 校验，
 # 因此输出路径自动继承相同的安全约束，无需额外校验。
+
+
+def validate_edit_permission(
+    resolved_path: Path,
+    owner_user_id: str,
+) -> str | None:
+    """校验编辑权限：文件必须是当前用户个人知识库中 ready 的文件。
+
+    Args:
+        resolved_path: 已解析的文件路径
+        owner_user_id: 当前认证用户 ID
+
+    Returns:
+        错误信息，无错误返回 None
+    """
+    from app.retrieval.document_registry import document_registry
+
+    if not owner_user_id:
+        return "编辑操作需要认证用户身份"
+
+    record = document_registry.find_personal_ready_by_path(
+        owner_user_id=owner_user_id,
+        stored_path=str(resolved_path),
+    )
+    if record is None:
+        return "只能编辑本人个人知识库中已保存且状态为 ready 的文件"
+
+    return None

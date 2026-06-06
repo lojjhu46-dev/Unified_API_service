@@ -96,6 +96,43 @@ def _build_feishu_resource_augmented_question(original_text: str, results: list[
     )
 
 
+def _looks_like_feishu_document_command(text: str | None) -> bool:
+    question = text or ""
+    if not question.strip():
+        return False
+    subject_words = ["文档", "文件", "正文", "内容", ".docx", ".xlsx", ".txt", ".pdf"]
+    action_words = [
+        "删除",
+        "删掉",
+        "清空",
+        "替换",
+        "修改",
+        "改成",
+        "追加",
+        "插入",
+        "编辑",
+        "审阅",
+        "提取",
+        "总结",
+        "识别",
+    ]
+    return any(word in question for word in subject_words) and any(word in question for word in action_words)
+
+
+async def _get_pending_file_hint_for_feishu_command(text: str | None, open_id: str | None, chat_id: str | None) -> str | None:
+    if not open_id or not chat_id or not _looks_like_feishu_document_command(text):
+        return None
+    pending = await pending_file_store.get_latest_pending(open_id, chat_id)
+    if not pending:
+        return None
+    filename = pending.get("file_name") or "刚上传的文件"
+    return (
+        f"我识别到你刚上传了 `{filename}`，但它还处于“是否保存到知识库”的待确认状态，"
+        "当前不会自动下载或导入，因此还没有可用于编辑的本地文件路径。\n\n"
+        "请先在文件卡片中选择“识别并总结”，或确认保存后再提供已保存文件路径执行编辑。"
+    )
+
+
 async def _handle_feishu_resource_links(text: str, session_id: str, open_id: str) -> str | None:
     if not settings.feishu_link_read_enabled:
         return None
@@ -299,6 +336,30 @@ async def upload_document(
         )
 
 
+@app.get("/documents/personal")
+async def list_personal_documents(
+    request: Request,
+    limit: int = 100,
+    auth_context: AuthContext | None = Depends(get_api_auth_context),
+):
+    """列出当前用户的个人知识库文件"""
+    await enforce_rate_limit("documents_personal", identity_from_auth(request, auth_context))
+    if auth_context is None:
+        raise HTTPException(status_code=401, detail="需要认证")
+    owner_user_id = (auth_context.user_id or "").strip()
+    if not owner_user_id:
+        raise HTTPException(status_code=401, detail="缺少用户标识")
+
+    from app.documents.tools import document_list_personal_files
+    result = await document_list_personal_files({
+        "owner_user_id": owner_user_id,
+        "limit": limit,
+    })
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error", "查询失败"))
+    return result
+
+
 @app.post("/sessions", response_model=SessionCreateResponse)
 async def create_session():
     """创建新会话"""
@@ -353,16 +414,20 @@ async def process_feishu_message(event_data: dict) -> None:
             if resource_answer is not None:
                 answer = resource_answer
             else:
-                knowledge_scope = decide_feishu_knowledge_scope(text)
-                ask_request = AskRequest(
-                    channel="feishu",
-                    user_id=open_id,
-                    session_id=session_id,
-                    question=text,
-                    knowledge_scope=knowledge_scope,
-                )
-                response = await orchestrator.process(ask_request)
-                answer = response.answer
+                pending_hint = await _get_pending_file_hint_for_feishu_command(text, open_id, chat_id)
+                if pending_hint is not None:
+                    answer = pending_hint
+                else:
+                    knowledge_scope = decide_feishu_knowledge_scope(text)
+                    ask_request = AskRequest(
+                        channel="feishu",
+                        user_id=open_id,
+                        session_id=session_id,
+                        question=text,
+                        knowledge_scope=knowledge_scope,
+                    )
+                    response = await orchestrator.process(ask_request)
+                    answer = response.answer
         except Exception as e:
             logger.error(f"飞书消息处理失败: {e}", exc_info=True)
             answer = "抱歉，处理您的问题时出现错误，请稍后重试。"
@@ -424,6 +489,12 @@ async def process_feishu_file_event(event_data: dict) -> None:
         "expires_at": time.time() + settings.feishu_pending_file_ttl_seconds,
     }
     await pending_file_store.create(pending_id, pending, settings.feishu_pending_file_ttl_seconds)
+    await pending_file_store.set_latest_pending(
+        event_data.get("open_id"),
+        event_data.get("chat_id"),
+        pending_id,
+        settings.feishu_pending_file_ttl_seconds,
+    )
     card = build_personal_file_confirm_card(filename, pending_id)
     await feishu_adapter.send_interactive_card(event_data.get("chat_id"), card)
 
@@ -481,6 +552,11 @@ async def process_feishu_card_action(action_data: dict) -> None:
         return
     if pending.get("expires_at", 0) < time.time():
         await pending_file_store.delete(pending_id)
+        await pending_file_store.clear_latest_pending(
+            pending.get("open_id"),
+            pending.get("chat_id"),
+            pending_id,
+        )
         chat_id = action_data.get("chat_id") or pending.get("chat_id")
         if chat_id:
             await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
@@ -491,6 +567,11 @@ async def process_feishu_card_action(action_data: dict) -> None:
 
     if action == "cancel_save_personal_file":
         await pending_file_store.delete(pending_id)
+        await pending_file_store.clear_latest_pending(
+            pending.get("open_id"),
+            pending.get("chat_id"),
+            pending_id,
+        )
         await feishu_adapter.send_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。")
         return
 
@@ -507,6 +588,11 @@ async def process_feishu_card_action(action_data: dict) -> None:
         if chat_id:
             await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
         return
+    await pending_file_store.clear_latest_pending(
+        pending.get("open_id"),
+        pending.get("chat_id"),
+        pending_id,
+    )
     if action == "confirm_save_enterprise_file":
         await save_feishu_file_to_enterprise_knowledge(pending)
     else:

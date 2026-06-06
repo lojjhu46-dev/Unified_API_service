@@ -15,7 +15,7 @@ from app.documents.models import (
     DocumentPlan,
     FileType,
 )
-from app.documents.path_security import validate_file_path
+from app.documents.path_security import validate_file_path, validate_edit_permission
 from app.documents.planner import DocumentPlanningAgent
 from app.config import settings
 from app.observability.logging import get_logger
@@ -173,7 +173,7 @@ async def document_extract(tool_input: dict) -> dict:
 async def document_plan(tool_input: dict) -> dict:
     """分析用户命令，生成编辑方案
 
-    input: { user_command: str, file_path: str, file_type?: str, structure?: dict }
+    input: { user_command: str, file_path: str, file_type?: str, structure?: dict, owner_user_id?: str }
     output: { success, plan: DocumentPlan.model_dump() }
     """
     user_command = tool_input.get("user_command", "")
@@ -187,6 +187,12 @@ async def document_plan(tool_input: dict) -> dict:
     if err:
         return {"success": False, "error": err}
     file_path = str(resolved_path)
+
+    # 编辑权限校验
+    owner_user_id = tool_input.get("owner_user_id", "")
+    err = validate_edit_permission(resolved_path, owner_user_id)
+    if err:
+        return {"success": False, "error": err}
 
     file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
     if err:
@@ -230,6 +236,13 @@ async def document_apply_plan(tool_input: dict) -> dict:
     if err:
         return {"success": False, "error": err}
     plan = plan.model_copy(update={"file_path": str(resolved_path)})
+
+    # 编辑权限校验
+    owner_user_id = tool_input.get("owner_user_id", "")
+    if plan.intent == DocumentIntent.EDIT:
+        err = validate_edit_permission(resolved_path, owner_user_id)
+        if err:
+            return {"success": False, "error": err}
 
     if not plan.is_actionable:
         response = {
@@ -312,4 +325,34 @@ async def document_review(tool_input: dict) -> dict:
         }
     except Exception as e:
         logger.error(f"文档审阅失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def document_list_personal_files(tool_input: dict) -> dict:
+    """列出当前用户的个人知识库文件
+
+    input: { owner_user_id: str, limit?: int }
+    output: { success, files: [...], count }
+    """
+    from app.retrieval.document_registry import document_registry
+
+    owner_user_id = tool_input.get("owner_user_id", "")
+    if not owner_user_id:
+        return {"success": False, "error": "缺少 owner_user_id"}
+
+    limit = tool_input.get("limit", 100)
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (ValueError, TypeError):
+        limit = 100
+
+    try:
+        files = document_registry.list_personal_ready(owner_user_id, limit=limit)
+        return {
+            "success": True,
+            "files": files,
+            "count": len(files),
+        }
+    except Exception as e:
+        logger.error(f"列出个人知识库文件失败: {e}")
         return {"success": False, "error": str(e)}

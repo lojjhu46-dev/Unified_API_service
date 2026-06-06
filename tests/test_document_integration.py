@@ -30,6 +30,10 @@ def _isolate_executor(monkeypatch):
         "app.documents.tools.validate_file_path",
         lambda fp: (Path(fp), None),
     )
+    monkeypatch.setattr(
+        "app.documents.tools.validate_edit_permission",
+        lambda resolved_path, owner_user_id: None,
+    )
     yield
     _reset_executor()
 
@@ -124,6 +128,24 @@ class TestDocumentRouting:
         data = response.json()
         assert data["route"] == "tool"
         assert "计算结果" in data["answer"]
+
+    def test_document_delete_content_without_path_does_not_route_to_calculator(self, client):
+        """删除文档内容但缺少路径时，应提示补充文档路径，不应把编号列表误判为计算。"""
+        payload = {
+            "user_id": "test_user",
+            "question": (
+                "删除文档中的内容：\n"
+                "实验目的：\n"
+                "（1）掌握 Pandas 读取数据及 Matplotlib 绘制散点图、折线图、饼图等多类型图表的方法；\n"
+                "（2）学会生成随机数据并绘制带折线的直方图，掌握数据分布可视化技巧；"
+            ),
+        }
+        response = client.post("/ask", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "文档文件路径" in data["answer"] or "document_file_path" in data["answer"]
+        assert "计算结果" not in data["answer"]
 
 
 # ---------------------------------------------------------------------------

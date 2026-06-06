@@ -4,13 +4,13 @@
 
 ## 技术栈
 
-- FastAPI
-- Pydantic v2
-- AsyncOpenAI
-- DeepSeek API
-- Chroma
-- Redis
-- Serper.dev
+* FastAPI
+* Pydantic v2
+* AsyncOpenAI
+* DeepSeek API
+* Chroma
+* Redis
+* Serper.dev
 
 ## 快速开始
 
@@ -18,38 +18,38 @@
 
 ```bash
 # 不推荐：这是 Windows Python，不是真正的 WSL/Linux Python
-source /mnt/d/C/python/new_python/.venv/Scripts/activate
+source /mnt/d/C/python/new\\\_python/.venv/Scripts/activate
 ```
 
 推荐做法：
 
 ```bash
 # 创建 WSL/Linux venv，建议放在 WSL ext4 文件系统，避免 /mnt/d 大量小文件写入过慢
-python3 -m venv /root/.venvs/unified_api_service
+python3 -m venv /root/.venvs/unified\\\_api\\\_service
 
 # 进入项目
-cd /mnt/d/LLM/Unified_API_service
+cd /mnt/d/LLM/Unified\\\_API\\\_service
 
 # 安装依赖
-/root/.venvs/unified_api_service/bin/python -m pip install -r requirements.txt
+/root/.venvs/unified\\\_api\\\_service/bin/python -m pip install -r requirements.txt
 
 # 复制配置文件
 cp .env.example .env
 
 # 启动服务
-/root/.venvs/unified_api_service/bin/python -m app.main
+/root/.venvs/unified\\\_api\\\_service/bin/python -m app.main
 ```
 
 验证当前解释器应显示 Linux：
 
 ```bash
-/root/.venvs/unified_api_service/bin/python -c "import sys, platform; print(sys.executable); print(platform.system()); print(sys.platform)"
+/root/.venvs/unified\\\_api\\\_service/bin/python -c "import sys, platform; print(sys.executable); print(platform.system()); print(sys.platform)"
 ```
 
 期望输出类似：
 
 ```text
-/root/.venvs/unified_api_service/bin/python
+/root/.venvs/unified\\\_api\\\_service/bin/python
 Linux
 linux
 ```
@@ -57,8 +57,8 @@ linux
 运行测试：
 
 ```bash
-cd /mnt/d/LLM/Unified_API_service
-/root/.venvs/unified_api_service/bin/python -m pytest
+cd /mnt/d/LLM/Unified\\\_API\\\_service
+/root/.venvs/unified\\\_api\\\_service/bin/python -m pytest
 ```
 
 ## API文档
@@ -70,71 +70,66 @@ cd /mnt/d/LLM/Unified_API_service
 正常文档问答、RAG 和联网综合回答必须使用真实 LLM，例如：
 
 ```env
-LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
+LLM\\\_PROVIDER=deepseek
+DEEPSEEK\\\_API\\\_KEY=your\\\_deepseek\\\_api\\\_key\\\_here
 ```
 
-`LLM_PROVIDER=mock` 仅用于本地调试和单元测试；文档问答会拒绝 mock，避免向用户返回 `[MOCK回答]`。
+`LLM\\\_PROVIDER=mock` 仅用于本地调试和单元测试；文档问答会拒绝 mock，避免向用户返回 `\\\[MOCK回答]`。
 
 ## API 认证
 
-生产环境必须配置 `API_KEY`。配置后，`/ask` 调用方需要在请求头中传入可信身份：
+生产环境必须配置 `API\\\_KEY`。配置后，`/ask` 调用方需要在请求头中传入可信身份：
 
 ```bash
-curl -X POST http://localhost:8000/ask \
-  -H "Authorization: Bearer your_api_key_here" \
-  -H "X-User-Id: ou_xxx" \
-  -H "X-Channel: api" \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"legacy_field","question":"你好"}'
+curl -X POST http://localhost:8000/ask \\\\
+  -H "Authorization: Bearer your\\\_api\\\_key\\\_here" \\\\
+  -H "X-User-Id: ou\\\_xxx" \\\\
+  -H "X-Channel: api" \\\\
+  -H "Content-Type: application/json" \\\\
+  -d '{"user\\\_id":"legacy\\\_field","question":"你好"}'
 ```
 
-`user_id` 和 `channel` 请求体字段仅为兼容保留，不作为权限身份；服务会使用 `X-User-Id` 和 `X-Channel` 注入可信身份。
+`user\\\_id` 和 `channel` 请求体字段仅为兼容保留，不作为权限身份；服务会使用 `X-User-Id` 和 `X-Channel` 注入可信身份。
 
-`/documents/upload` 同样需要 API Key 和 `X-User-Id`。上传到个人知识库时，owner 来自 `X-User-Id`，表单中的 `owner_open_id` 仅为本地兼容保留，生产认证模式下不会作为权限身份。
+`/documents/upload` 同样需要 API Key 和 `X-User-Id`。上传到个人知识库时，owner 来自 `X-User-Id`，表单中的 `owner\\\_open\\\_id` 仅为本地兼容保留，生产认证模式下不会作为权限身份。
 
 ```bash
-curl -X POST http://localhost:8000/documents/upload \
-  -H "Authorization: Bearer your_api_key_here" \
-  -H "X-User-Id: ou_xxx" \
-  -F "knowledge_base_type=personal" \
+curl -X POST http://localhost:8000/documents/upload \\\\
+  -H "Authorization: Bearer your\\\_api\\\_key\\\_here" \\\\
+  -H "X-User-Id: ou\\\_xxx" \\\\
+  -F "knowledge\\\_base\\\_type=personal" \\\\
   -F "file=@example.txt"
 ```
 
 生产环境如需浏览器跨域访问，请配置可信前端域名；默认不开放任意 CORS 来源：
 
 ```env
-CORS_ALLOWED_ORIGINS=https://your-frontend.example.com
-CORS_ALLOW_CREDENTIALS=false
+CORS\\\_ALLOWED\\\_ORIGINS=https://your-frontend.example.com
+CORS\\\_ALLOW\\\_CREDENTIALS=false
 ```
 
-## 文档 MCP 后端
-
-TXT 和 PDF 使用本地真实后端；DOCX 和 XLSX 编辑依赖独立的 HTTP MCP 服务。启用后，API 服务会把上传目录内的文件路径传给 MCP 服务，因此两边必须共享同一文件系统挂载或等价的网络文件系统。
+飞书文件确认 pending 状态和公开入口限流优先使用 Redis。生产环境请保证 `REDIS\\\_URL` 可用；如果 Redis 不可用，服务会回退到本机内存，适合本地开发但不适合多实例生产：
 
 ```env
-DOCUMENT_MCP_ENABLED=true
-DOCUMENT_MCP_TIMEOUT_SECONDS=30
-DOCX_MCP_BASE_URL=http://localhost:9100
-XLSX_MCP_BASE_URL=http://localhost:9101
-```
-
-MCP 服务需要按 `.env.example` 中列出的 HTTP 契约提供 DOCX/XLSX 读写端点，统一返回 `{success: bool, data?: object, error?: string}`。如果未启用 MCP 或未配置对应 URL，DOCX/XLSX 后端会明确返回未注册/不可用；不会回退到 mock 后端。
-
-文档工具只允许访问 `UPLOAD_DIR` 和 `PERSONAL_UPLOAD_DIR` 下的文件，输出副本由后端在源文件同目录生成，原文件不被覆盖。
-
-飞书文件确认 pending 状态和公开入口限流优先使用 Redis。生产环境请保证 `REDIS_URL` 可用；如果 Redis 不可用，服务会回退到本机内存，适合本地开发但不适合多实例生产：
-
-```env
-REDIS_URL=redis://localhost:6379/0
-REDIS_SOCKET_TIMEOUT=5
-REDIS_CONNECT_TIMEOUT=5
-REDIS_RETRY_COOLDOWN_SECONDS=10
-RATE_LIMIT_PER_MINUTE=60
-RATE_LIMIT_PER_HOUR=1000
+REDIS\\\_URL=redis://localhost:6379/0
+REDIS\\\_SOCKET\\\_TIMEOUT=5
+REDIS\\\_CONNECT\\\_TIMEOUT=5
+REDIS\\\_RETRY\\\_COOLDOWN\\\_SECONDS=10
+RATE\\\_LIMIT\\\_PER\\\_MINUTE=60
+RATE\\\_LIMIT\\\_PER\\\_HOUR=1000
 ```
 
 本机直接运行服务时可使用 `redis://localhost:6379/0`；如果服务也运行在 Docker Compose 网络内，请使用 `redis://redis:6379/0`。`docker-compose.yml` 已包含 Redis 服务，生产环境建议监控 `/health` 中的 Redis-backed components，避免长期处于 memory fallback。
+
+会话记忆同样优先使用 Redis。`MEMORY_MAX_MESSAGES` 控制每个 session 最多保存多少条消息；每轮请求会按用途读取不同窗口，默认最近答案复用读取 20 条、追问改写读取 12 条、最终回答 prompt 使用 8 条。飞书同一用户在同一聊天窗口会生成稳定 `session_id`，Redis 正常时服务重启后仍可读取最近上下文。
+
+```env
+MEMORY_REUSE_WINDOW_MESSAGES=20
+MEMORY_REWRITE_WINDOW_MESSAGES=12
+MEMORY_PROMPT_WINDOW_MESSAGES=8
+MEMORY_MAX_MESSAGES=20
+MEMORY_SESSION_TTL_SECONDS=604800
+```
 
 ## 飞书事件订阅
 
@@ -149,28 +144,28 @@ https://your-domain.example.com/channels/feishu/events
 长连接备用方式：在飞书开放平台选择“使用长连接接收事件”，然后单独启动 worker：
 
 ```bash
-cd /mnt/d/LLM/Unified_API_service
-/root/.venvs/unified_api_service/bin/python -m app.channels.feishu_ws_worker
+cd /mnt/d/LLM/Unified\\\_API\\\_service
+/root/.venvs/unified\\\_api\\\_service/bin/python -m app.channels.feishu\\\_ws\\\_worker
 ```
 
-长连接 worker 使用 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 建连；HTTP 回调仍使用 `FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY` 进行回调校验与解密。
+长连接 worker 使用 `FEISHU\\\_APP\\\_ID` 和 `FEISHU\\\_APP\\\_SECRET` 建连；HTTP 回调仍使用 `FEISHU\\\_VERIFICATION\\\_TOKEN` 和 `FEISHU\\\_ENCRYPT\\\_KEY` 进行回调校验与解密。
 
 飞书文本消息中包含 Docx、Sheets 或 Bitable 链接时，Agent 会默认用应用身份读取在线资源内容并参与本轮回答：
 
 ```env
-FEISHU_LINK_READ_ENABLED=true
-FEISHU_LINK_MAX_COUNT=3
-FEISHU_RESOURCE_MAX_CHARS=12000
-FEISHU_SHEET_SAMPLE_ROWS=30
-FEISHU_BITABLE_SAMPLE_RECORDS=50
+FEISHU\\\_LINK\\\_READ\\\_ENABLED=true
+FEISHU\\\_LINK\\\_MAX\\\_COUNT=3
+FEISHU\\\_RESOURCE\\\_MAX\\\_CHARS=12000
+FEISHU\\\_SHEET\\\_SAMPLE\\\_ROWS=30
+FEISHU\\\_BITABLE\\\_SAMPLE\\\_RECORDS=50
 ```
 
-该能力只使用 `tenant_access_token` 读取资源，不使用用户登录态、不爬网页、不自动入库知识库。生产环境需要在飞书开放平台为应用开通 Docx、Sheets、Bitable 对应只读权限，并确保目标文档已授权给机器人/应用；否则会提示应用没有读取权限。
+该能力只使用 `tenant\\\_access\\\_token` 读取资源，不使用用户登录态、不爬网页、不自动入库知识库。生产环境需要在飞书开放平台为应用开通 Docx、Sheets、Bitable 对应只读权限，并确保目标文档已授权给机器人/应用；否则会提示应用没有读取权限。
 
 ## 项目结构
 
 ```
-Unified_API_service/
+Unified\\\_API\\\_service/
   app/
     main.py              # FastAPI应用入口
     config.py            # 配置模块
@@ -186,13 +181,3 @@ Unified_API_service/
   requirements.txt       # 依赖
   .env.example           # 配置模板
 ```
-
-## 开发阶段
-
-- [x] 阶段1: 统一API骨架
-- [ ] 阶段2: DeepSeek LLM Gateway
-- [ ] 阶段3: 文档上传与本地RAG
-- [ ] 阶段4: 会话记忆与追问改写
-- [ ] 阶段5: 联网工具与Agentic RAG
-- [ ] 阶段6: 飞书Channel Adapter
-- [ ] 阶段7: 生产化增强

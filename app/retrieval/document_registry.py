@@ -126,6 +126,51 @@ class DocumentRegistry:
                 values,
             )
 
+    def list_personal_ready(
+        self,
+        owner_user_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """列出指定用户的个人知识库 ready 文件，按创建时间倒序。"""
+        self.init()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT document_id, original_filename, stored_filename,
+                       stored_path, created_at, updated_at
+                FROM documents
+                WHERE owner_user_id = ?
+                  AND knowledge_base_type = 'personal'
+                  AND status = 'ready'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (owner_user_id, min(limit, 500)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_personal_ready_by_path(
+        self,
+        owner_user_id: str,
+        stored_path: str,
+    ) -> dict[str, Any] | None:
+        """按 stored_path 查找当前用户 personal ready 文件，用于编辑前校验。"""
+        self.init()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM documents
+                WHERE stored_path = ?
+                  AND owner_user_id = ?
+                  AND knowledge_base_type = 'personal'
+                  AND status = 'ready'
+                LIMIT 1
+                """,
+                (stored_path, owner_user_id),
+            ).fetchone()
+        return dict(row) if row else None
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 from app.memory.store import FallbackMemoryStore, InMemoryStore, RedisStore, get_memory_store, memory_store
 from app.memory.rewrite import rewrite_question, _history_to_text
 from app.redis_client import create_redis_client, reset_redis_client
+from app.config import settings
 
 
 @pytest.fixture
@@ -41,6 +42,18 @@ async def test_max_messages(memory):
 
     history = await memory.get_history(session_id, max_messages=4)
     assert len(history) == 4
+
+
+@pytest.mark.asyncio
+async def test_in_memory_store_trims_to_memory_max_messages(memory):
+    session_id = await memory.create_session()
+    for index in range(12):
+        await memory.append_turn(session_id, f"问题{index}", f"回答{index}")
+
+    history = await memory.get_history(session_id, max_messages=30)
+
+    assert len(history) == 20
+    assert history[0]["content"] == "问题2"
 
 
 @pytest.mark.asyncio
@@ -185,6 +198,18 @@ async def test_redis_store_append_get_clear_and_ttl():
     await store.clear_session(session_id)
     assert await store.get_history(session_id) == []
     assert await store.session_exists(session_id) is False
+
+
+@pytest.mark.asyncio
+async def test_memory_health_exposes_context_window_settings():
+    memory = InMemoryStore()
+
+    health = await memory.health()
+
+    assert health["max_messages"] == settings.memory_max_messages
+    assert health["reuse_window_messages"] == settings.memory_reuse_window_messages
+    assert health["rewrite_window_messages"] == settings.memory_rewrite_window_messages
+    assert health["prompt_window_messages"] == settings.memory_prompt_window_messages
 
 
 @pytest.mark.asyncio

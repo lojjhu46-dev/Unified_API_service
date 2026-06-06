@@ -822,7 +822,48 @@ def test_rag_reuses_recent_answer_without_retrieval(client):
     mock_rewrite.assert_not_awaited()
     mock_search.assert_not_awaited()
     mock_generate.assert_not_awaited()
+    mock_memory.get_history.assert_awaited_once_with("test_session", settings.memory_reuse_window_messages)
     mock_memory.append_turn.assert_awaited_once_with("test_session", "请帮我绘制一条默认样式的正弦曲线", "下面是绘图代码。")
+
+
+def test_rag_reuses_answer_from_tenth_recent_turn(client):
+    history = []
+    for index in range(10):
+        history.extend([
+            {"role": "user", "content": f"历史问题{index}"},
+            {"role": "assistant", "content": f"历史答案{index}"},
+        ])
+
+    mock_memory = MagicMock()
+
+    async def get_history(_session_id, max_messages=6):
+        return history[-max_messages:]
+
+    mock_memory.get_history = AsyncMock(side_effect=get_history)
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.rewrite_question", new=AsyncMock()) as mock_rewrite, \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock()) as mock_search, \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock()) as mock_generate:
+        response = client.post(
+            "/ask",
+            json={
+                "user_id": "test_user",
+                "question": "历史问题0",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"] == "历史答案0"
+    assert data["route"] == "rag"
+    assert data["sources"] == []
+    mock_memory.get_history.assert_awaited_once_with("test_session", settings.memory_reuse_window_messages)
+    mock_rewrite.assert_not_awaited()
+    mock_search.assert_not_awaited()
+    mock_generate.assert_not_awaited()
 
 
 def test_web_route_does_not_reuse_recent_answer(client):
@@ -872,6 +913,8 @@ def test_web_route_does_not_reuse_recent_answer(client):
     assert data["answer"] == "新联网答案"
     mock_tool.assert_awaited_once()
     mock_generate.assert_awaited_once()
+    assert mock_memory.get_history.await_args_list[0].args == ("test_session", settings.memory_rewrite_window_messages)
+    assert mock_memory.get_history.await_args_list[1].args == ("test_session", settings.memory_prompt_window_messages)
     mock_memory.append_turn.assert_awaited_once_with("test_session", "今天的 Python 新闻", "新联网答案")
 
 
@@ -1040,13 +1083,24 @@ class TestRecentAnswerReuse:
 
 
 def test_rag_prompt_includes_history_original_and_standalone_question(client):
-    mock_memory = MagicMock()
-    mock_memory.get_history = AsyncMock(return_value=[
+    full_history = [
+        {"role": "user", "content": "不应进入 prompt 的旧问题"},
+        {"role": "assistant", "content": "不应进入 prompt 的旧答案"},
         {"role": "user", "content": "iPhone 15有什么特点"},
         {"role": "assistant", "content": "特点..."},
-    ])
+    ]
+    mock_memory = MagicMock()
+
+    async def get_history(_session_id, max_messages=6):
+        return full_history[-max_messages:]
+
+    mock_memory.get_history = AsyncMock(side_effect=get_history)
     mock_memory.create_session = AsyncMock(return_value="test_session")
     mock_memory.append_turn = AsyncMock()
+
+    async def fake_rewrite(question, history):
+        assert len(history) == min(settings.memory_rewrite_window_messages, len(full_history))
+        return "iPhone 15的续航"
 
     with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
         "app.orchestrator.orchestrator.llm.generate",
@@ -1054,7 +1108,7 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     ) as mock_generate, patch(
         "app.orchestrator.orchestrator.retriever.search",
         new=AsyncMock(return_value=[]),
-    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="iPhone 15的续航")):
+    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(side_effect=fake_rewrite)) as mock_rewrite:
         response = client.post(
             "/ask",
             json={"user_id": "test_user", "question": "它的续航怎么样"},
@@ -1068,6 +1122,49 @@ def test_rag_prompt_includes_history_original_and_standalone_question(client):
     assert "它的续航怎么样" in prompt
     assert "独立检索问题" in prompt
     assert "iPhone 15的续航" in prompt
+    mock_rewrite.assert_awaited_once()
+    assert mock_memory.get_history.await_args_list[0].args == ("test_session", settings.memory_reuse_window_messages)
+    assert mock_memory.get_history.await_args_list[1].args == ("test_session", settings.memory_rewrite_window_messages)
+    assert mock_memory.get_history.await_args_list[2].args == ("test_session", settings.memory_prompt_window_messages)
+
+
+def test_rag_prompt_uses_prompt_window_not_reuse_window(client):
+    full_history = []
+    for index in range(10):
+        full_history.extend([
+            {"role": "user", "content": f"历史问题{index}"},
+            {"role": "assistant", "content": f"历史答案{index}"},
+        ])
+
+    mock_memory = MagicMock()
+
+    async def get_history(_session_id, max_messages=6):
+        return full_history[-max_messages:]
+
+    mock_memory.get_history = AsyncMock(side_effect=get_history)
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), patch(
+        "app.orchestrator.orchestrator.llm.generate",
+        new=AsyncMock(return_value="回答"),
+    ) as mock_generate, patch(
+        "app.orchestrator.orchestrator.retriever.search",
+        new=AsyncMock(return_value=[]),
+    ), patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="新问题")):
+        response = client.post(
+            "/ask",
+            json={"user_id": "test_user", "question": "一个没有命中复用的新问题"},
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.args[0]
+    assert "历史问题6" in prompt
+    assert "历史答案9" in prompt
+    assert "历史问题5" not in prompt
+    assert mock_memory.get_history.await_args_list[0].args == ("test_session", settings.memory_reuse_window_messages)
+    assert mock_memory.get_history.await_args_list[1].args == ("test_session", settings.memory_rewrite_window_messages)
+    assert mock_memory.get_history.await_args_list[2].args == ("test_session", settings.memory_prompt_window_messages)
 
 
 def test_rag_prompt_uses_full_internal_content_not_display_snippet(client):

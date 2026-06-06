@@ -33,6 +33,11 @@ def _isolate_executor(tmp_path, monkeypatch):
     """每个测试前后重置 executor，避免全局状态污染。
     同时将 upload_dir 指向 tmp_path，让路径安全校验通过。"""
     monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "document_mcp_enabled", False)
+    monkeypatch.setattr(
+        "app.documents.tools.validate_edit_permission",
+        lambda resolved_path, owner_user_id: None,
+    )
     _reset_executor()
     yield
     _reset_executor()

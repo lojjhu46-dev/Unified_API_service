@@ -58,6 +58,9 @@ class Settings(BaseSettings):
 
     # 会话配置
     memory_window_messages: int = 6
+    memory_reuse_window_messages: int = 20
+    memory_rewrite_window_messages: int = 12
+    memory_prompt_window_messages: int = 8
     memory_max_messages: int = 20
     memory_session_ttl_seconds: int = 7 * 24 * 60 * 60
     recent_answer_reuse_similarity_threshold: float = 0.8
