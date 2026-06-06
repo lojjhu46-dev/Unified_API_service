@@ -497,3 +497,86 @@ class TestToolRegistryIntegration:
         )
         assert execution.trace.status == "success"
         assert execution.result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# 真实权限校验（不 mock validate_edit_permission）
+# ---------------------------------------------------------------------------
+
+class TestRealEditPermission:
+    """直接单测 validate_edit_permission，不依赖 autouse fixture 的 mock"""
+
+    @pytest.fixture
+    def seeded_registry(self, tmp_path, monkeypatch):
+        from app.retrieval.document_registry import DocumentRegistry
+        db_path = str(tmp_path / "reg.sqlite3")
+        reg = DocumentRegistry(db_path=db_path)
+        reg.init()
+        # 本人 personal ready 文件
+        reg.create_processing(
+            document_id="doc_personal", tenant_id="default",
+            knowledge_base_type="personal", owner_user_id="owner1",
+            original_filename="test.txt", stored_filename="test.txt",
+            stored_path=str(tmp_path / "test.txt"),
+        )
+        reg.mark_ready("doc_personal", chunk_count=3)
+        # 企业库文件
+        reg.create_processing(
+            document_id="doc_enterprise", tenant_id="default",
+            knowledge_base_type="enterprise", owner_user_id="owner1",
+            original_filename="ent.txt", stored_filename="ent.txt",
+            stored_path=str(tmp_path / "ent.txt"),
+        )
+        reg.mark_ready("doc_enterprise", chunk_count=3)
+        # 其他用户的文件
+        reg.create_processing(
+            document_id="doc_other", tenant_id="default",
+            knowledge_base_type="personal", owner_user_id="owner2",
+            original_filename="other.txt", stored_filename="other.txt",
+            stored_path=str(tmp_path / "other.txt"),
+        )
+        reg.mark_ready("doc_other", chunk_count=3)
+        # processing 文件
+        reg.create_processing(
+            document_id="doc_proc", tenant_id="default",
+            knowledge_base_type="personal", owner_user_id="owner1",
+            original_filename="proc.txt", stored_filename="proc.txt",
+            stored_path=str(tmp_path / "proc.txt"),
+        )
+        monkeypatch.setattr("app.retrieval.document_registry.document_registry", reg)
+        return tmp_path
+
+    def test_own_personal_ready_passes(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "test.txt", "owner1")
+        assert result is None
+
+    def test_enterprise_file_rejected(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "ent.txt", "owner1")
+        assert result is not None
+        assert "只能编辑" in result
+
+    def test_other_user_rejected(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "other.txt", "owner1")
+        assert result is not None
+        assert "只能编辑" in result
+
+    def test_unregistered_file_rejected(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "nope.txt", "owner1")
+        assert result is not None
+        assert "只能编辑" in result
+
+    def test_processing_file_rejected(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "proc.txt", "owner1")
+        assert result is not None
+        assert "只能编辑" in result
+
+    def test_empty_owner_rejected(self, seeded_registry):
+        from app.documents.path_security import validate_edit_permission
+        result = validate_edit_permission(seeded_registry / "test.txt", "")
+        assert result is not None
+        assert "认证" in result

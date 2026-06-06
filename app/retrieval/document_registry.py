@@ -134,6 +134,7 @@ class DocumentRegistry:
     ) -> list[dict[str, Any]]:
         """列出指定用户的个人知识库 ready 文件，按创建时间倒序。"""
         self.init()
+        safe_limit = max(1, min(int(limit), 500))
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -146,7 +147,7 @@ class DocumentRegistry:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (owner_user_id, min(limit, 500)),
+                (owner_user_id, safe_limit),
             ).fetchall()
         return [dict(row) for row in rows]
 

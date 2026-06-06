@@ -482,10 +482,21 @@ class Orchestrator:
         "审阅", "审阅文档", "提取", "提取结构", "总结", "总结文档", "查看", "查看结构",
         "review", "extract", "summarize",
     })
-    _DOC_LIST_INTENT_WORDS = frozenset({
-        "列出", "查看文件", "我的文件", "个人知识库", "知识库文件",
-        "list files", "my files", "personal",
+    _DOC_LIST_VERBS = frozenset({
+        "列出", "查看", "看看", "有哪些", "有什么", "显示", "展示",
+        "list", "show", "view",
     })
+    _DOC_LIST_OBJECTS = frozenset({
+        "文件", "文档", "个人知识库文件", "知识库文件", "保存的文件", "已保存",
+        "files", "documents",
+    })
+
+    def _is_list_intent(self, question: str) -> bool:
+        """判断是否为列出文件意图：必须同时命中动词和对象词"""
+        q = question.lower()
+        has_verb = any(v in q for v in self._DOC_LIST_VERBS)
+        has_obj = any(o in q for o in self._DOC_LIST_OBJECTS)
+        return has_verb and has_obj
 
     def _is_document_request(self, request: AskRequest) -> bool:
         """判断是否为文档操作请求"""
@@ -500,7 +511,7 @@ class Orchestrator:
         question = request.question
 
         # 自然语言识别：列出个人知识库文件
-        if any(word in question for word in self._DOC_LIST_INTENT_WORDS):
+        if self._is_list_intent(question):
             return True
 
         # 自然语言识别：文件路径 + 意图词
@@ -972,7 +983,9 @@ class Orchestrator:
             })
             if list_result.result.get("success") and list_result.result.get("files"):
                 files = list_result.result["files"]
-                file_list = "\n".join(f"  - {f['original_filename']} ({f['stored_path']})" for f in files)
+                file_list = "\n".join(
+                    f"  - {f['original_filename']}（{f['created_at'][:10]}）" for f in files
+                )
                 answer = f"请指定要处理的文件路径。您个人知识库中的文件：\n{file_list}"
             else:
                 answer = "请补充要处理的文档文件路径。可通过 document_file_path 传入已上传文件路径，或先上传文件到个人知识库。"
@@ -1064,10 +1077,6 @@ class Orchestrator:
     def _has_edit_intent(self, question: str) -> bool:
         """判断问题是否包含编辑意图"""
         return any(word in question for word in self._DOC_EDIT_INTENT_WORDS)
-
-    def _is_list_intent(self, question: str) -> bool:
-        """判断问题是否为列出文件意图"""
-        return any(word in question for word in self._DOC_LIST_INTENT_WORDS)
 
     @staticmethod
     def _extract_file_path(question: str) -> str:

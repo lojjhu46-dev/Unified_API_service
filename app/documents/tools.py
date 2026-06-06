@@ -58,6 +58,17 @@ def _resolve_file_type(file_path: str, file_type_str: str | None) -> tuple[FileT
     return ft, None
 
 
+_EDIT_KEYWORDS = frozenset({
+    "修改", "编辑", "替换", "删除", "改写", "添加", "插入", "清空", "移除", "更新", "改动",
+    "edit", "replace", "delete", "modify", "remove", "clear",
+})
+
+
+def _looks_like_edit(command: str) -> bool:
+    """判断命令是否看起来像编辑操作"""
+    return any(kw in command.lower() for kw in _EDIT_KEYWORDS)
+
+
 _BACKEND_BY_FILE_TYPE: dict[FileType, BackendType] = {
     FileType.DOCX: BackendType.DOCX_MCP,
     FileType.XLSX: BackendType.XLSX_MCP,
@@ -188,11 +199,12 @@ async def document_plan(tool_input: dict) -> dict:
         return {"success": False, "error": err}
     file_path = str(resolved_path)
 
-    # 编辑权限校验
+    # 编辑意图时校验权限（非编辑意图如审阅/提取不受限制）
     owner_user_id = tool_input.get("owner_user_id", "")
-    err = validate_edit_permission(resolved_path, owner_user_id)
-    if err:
-        return {"success": False, "error": err}
+    if _looks_like_edit(user_command):
+        err = validate_edit_permission(resolved_path, owner_user_id)
+        if err:
+            return {"success": False, "error": err}
 
     file_type, err = _resolve_file_type(file_path, tool_input.get("file_type"))
     if err:
@@ -347,7 +359,16 @@ async def document_list_personal_files(tool_input: dict) -> dict:
         limit = 100
 
     try:
-        files = document_registry.list_personal_ready(owner_user_id, limit=limit)
+        raw_files = document_registry.list_personal_ready(owner_user_id, limit=limit)
+        # 只暴露最小元数据，不返回服务器路径
+        files = [
+            {
+                "document_id": f["document_id"],
+                "original_filename": f["original_filename"],
+                "created_at": f["created_at"],
+            }
+            for f in raw_files
+        ]
         return {
             "success": True,
             "files": files,
