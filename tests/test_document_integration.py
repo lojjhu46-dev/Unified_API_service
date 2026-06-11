@@ -48,6 +48,49 @@ def _setup_executor_with_txt():
     return executor
 
 
+class TableDocxBackend(MockDocxBackend):
+    """返回含表格单元格文本的 DOCX mock 后端。"""
+
+    async def read_structure(self, file_path: str) -> dict:
+        self._get_paras(file_path)
+        return {
+            "type": "docx",
+            "paragraph_count": 1,
+            "paragraphs": [{"index": 0, "text": "封面", "style": "Normal"}],
+            "headings": [],
+            "tables": [
+                {
+                    "index": 0,
+                    "rows": 2,
+                    "cols": 1,
+                    "cells": [
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法",
+                            "merged": False,
+                        },
+                    ],
+                },
+            ],
+        }
+
+
+def _setup_executor_with_docx_table(file_path: str):
+    executor = DocumentOperationAgent()
+    backend = TableDocxBackend()
+    backend.load_document(file_path, ["封面"])
+    backend.load_tables(file_path, [
+        [
+            ["项目"],
+            ["实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法"],
+        ],
+    ])
+    executor.register_backend(BackendType.DOCX_MCP, backend)
+    set_executor(executor)
+    return executor, backend
+
+
 # ---------------------------------------------------------------------------
 # 路由识别
 # ---------------------------------------------------------------------------
@@ -296,6 +339,102 @@ class TestDocumentOperations:
         assert data["route"] == "tool"
         assert "编辑方案" in data["answer"]
         assert "确认" in data["answer"]
+
+    def test_plan_docx_table_cell_via_ask_returns_edit_plan(self, client, monkeypatch, tmp_path):
+        """document_id + DOCX 表格目标应生成可确认编辑方案，而不是找不到目标。"""
+        from app.retrieval.document_registry import DocumentRegistry
+
+        f = tmp_path / "experiment.docx"
+        f.write_text("", encoding="utf-8")
+        reg = DocumentRegistry(db_path=str(tmp_path / "reg.sqlite3"))
+        reg.init()
+        reg.create_processing(
+            document_id="doc_table_id",
+            tenant_id="default",
+            knowledge_base_type="personal",
+            owner_user_id="test_user",
+            original_filename="experiment.docx",
+            stored_filename="experiment.docx",
+            stored_path=str(f),
+        )
+        reg.mark_ready("doc_table_id", chunk_count=1)
+        monkeypatch.setattr("app.retrieval.document_registry.document_registry", reg)
+        _setup_executor_with_docx_table(str(f))
+
+        mock_plan_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "clear_table_cell",
+                    "target": {"table_index": 0, "row": 1, "col": 0},
+                    "value": None,
+                    "description": "清空实验目的单元格",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_plan_data, ensure_ascii=False)),
+        ):
+            response = client.post("/ask", json={
+                "user_id": "test_user",
+                "question": "编辑document_id: doc_table_id，删除实验目的的内容",
+                "document_id": "doc_table_id",
+                "document_action": "plan",
+            })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "编辑方案" in data["answer"]
+        assert "确认" in data["answer"]
+        assert "clear_table_cell" in data["answer"]
+        assert "table_index" in data["answer"]
+        assert '"row": 1' in data["answer"]
+        assert '"col": 0' in data["answer"]
+        assert "找不到实验目的" not in data["answer"]
+        assert "无法定位" not in data["answer"]
+
+    def test_apply_docx_table_cell_via_ask_confirmed_edits_copy(self, client, tmp_path):
+        """confirmed apply 应清空 DOCX 副本中的表格单元格，原文件不变。"""
+        f = tmp_path / "experiment.docx"
+        f.write_text("", encoding="utf-8")
+        _, backend = _setup_executor_with_docx_table(str(f))
+
+        response = client.post("/ask", json={
+            "user_id": "test_user",
+            "question": "执行编辑",
+            "document_plan": {
+                "intent": "edit",
+                "file_type": "docx",
+                "file_path": str(f),
+                "backend_required": "docx_mcp",
+                "risk_level": "high",
+                "requires_confirmation": True,
+                "operations": [
+                    {
+                        "action": "clear_table_cell",
+                        "target": {"table_index": 0, "row": 1, "col": 0},
+                        "description": "清空实验目的单元格",
+                    },
+                ],
+            },
+            "document_confirmed": True,
+        })
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["route"] == "tool"
+        assert "成功" in data["answer"]
+        assert "输出文件：" in data["answer"]
+        output_file = data["answer"].split("输出文件：", 1)[1].strip()
+        assert "实验目的" in backend._get_table_cell(str(f), 0, 1, 0)
+        assert backend._get_table_cell(output_file, 0, 1, 0) == ""
 
     def test_plan_unsupported_via_ask(self, client):
         """PDF 编辑方案应返回 unsupported 提示"""

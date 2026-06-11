@@ -1,6 +1,7 @@
 """Read-only Feishu cloud resource helpers."""
 
 import re
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -265,12 +266,43 @@ class FeishuResourceClient:
         if not headers:
             return {"success": False, "error": "飞书 tenant_access_token 获取失败。", "permission_error": True}
 
-        try:
-            resp = await client.get(f"{self._base_url}{path}", headers=headers, params=params)
-            data = resp.json()
-        except Exception as e:
-            logger.warning("读取飞书在线资源异常: %s", e, exc_info=True)
-            return {"success": False, "error": f"读取飞书在线资源失败: {e}", "permission_error": False}
+        url = f"{self._base_url}{path}"
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.get(url, headers=headers, params=params)
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.warning(
+                        "读取飞书在线资源响应非 JSON: %s",
+                        e,
+                        exc_info=True,
+                        extra={"path": path, "status_code": resp.status_code, "body": resp.text[:300]},
+                    )
+                    return {"success": False, "error": f"读取飞书在线资源失败: 非 JSON 响应 {resp.text[:300]}", "permission_error": False}
+                break
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.warning(
+                    "读取飞书在线资源异常: %s: %s",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                    extra={"path": path, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                return {"success": False, "error": f"读取飞书在线资源失败: {e}", "permission_error": False}
+            except Exception as e:
+                logger.warning(
+                    "读取飞书在线资源异常: %s: %s",
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                    extra={"path": path, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                return {"success": False, "error": f"读取飞书在线资源失败: {e}", "permission_error": False}
 
         code = data.get("code")
         if resp.status_code == 200 and code == 0:

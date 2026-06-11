@@ -36,15 +36,32 @@ class DocumentRegistry:
                     status TEXT NOT NULL,
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
+                    is_generated_copy INTEGER NOT NULL DEFAULT 0,
+                    source_document_id TEXT NOT NULL DEFAULT '',
+                    source_stored_path TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_copy_columns(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_documents_owner "
                 "ON documents (tenant_id, knowledge_base_type, owner_user_id)"
             )
+
+    def _ensure_copy_columns(self, conn: sqlite3.Connection) -> None:
+        """轻量迁移：为旧 registry 补充编辑副本元数据字段。"""
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        if "is_generated_copy" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN is_generated_copy INTEGER NOT NULL DEFAULT 0")
+        if "source_document_id" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN source_document_id TEXT NOT NULL DEFAULT ''")
+        if "source_stored_path" not in columns:
+            conn.execute("ALTER TABLE documents ADD COLUMN source_stored_path TEXT NOT NULL DEFAULT ''")
 
     def create_processing(
         self,
@@ -68,8 +85,10 @@ class DocumentRegistry:
                 INSERT OR REPLACE INTO documents (
                     document_id, tenant_id, knowledge_base_type, owner_user_id,
                     owner_open_id, original_filename, stored_filename, stored_path,
-                    channel, chat_id, status, chunk_count, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 0, '', ?, ?)
+                    channel, chat_id, status, chunk_count, error,
+                    is_generated_copy, source_document_id, source_stored_path,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'processing', 0, '', 0, '', '', ?, ?)
                 """,
                 (
                     document_id,
@@ -92,6 +111,51 @@ class DocumentRegistry:
 
     def mark_failed(self, document_id: str, error: str | None = None) -> None:
         self._update_status(document_id, "failed", error=error or "")
+
+    def register_generated_copy(
+        self,
+        *,
+        document_id: str,
+        source_record: dict[str, Any],
+        stored_path: str,
+        stored_filename: str,
+        original_filename: str | None = None,
+    ) -> None:
+        """登记系统生成的编辑副本为当前用户 personal ready 文件。
+
+        该登记仅用于文件列表、权限校验和后续编辑定位，不表示已重新入库向量索引。
+        """
+        self.init()
+        now = _utc_now()
+        source_document_id = source_record.get("source_document_id") or source_record.get("document_id", "")
+        source_stored_path = source_record.get("source_stored_path") or source_record.get("stored_path", "")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO documents (
+                    document_id, tenant_id, knowledge_base_type, owner_user_id,
+                    owner_open_id, original_filename, stored_filename, stored_path,
+                    channel, chat_id, status, chunk_count, error,
+                    is_generated_copy, source_document_id, source_stored_path,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'personal', ?, ?, ?, ?, ?, ?, ?, 'ready', 0, '', 1, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    source_record.get("tenant_id", "default"),
+                    source_record.get("owner_user_id", ""),
+                    source_record.get("owner_open_id", ""),
+                    original_filename or f"{source_record.get('original_filename', stored_filename)} 编辑副本",
+                    stored_filename,
+                    stored_path,
+                    source_record.get("channel", ""),
+                    source_record.get("chat_id", ""),
+                    source_document_id,
+                    source_stored_path,
+                    now,
+                    now,
+                ),
+            )
 
     def get(self, document_id: str) -> dict[str, Any] | None:
         self.init()
@@ -139,7 +203,8 @@ class DocumentRegistry:
             rows = conn.execute(
                 """
                 SELECT document_id, original_filename, stored_filename,
-                       stored_path, created_at, updated_at
+                       stored_path, created_at, updated_at,
+                       is_generated_copy, source_document_id
                 FROM documents
                 WHERE owner_user_id = ?
                   AND knowledge_base_type = 'personal'
@@ -171,6 +236,17 @@ class DocumentRegistry:
                 (stored_path, owner_user_id),
             ).fetchone()
         return dict(row) if row else None
+
+    def find_personal_ready_generated_copy_by_path(
+        self,
+        owner_user_id: str,
+        stored_path: str,
+    ) -> dict[str, Any] | None:
+        """按路径查找当前用户 personal ready 的系统生成副本。"""
+        record = self.find_personal_ready_by_path(owner_user_id, stored_path)
+        if record and int(record.get("is_generated_copy") or 0) == 1:
+            return record
+        return None
 
     def find_personal_ready_by_id(
         self,

@@ -77,7 +77,11 @@ class ToolRegistry:
             return ToolExecution(trace=trace, result=result)
         except Exception as e:
             latency_ms = (time.perf_counter() - start) * 1000
-            logger.error(f"工具 {tool_name} 执行失败: {e}")
+            logger.error(
+                f"工具 {tool_name} 执行失败: {type(e).__name__}: {e}",
+                exc_info=True,
+                extra={"tool_name": tool_name, "tool_input_preview": str(tool_input)[:500]},
+            )
             trace = ToolTrace(
                 tool_name=tool_name,
                 tool_input=tool_input,

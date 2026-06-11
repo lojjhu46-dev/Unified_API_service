@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import httpx
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -31,6 +32,7 @@ from app.main import (
     process_feishu_file_event,
     process_feishu_message,
     send_feishu_processing_heartbeat,
+    _run_background_task_safely,
 )
 
 
@@ -540,6 +542,24 @@ class TestReplyMessage:
             result = await adapter.reply_message("om_test123", "测试回复")
             assert result is False
 
+    @pytest.mark.asyncio
+    async def test_reply_message_retries_transient_request_error(self, adapter):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"code": 0, "msg": "success"}
+        post = AsyncMock(side_effect=[
+            httpx.ConnectTimeout("timeout"),
+            mock_response,
+        ])
+
+        with patch.object(adapter, "get_tenant_access_token", new=AsyncMock(return_value="test_token")), \
+             patch("httpx.AsyncClient.post", new=post), \
+             patch.object(adapter, "_retry_delay", new=AsyncMock()) as mock_sleep:
+            result = await adapter.reply_message("om_test123", "测试回复")
+
+        assert result is True
+        assert post.await_count == 2
+        mock_sleep.assert_awaited_once()
+
 
 class TestSendMessage:
     """发送消息测试"""
@@ -560,6 +580,61 @@ class TestSendMessage:
         with patch.object(adapter, "get_tenant_access_token", new=AsyncMock(return_value=None)):
             result = await adapter.send_message("oc_test123", "测试消息")
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_send_message_retries_transient_request_error(self, adapter):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"code": 0, "msg": "success"}
+        post = AsyncMock(side_effect=[
+            httpx.ConnectTimeout("timeout"),
+            mock_response,
+        ])
+
+        with patch.object(adapter, "get_tenant_access_token", new=AsyncMock(return_value="test_token")), \
+             patch("httpx.AsyncClient.post", new=post), \
+             patch.object(adapter, "_retry_delay", new=AsyncMock()) as mock_sleep:
+            result = await adapter.send_message("oc_test123", "测试消息")
+
+        assert result is True
+        assert post.await_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_interactive_card_retries_transient_request_error(self, adapter):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"code": 0, "msg": "success"}
+        post = AsyncMock(side_effect=[
+            httpx.ConnectTimeout("timeout"),
+            mock_response,
+        ])
+
+        with patch.object(adapter, "get_tenant_access_token", new=AsyncMock(return_value="test_token")), \
+             patch("httpx.AsyncClient.post", new=post), \
+             patch.object(adapter, "_retry_delay", new=AsyncMock()) as mock_sleep:
+            result = await adapter.send_interactive_card("oc_test123", {"elements": []})
+
+        assert result is True
+        assert post.await_count == 2
+        mock_sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_download_message_resource_retries_transient_request_error(self, adapter):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"file"
+        get = AsyncMock(side_effect=[
+            httpx.ReadTimeout("timeout"),
+            mock_response,
+        ])
+
+        with patch.object(adapter, "get_tenant_access_token", new=AsyncMock(return_value="test_token")), \
+             patch("httpx.AsyncClient.get", new=get), \
+             patch.object(adapter, "_retry_delay", new=AsyncMock()) as mock_sleep:
+            result = await adapter.download_message_resource("om_test123", "file_key")
+
+        assert result == b"file"
+        assert get.await_count == 2
+        mock_sleep.assert_awaited_once()
 
 
 class TestFeishuHeartbeat:
@@ -587,6 +662,20 @@ class TestFeishuHeartbeat:
 
         mock_send.assert_not_awaited()
         mock_reply.assert_awaited_once_with("om_test456", "机器人回答")
+
+    @pytest.mark.asyncio
+    async def test_background_task_wrapper_logs_exception(self):
+        async def failing_handler(payload):
+            raise RuntimeError("boom")
+
+        payload = {"message_id": "om_test", "dedupe_key": "event_test", "chat_id": "oc_test"}
+        with patch("app.main.logger.error") as mock_error:
+            await _run_background_task_safely(failing_handler, payload, task_name="failing_handler")
+
+        mock_error.assert_called_once()
+        assert "Background task failed" in mock_error.call_args.args[0]
+        assert mock_error.call_args.kwargs["extra"]["task_name"] == "failing_handler"
+        assert mock_error.call_args.kwargs["extra"]["message_id"] == "om_test"
 
     @pytest.mark.asyncio
     async def test_slow_processing_sends_heartbeat_then_final_reply(self):
@@ -1193,6 +1282,45 @@ class TestFeishuPersonalKnowledgeFiles:
         message = mock_send.await_args.args[1]
         assert "文档编辑执行成功" in message
         assert "/tmp/test_edited.txt" in message
+
+    @pytest.mark.asyncio
+    async def test_confirm_document_edit_card_logs_send_failure(self):
+        pending_feishu_files["edit_pending_send_failed"] = {
+            "type": "document_edit",
+            "open_id": "ou_test123",
+            "chat_id": "oc_test789",
+            "document_id": "doc123",
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "file_path": "/tmp/test.txt",
+                "backend_required": "text_adapter",
+                "operations": [{"action": "delete_line", "target": {"line": 1}}],
+            },
+            "expires_at": 9999999999,
+        }
+        execution = SimpleNamespace(result={
+            "success": True,
+            "result": {
+                "summary": "已完成 1 项操作",
+                "output_file": "/tmp/test_edited.txt",
+            },
+        })
+
+        with patch("app.main.tool_registry.execute_with_result", new=AsyncMock(return_value=execution)), \
+             patch("app.main.feishu_adapter.send_message", new=AsyncMock(return_value=False)), \
+             patch("app.main.logger.error") as mock_error:
+            await process_feishu_card_action({
+                "action": "confirm_document_edit",
+                "pending_id": "edit_pending_send_failed",
+                "open_id": "ou_test123",
+                "chat_id": "oc_test789",
+        })
+
+        mock_error.assert_called()
+        assert mock_error.call_args.args[0] == "Feishu message send returned false"
+        assert mock_error.call_args.kwargs["extra"]["context"] == "document_edit_success"
+        assert mock_error.call_args.kwargs["extra"]["pending_id"] == "edit_pending_send_failed"
 
     @pytest.mark.asyncio
     async def test_cancel_document_edit_card_does_not_execute_plan(self):

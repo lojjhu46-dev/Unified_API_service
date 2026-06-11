@@ -29,6 +29,9 @@ def test_document_registry_create_mark_ready_and_get(tmp_path):
     assert row["status"] == "ready"
     assert row["chunk_count"] == 3
     assert row["error"] == ""
+    assert row["is_generated_copy"] == 0
+    assert row["source_document_id"] == ""
+    assert row["source_stored_path"] == ""
 
 
 def test_document_registry_mark_failed_stores_error(tmp_path):
@@ -142,3 +145,89 @@ class TestFindPersonalReadyByPath:
     def test_processing(self, seeded_registry):
         _seed(seeded_registry, doc_id="d1", status="processing", stored_path="/uploads/p.txt")
         assert seeded_registry.find_personal_ready_by_path("user1", "/uploads/p.txt") is None
+
+
+# ---------------------------------------------------------------------------
+# generated copy metadata
+# ---------------------------------------------------------------------------
+
+class TestGeneratedCopyRegistry:
+    def test_register_generated_copy(self, seeded_registry):
+        _seed(seeded_registry, doc_id="source_doc", stored_path="/uploads/source.txt")
+        source = seeded_registry.get("source_doc")
+
+        seeded_registry.register_generated_copy(
+            document_id="copy_doc",
+            source_record=source,
+            stored_path="/uploads/source_副本_abcd.txt",
+            stored_filename="source_副本_abcd.txt",
+        )
+
+        copy = seeded_registry.get("copy_doc")
+        assert copy["knowledge_base_type"] == "personal"
+        assert copy["owner_user_id"] == "user1"
+        assert copy["status"] == "ready"
+        assert copy["is_generated_copy"] == 1
+        assert copy["source_document_id"] == "source_doc"
+        assert copy["source_stored_path"] == "/uploads/source.txt"
+
+    def test_generated_copy_can_be_found_by_path(self, seeded_registry):
+        _seed(seeded_registry, doc_id="source_doc", stored_path="/uploads/source.txt")
+        source = seeded_registry.get("source_doc")
+        seeded_registry.register_generated_copy(
+            document_id="copy_doc",
+            source_record=source,
+            stored_path="/uploads/source_副本_abcd.txt",
+            stored_filename="source_副本_abcd.txt",
+        )
+
+        assert seeded_registry.find_personal_ready_generated_copy_by_path(
+            "user1",
+            "/uploads/source_副本_abcd.txt",
+        )["document_id"] == "copy_doc"
+        assert seeded_registry.find_personal_ready_generated_copy_by_path("user2", "/uploads/source_副本_abcd.txt") is None
+        assert seeded_registry.find_personal_ready_generated_copy_by_path("user1", "/uploads/source.txt") is None
+
+    def test_migrates_old_schema_with_default_copy_fields(self, tmp_path):
+        import sqlite3
+
+        db_path = tmp_path / "old.sqlite3"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE documents (
+                document_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                knowledge_base_type TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL DEFAULT '',
+                owner_open_id TEXT NOT NULL DEFAULT '',
+                original_filename TEXT NOT NULL,
+                stored_filename TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO documents (
+                document_id, tenant_id, knowledge_base_type, owner_user_id,
+                original_filename, stored_filename, stored_path, status, created_at, updated_at
+            ) VALUES ('old_doc', 'default', 'personal', 'user1', 'old.txt', 'old.txt', '/uploads/old.txt', 'ready', 't1', 't1')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        reg = DocumentRegistry(str(db_path))
+        row = reg.get("old_doc")
+
+        assert row["is_generated_copy"] == 0
+        assert row["source_document_id"] == ""
+        assert row["source_stored_path"] == ""

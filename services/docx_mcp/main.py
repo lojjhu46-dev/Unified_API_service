@@ -49,10 +49,7 @@ async def _run_in_executor(func, *args) -> Any:
 @app.post("/docx/read_structure")
 async def read_structure(request: Request, body: dict) -> dict:
     """读取 DOCX 文档结构"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     resolved, err = validate_file_path(file_path)
@@ -70,10 +67,7 @@ async def read_structure(request: Request, body: dict) -> dict:
 @app.post("/docx/read_paragraph")
 async def read_paragraph(request: Request, body: dict) -> dict:
     """读取指定段落的文本"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     index = body.get("index")
@@ -98,10 +92,7 @@ async def read_paragraph(request: Request, body: dict) -> dict:
 @app.post("/docx/replace_paragraph")
 async def replace_paragraph(request: Request, body: dict) -> dict:
     """替换指定段落的文本"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     index = body.get("index")
@@ -127,10 +118,7 @@ async def replace_paragraph(request: Request, body: dict) -> dict:
 @app.post("/docx/delete_paragraph")
 async def delete_paragraph(request: Request, body: dict) -> dict:
     """删除指定段落"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     index = body.get("index")
@@ -155,10 +143,7 @@ async def delete_paragraph(request: Request, body: dict) -> dict:
 @app.post("/docx/append_paragraph")
 async def append_paragraph(request: Request, body: dict) -> dict:
     """在文档末尾追加段落"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     text = body.get("text", "")
@@ -175,13 +160,111 @@ async def append_paragraph(request: Request, body: dict) -> dict:
         return fail(str(e))
 
 
+@app.post("/docx/read_table_cell")
+async def read_table_cell(request: Request, body: dict) -> dict:
+    """读取指定表格单元格文本"""
+    verify_api_key(request)
+
+    file_path = body.get("file_path", "")
+    table_index = body.get("table_index")
+    row = body.get("row")
+    col = body.get("col")
+
+    resolved, err = validate_file_path(file_path)
+    if err:
+        return fail(err)
+
+    if table_index is None or row is None or col is None:
+        return fail("缺少 table_index、row 或 col 参数")
+
+    try:
+        text = await _run_in_executor(
+            operations.read_table_cell,
+            str(resolved),
+            int(table_index),
+            int(row),
+            int(col),
+        )
+        return ok({"text": text})
+    except (IndexError, ValueError) as e:
+        return fail(str(e))
+    except Exception as e:
+        logger.error(f"read_table_cell 失败: {e}")
+        return fail(str(e))
+
+
+@app.post("/docx/replace_table_cell")
+async def replace_table_cell(request: Request, body: dict) -> dict:
+    """替换指定表格单元格文本"""
+    verify_api_key(request)
+
+    file_path = body.get("file_path", "")
+    table_index = body.get("table_index")
+    row = body.get("row")
+    col = body.get("col")
+    new_text = body.get("new_text", "")
+
+    resolved, err = validate_file_path(file_path)
+    if err:
+        return fail(err)
+
+    if table_index is None or row is None or col is None:
+        return fail("缺少 table_index、row 或 col 参数")
+
+    try:
+        await _run_in_executor(
+            operations.replace_table_cell,
+            str(resolved),
+            int(table_index),
+            int(row),
+            int(col),
+            new_text,
+        )
+        return ok()
+    except (IndexError, ValueError) as e:
+        return fail(str(e))
+    except Exception as e:
+        logger.error(f"replace_table_cell 失败: {e}")
+        return fail(str(e))
+
+
+@app.post("/docx/clear_table_cell")
+async def clear_table_cell(request: Request, body: dict) -> dict:
+    """清空指定表格单元格文本"""
+    verify_api_key(request)
+
+    file_path = body.get("file_path", "")
+    table_index = body.get("table_index")
+    row = body.get("row")
+    col = body.get("col")
+
+    resolved, err = validate_file_path(file_path)
+    if err:
+        return fail(err)
+
+    if table_index is None or row is None or col is None:
+        return fail("缺少 table_index、row 或 col 参数")
+
+    try:
+        await _run_in_executor(
+            operations.clear_table_cell,
+            str(resolved),
+            int(table_index),
+            int(row),
+            int(col),
+        )
+        return ok()
+    except (IndexError, ValueError) as e:
+        return fail(str(e))
+    except Exception as e:
+        logger.error(f"clear_table_cell 失败: {e}")
+        return fail(str(e))
+
+
 @app.post("/docx/save_copy")
 async def save_copy(request: Request, body: dict) -> dict:
     """保存文档副本到指定路径"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     output_path = body.get("output_path", "")

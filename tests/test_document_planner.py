@@ -69,6 +69,28 @@ class TestBuildStructureBrief:
     def test_none_structure(self):
         assert "无结构信息" in build_structure_brief(None)
 
+    def test_docx_table_cells_included_in_brief(self):
+        brief = build_structure_brief({
+            "type": "docx",
+            "paragraph_count": 2,
+            "tables": [
+                {
+                    "index": 0,
+                    "rows": 2,
+                    "cols": 2,
+                    "cells": [
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法",
+                        },
+                    ],
+                },
+            ],
+        })
+
+        assert "表格[0] R1C0: 实验目的" in brief
+
 
 # ---------------------------------------------------------------------------
 # 硬规则：不依赖 LLM
@@ -430,6 +452,170 @@ class TestParseLLMOutput:
                 file_type=FileType.XLSX,
             )
         assert plan.backend_required == BackendType.XLSX_MCP
+
+    @pytest.mark.asyncio
+    async def test_docx_table_cell_edit_returns_edit_plan(self):
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "clear_table_cell",
+                    "target": {"table_index": 0, "row": 1, "col": 0},
+                    "value": None,
+                    "description": "清空实验目的单元格",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        structure = {
+            "type": "docx",
+            "tables": [
+                {
+                    "index": 0,
+                    "rows": 2,
+                    "cols": 2,
+                    "cells": [
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法",
+                        },
+                    ],
+                },
+            ],
+        }
+
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data, ensure_ascii=False)),
+        ):
+            plan = await planner.plan(
+                user_command="删除实验目的的内容",
+                file_type=FileType.DOCX,
+                structure=structure,
+            )
+
+        assert plan.intent == DocumentIntent.EDIT
+        assert plan.backend_required == BackendType.DOCX_MCP
+        assert len(plan.operations) == 1
+        assert plan.operations[0].action == "clear_table_cell"
+        assert plan.operations[0].target == {"table_index": 0, "row": 1, "col": 0}
+        assert plan.risk_level == RiskLevel.HIGH
+        assert plan.needs_confirmation
+
+    @pytest.mark.asyncio
+    async def test_docx_paragraph_edit_still_passes(self):
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "replace_paragraph",
+                    "target": {"paragraph_index": 1},
+                    "value": "新内容",
+                    "description": "替换段落",
+                },
+            ],
+            "risk_level": "low",
+            "requires_confirmation": False,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data, ensure_ascii=False)),
+        ):
+            plan = await planner.plan(
+                user_command="把第2段改成新内容",
+                file_type=FileType.DOCX,
+                structure={"type": "docx", "paragraphs": [{"index": 1, "text": "旧内容"}]},
+            )
+
+        assert plan.intent == DocumentIntent.EDIT
+        assert plan.backend_required == BackendType.DOCX_MCP
+        assert plan.operations[0].target == {"paragraph_index": 1}
+
+    @pytest.mark.asyncio
+    async def test_docx_previous_table_reference_overrides_anchor_table(self):
+        """“锚点的上一个表格”必须定位到前一个表格，而不是锚点所在表格。"""
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "replace_table_cell",
+                    "target": {"table_index": 4, "row": 0, "col": 0},
+                    "value": "本实验通过 Matplotlib 与 Pandas 完成多产业就业数据可视化。",
+                    "description": "填充实验体会",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        structure = {
+            "type": "docx",
+            "tables": [
+                {"index": 3, "rows": 2, "cols": 1, "cells": [
+                    {"row": 0, "col": 0, "text": "实验体会："},
+                    {"row": 1, "col": 0, "text": ""},
+                ]},
+                {"index": 4, "rows": 2, "cols": 1, "cells": [
+                    {"row": 0, "col": 0, "text": "教师评语及成绩："},
+                    {"row": 1, "col": 0, "text": ""},
+                ]},
+            ],
+        }
+
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data, ensure_ascii=False)),
+        ):
+            plan = await planner.plan(
+                user_command="编辑文档，在“教师评语及成绩：”的上一个表格填充内容",
+                file_type=FileType.DOCX,
+                structure=structure,
+            )
+
+        assert plan.intent == DocumentIntent.EDIT
+        assert plan.operations[0].target["table_index"] == 3
+        assert plan.operations[0].target["row"] == 0
+        assert plan.operations[0].target["col"] == 0
+        assert plan.operations[0].target["table_index"] != 4
+
+    @pytest.mark.asyncio
+    async def test_docx_previous_table_reference_missing_anchor_clarifies(self):
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "replace_table_cell",
+                    "target": {"table_index": 0, "row": 0, "col": 0},
+                    "value": "内容",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+
+        with patch(
+            "app.documents.planner.llm_gateway.generate",
+            new=AsyncMock(return_value=json.dumps(mock_data, ensure_ascii=False)),
+        ):
+            plan = await planner.plan(
+                user_command="在“教师评语及成绩：”的上一个表格填充内容",
+                file_type=FileType.DOCX,
+                structure={"type": "docx", "tables": [{"index": 0, "cells": [{"row": 0, "col": 0, "text": "实验体会："}]}]},
+            )
+
+        assert plan.intent == DocumentIntent.EDIT
+        assert not plan.is_actionable
+        assert "未在文档表格中找到锚点文本" in plan.clarification_question
 
 
 # ---------------------------------------------------------------------------

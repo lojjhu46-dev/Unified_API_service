@@ -81,25 +81,83 @@ class Orchestrator:
                     session_id,
                     self._memory_reuse_window_messages(),
                 )
-                reuse_decision = self._evaluate_recent_answer_reuse(request.question, reuse_history)
-                if reuse_decision["hit"]:
-                    result = {
-                        "answer": reuse_decision["answer"],
-                        "sources": [],
-                        "tool_trace": [],
-                        "retrieval_ms": 0,
-                        "tool_ms": 0,
-                        "llm_ms": 0,
-                    }
+                if self._is_regenerate_answer_request(request.question):
                     logger.info(
-                        "Recent answer reuse hit",
+                        "Recent answer reuse skipped",
                         extra={
                             "request_id": request_id,
                             "session_id": session_id,
                             "route": route,
-                            "recent_answer_reuse_hit": True,
-                            "recent_answer_reuse_similarity": reuse_decision["similarity"],
-                            "recent_answer_reuse_turn_offset": reuse_decision["turn_offset"],
+                            "recent_answer_reuse_hit": False,
+                            "recent_answer_reuse_miss_reason": "regenerate_requested",
+                            "recent_answer_reuse_best_similarity": 0.0,
+                            "recent_answer_reuse_turn_offset": None,
+                            "recent_answer_reuse_candidate_count": 0,
+                            "recent_answer_reuse_threshold": float(settings.recent_answer_reuse_similarity_threshold),
+                            "recent_answer_reuse_min_chars": max(int(settings.recent_answer_reuse_min_chars), 1),
+                            "memory_reuse_history_count": len(reuse_history),
+                            "memory_rewrite_history_count": 0,
+                            "memory_prompt_history_count": 0,
+                            "memory_max_messages": settings.memory_max_messages,
+                        },
+                    )
+                else:
+                    reuse_decision = self._evaluate_recent_answer_reuse(request.question, reuse_history)
+                    if reuse_decision["hit"]:
+                        result = {
+                            "answer": reuse_decision["answer"],
+                            "sources": [],
+                            "tool_trace": [],
+                            "retrieval_ms": 0,
+                            "tool_ms": 0,
+                            "llm_ms": 0,
+                        }
+                        logger.info(
+                            "Recent answer reuse hit",
+                            extra={
+                                "request_id": request_id,
+                                "session_id": session_id,
+                                "route": route,
+                                "recent_answer_reuse_hit": True,
+                                "recent_answer_reuse_similarity": reuse_decision["similarity"],
+                                "recent_answer_reuse_turn_offset": reuse_decision["turn_offset"],
+                                "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
+                                "recent_answer_reuse_threshold": reuse_decision["threshold"],
+                                "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
+                                "memory_reuse_history_count": len(reuse_history),
+                                "memory_rewrite_history_count": 0,
+                                "memory_prompt_history_count": 0,
+                                "memory_max_messages": settings.memory_max_messages,
+                            },
+                        )
+                        await self.memory.append_turn(session_id, request.question, result["answer"])
+                        total_ms = (time.perf_counter() - start_time) * 1000
+                        return AgentResponse(
+                            request_id=request_id,
+                            session_id=session_id,
+                            route=route,
+                            answer=result.get("answer", ""),
+                            sources=result.get("sources", []),
+                            tool_trace=result.get("tool_trace", []),
+                            timing=TimingInfo(
+                                rewrite_ms=0,
+                                retrieval_ms=0,
+                                tool_ms=0,
+                                llm_ms=0,
+                                total_ms=total_ms,
+                            ),
+                            standalone_question=request.question,
+                        )
+                    logger.info(
+                        "Recent answer reuse miss",
+                        extra={
+                            "request_id": request_id,
+                            "session_id": session_id,
+                            "route": route,
+                            "recent_answer_reuse_hit": False,
+                            "recent_answer_reuse_miss_reason": reuse_decision["miss_reason"],
+                            "recent_answer_reuse_best_similarity": reuse_decision["best_similarity"],
+                            "recent_answer_reuse_turn_offset": reuse_decision["best_turn_offset"],
                             "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
                             "recent_answer_reuse_threshold": reuse_decision["threshold"],
                             "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
@@ -109,43 +167,6 @@ class Orchestrator:
                             "memory_max_messages": settings.memory_max_messages,
                         },
                     )
-                    await self.memory.append_turn(session_id, request.question, result["answer"])
-                    total_ms = (time.perf_counter() - start_time) * 1000
-                    return AgentResponse(
-                        request_id=request_id,
-                        session_id=session_id,
-                        route=route,
-                        answer=result.get("answer", ""),
-                        sources=result.get("sources", []),
-                        tool_trace=result.get("tool_trace", []),
-                        timing=TimingInfo(
-                            rewrite_ms=0,
-                            retrieval_ms=0,
-                            tool_ms=0,
-                            llm_ms=0,
-                            total_ms=total_ms,
-                        ),
-                        standalone_question=request.question,
-                    )
-                logger.info(
-                    "Recent answer reuse miss",
-                    extra={
-                        "request_id": request_id,
-                        "session_id": session_id,
-                        "route": route,
-                        "recent_answer_reuse_hit": False,
-                        "recent_answer_reuse_miss_reason": reuse_decision["miss_reason"],
-                        "recent_answer_reuse_best_similarity": reuse_decision["best_similarity"],
-                        "recent_answer_reuse_turn_offset": reuse_decision["best_turn_offset"],
-                        "recent_answer_reuse_candidate_count": reuse_decision["candidate_count"],
-                        "recent_answer_reuse_threshold": reuse_decision["threshold"],
-                        "recent_answer_reuse_min_chars": reuse_decision["min_chars"],
-                        "memory_reuse_history_count": len(reuse_history),
-                        "memory_rewrite_history_count": 0,
-                        "memory_prompt_history_count": 0,
-                        "memory_max_messages": settings.memory_max_messages,
-                    },
-                )
 
             if route in {"rag", "web", "agentic_rag"}:
                 rewrite_history = await self.memory.get_history(
@@ -286,6 +307,39 @@ class Orchestrator:
         if not (answer or "").strip():
             return False
         return not any(marker in answer for marker in _NON_REUSABLE_RECENT_ANSWER_MARKERS)
+
+    def _is_regenerate_answer_request(self, question: str) -> bool:
+        """判断用户是否在请求重新生成上一轮答案。"""
+        normalized = self._normalize_recent_answer_text(question)
+        if not normalized:
+            return False
+
+        for prefix in ("请", "麻烦", "帮我", "please"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                break
+
+        for suffix in ("一下", "一次", "一遍", "吧", "下", "please"):
+            if normalized.endswith(suffix):
+                normalized = normalized[:-len(suffix)]
+                break
+
+        regenerate_commands = {
+            "重新生成答案",
+            "重新回答",
+            "再回答",
+            "再回答一次",
+            "再生成",
+            "再生成一次",
+            "重新生成",
+            "换个答案",
+            "换一个答案",
+            "重新检索回答",
+            "regenerate",
+            "regenerateanswer",
+            "answeragain",
+        }
+        return normalized in regenerate_commands
 
     def _evaluate_recent_answer_reuse(self, question: str, history: list[dict]) -> dict:
         """评估是否可以直接复用最近答案，并返回命中或未命中原因。"""
@@ -1031,7 +1085,7 @@ class Orchestrator:
             }
 
         # plan：生成编辑方案
-        if action == "plan" or (file_path and self._has_edit_intent(request.question)):
+        if action == "plan" or ((file_path or document_id) and self._has_edit_intent(request.question)):
             execution = await self.tools.execute_with_result("document_plan", {
                 "user_command": request.question,
                 "document_id": document_id,

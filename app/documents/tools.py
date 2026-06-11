@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 from app.documents.executor import DocumentOperationAgent, describe_non_actionable_plan
@@ -85,6 +86,36 @@ def _resolve_personal_document_path(tool_input: dict) -> tuple[str, str | None]:
     if record is None:
         return "", "未找到当前用户个人知识库中状态为 ready 的文档"
     return record["stored_path"], None
+
+
+def _register_generated_copy_if_needed(
+    *,
+    owner_user_id: str,
+    source_record: dict | None,
+    source_path: str,
+    output_file: str | None,
+    edited_in_place: bool,
+) -> str | None:
+    """源文档首次编辑成功后登记输出副本；续编副本不重复登记。"""
+    if not owner_user_id or not source_record or not output_file or edited_in_place:
+        return None
+    if str(output_file) == str(source_path):
+        return None
+
+    from app.retrieval.document_registry import document_registry
+
+    output_path = Path(output_file)
+    if not output_path.exists() or not output_path.is_file():
+        logger.warning(f"编辑副本文件不存在，跳过登记: {output_file}")
+        return None
+    document_id = f"copy_{uuid.uuid4().hex[:12]}"
+    document_registry.register_generated_copy(
+        document_id=document_id,
+        source_record=source_record,
+        stored_path=str(output_path),
+        stored_filename=output_path.name,
+    )
+    return document_id
 
 
 _BACKEND_BY_FILE_TYPE: dict[FileType, BackendType] = {
@@ -234,6 +265,20 @@ async def document_plan(tool_input: dict) -> dict:
         return {"success": False, "error": err}
 
     structure = tool_input.get("structure")
+    if structure is None and file_type == FileType.DOCX and _looks_like_edit(user_command):
+        backend_type = _BACKEND_BY_FILE_TYPE.get(file_type)
+        executor = _get_executor()
+        backend = executor.get_backend(backend_type) if backend_type else None
+        if backend is None:
+            return {"success": False, "error": f"后端 {backend_type} 未注册"}
+        try:
+            structure = await backend.read_structure(file_path)
+        except FileNotFoundError:
+            return {"success": False, "error": f"文件不存在: {file_path}"}
+        except Exception as e:
+            logger.error(f"文档结构预读取失败: {e}")
+            return {"success": False, "error": str(e)}
+
     planner = _get_planner()
 
     try:
@@ -280,10 +325,15 @@ async def document_apply_plan(tool_input: dict) -> dict:
 
     # 编辑权限校验
     owner_user_id = tool_input.get("owner_user_id", "")
+    source_record = None
     if plan.intent == DocumentIntent.EDIT:
         err = validate_edit_permission(resolved_path, owner_user_id)
         if err:
             return {"success": False, "error": err}
+        from app.retrieval.document_registry import document_registry
+        source_record = document_registry.find_personal_ready_by_path(owner_user_id, str(resolved_path))
+        edit_in_place = bool(source_record and int(source_record.get("is_generated_copy") or 0) == 1)
+        plan = plan.model_copy(update={"edit_in_place": edit_in_place})
 
     if not plan.is_actionable:
         response = {
@@ -319,6 +369,17 @@ async def document_apply_plan(tool_input: dict) -> dict:
 
     try:
         result = await executor.execute(plan)
+        generated_copy_document_id = None
+        if plan.intent == DocumentIntent.EDIT and result.success:
+            generated_copy_document_id = _register_generated_copy_if_needed(
+                owner_user_id=owner_user_id,
+                source_record=source_record,
+                source_path=plan.file_path,
+                output_file=result.output_file,
+                edited_in_place=plan.edit_in_place,
+            )
+            if generated_copy_document_id:
+                result.verification["generated_copy_document_id"] = generated_copy_document_id
         return {
             "success": result.success,
             "result": result.model_dump(),

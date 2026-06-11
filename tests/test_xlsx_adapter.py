@@ -285,6 +285,34 @@ class TestExecuteEdit:
         assert result.success
         assert "2 项操作" in result.summary
 
+    @pytest.mark.asyncio
+    async def test_edit_in_place_does_not_create_second_copy(self, backend, sample_doc):
+        copy_path = "/tmp/test_副本_abcd.xlsx"
+        await backend.save_copy(sample_doc, copy_path)
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.XLSX,
+            file_path=copy_path,
+            backend_required=BackendType.XLSX_MCP,
+            edit_in_place=True,
+            operations=[
+                DocumentOperation(
+                    action="modify_cell",
+                    target={"sheet": "Sheet1", "cell": "B2"},
+                    value="续编部门",
+                ),
+            ],
+        )
+
+        result = await backend.execute(plan)
+
+        assert result.success
+        assert result.output_file == copy_path
+        assert result.verification["edited_in_place"] is True
+        assert "original_unchanged" not in result.verification
+        assert await backend.read_cell(copy_path, "Sheet1", "B2") == "续编部门"
+        assert await backend.read_cell(sample_doc, "Sheet1", "B2") == "技术部"
+
 
 # ---------------------------------------------------------------------------
 # execute() 只读操作

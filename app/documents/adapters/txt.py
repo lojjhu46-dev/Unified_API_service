@@ -137,33 +137,40 @@ class TxtBackend(DocumentBackend):
             return DocumentOperationResult(success=False, error=str(e))
 
     async def _handle_edit(self, plan: DocumentPlan) -> DocumentOperationResult:
-        """处理编辑操作（在副本上执行）"""
-        output_path = self._build_output_path(plan.file_path)
+        """处理编辑操作：源文档生成副本，系统副本可原地续编。"""
+        output_path = plan.file_path if plan.edit_in_place else self._build_output_path(plan.file_path)
         warnings: list[str] = []
 
         try:
-            # 保存副本
-            await self.save_copy(plan.file_path, output_path)
+            if not plan.edit_in_place:
+                await self.save_copy(plan.file_path, output_path)
 
             # 执行操作
             for i, op in enumerate(plan.operations):
                 try:
                     await self._dispatch_operation(output_path, op)
                 except Exception as e:
+                    verification = {
+                        "partial_output": output_path,
+                        "edited_in_place": plan.edit_in_place,
+                    }
                     return DocumentOperationResult(
                         success=False,
                         summary=f"操作 {i + 1}/{len(plan.operations)} 失败",
                         error=str(e),
                         warnings=warnings,
-                        verification={"partial_output": output_path},
+                        verification=verification,
                     )
 
+            verification = {"edited_in_place": plan.edit_in_place}
+            if not plan.edit_in_place:
+                verification["original_unchanged"] = True
             return DocumentOperationResult(
                 success=True,
                 output_file=output_path,
                 summary=f"已完成 {len(plan.operations)} 项操作",
                 warnings=warnings,
-                verification={"original_unchanged": True},
+                verification=verification,
             )
         except Exception as e:
             logger.error(f"编辑操作失败: {e}")

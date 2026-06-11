@@ -28,9 +28,12 @@ class Retriever:
             self._use_chroma = True
             logger.info("使用Chroma向量存储")
             return True
-        except Exception:
+        except Exception as e:
             self._use_chroma = False
-            logger.info("使用Mock检索器")
+            logger.info(
+                "使用Mock检索器",
+                extra={"error_type": type(e).__name__, "error": str(e)},
+            )
             return False
 
     async def search(
@@ -46,7 +49,11 @@ class Retriever:
             try:
                 return await self._chroma_search(query, top_k, knowledge_scope, owner_open_id, subquestions)
             except Exception as e:
-                logger.error(f"Chroma检索失败，降级到Mock检索器: {e}")
+                logger.error(
+                    f"Chroma检索失败，降级到Mock检索器: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"query": query, "knowledge_scope": knowledge_scope, "owner_open_id": owner_open_id},
+                )
                 self._use_chroma = False
         return await self._mock_search(query, top_k)
 
@@ -186,7 +193,12 @@ class Retriever:
             if isinstance(result, Exception):
                 logger.warning(
                     "Knowledge base subquestion retrieval failed",
-                    extra={"parallel_retrieval": True, "error": str(result)},
+                    extra={
+                        "parallel_retrieval": True,
+                        "error_type": type(result).__name__,
+                        "error": str(result),
+                        "query": query,
+                    },
                 )
                 continue
             if result is not None:

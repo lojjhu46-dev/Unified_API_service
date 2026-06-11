@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import time
+import asyncio
 import httpx
 from typing import Optional
 from cryptography.hazmat.primitives import padding
@@ -335,6 +336,9 @@ class FeishuAdapter:
         """判断是否为飞书鉴权错误"""
         return code in {99991663, 99991664, 99991668}
 
+    async def _retry_delay(self, attempt: int) -> None:
+        await asyncio.sleep(0.3 * attempt)
+
     async def reply_message(self, message_id: str, text: str) -> bool:
         """回复飞书消息
 
@@ -348,27 +352,46 @@ class FeishuAdapter:
         if len(text) > 150000:  # 150KB 限制
             text = text[:150000] + "...(消息过长已截断)"
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply",
-                    headers={"Authorization": f"Bearer {token}"},
-                    json={
-                        "content": json.dumps({"text": text}, ensure_ascii=False),
-                        "msg_type": "text",
-                    },
-                )
-                data = resp.json()
-                if data.get("code") == 0:
-                    return True
-                else:
+        max_attempts = 3
+        endpoint = f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/reply"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={
+                            "content": json.dumps({"text": text}, ensure_ascii=False),
+                            "msg_type": "text",
+                        },
+                    )
+                    data = resp.json()
+                    if data.get("code") == 0:
+                        return True
                     if self._is_auth_error(data.get("code")):
                         await self.clear_tenant_access_token()
-                    logger.error(f"回复消息失败: {data}")
+                    logger.error(
+                        f"回复消息失败: {data}",
+                        extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                    )
                     return False
-        except Exception as e:
-            logger.error(f"回复消息异常: {e}")
-            return False
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.error(
+                    f"回复消息异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                if attempt < max_attempts:
+                    await self._retry_delay(attempt)
+                    continue
+                return False
+            except Exception as e:
+                logger.error(
+                    f"回复消息异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                return False
 
     async def send_message(self, chat_id: str, text: str) -> bool:
         """发送飞书消息
@@ -379,77 +402,136 @@ class FeishuAdapter:
         if not token:
             return False
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{FEISHU_API_BASE}/im/v1/messages",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"receive_id_type": "chat_id"},
-                    json={
-                        "receive_id": chat_id,
-                        "content": json.dumps({"text": text}, ensure_ascii=False),
-                        "msg_type": "text",
-                    },
-                )
-                data = resp.json()
-                if data.get("code") == 0:
-                    return True
-                else:
+        max_attempts = 3
+        endpoint = f"{FEISHU_API_BASE}/im/v1/messages"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"receive_id_type": "chat_id"},
+                        json={
+                            "receive_id": chat_id,
+                            "content": json.dumps({"text": text}, ensure_ascii=False),
+                            "msg_type": "text",
+                        },
+                    )
+                    data = resp.json()
+                    if data.get("code") == 0:
+                        return True
                     if self._is_auth_error(data.get("code")):
                         await self.clear_tenant_access_token()
-                    logger.error(f"发送消息失败: {data}")
+                    logger.error(
+                        f"发送消息失败: {data}",
+                        extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                    )
                     return False
-        except Exception as e:
-            logger.error(f"发送消息异常: {e}")
-            return False
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.error(
+                    f"发送消息异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                if attempt < max_attempts:
+                    await self._retry_delay(attempt)
+                    continue
+                return False
+            except Exception as e:
+                logger.error(
+                    f"发送消息异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                return False
 
     async def send_interactive_card(self, chat_id: str, card: dict) -> bool:
         token = await self.get_tenant_access_token()
         if not token:
             return False
 
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{FEISHU_API_BASE}/im/v1/messages",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"receive_id_type": "chat_id"},
-                    json={
-                        "receive_id": chat_id,
-                        "content": json.dumps(card, ensure_ascii=False),
-                        "msg_type": "interactive",
-                    },
+        max_attempts = 3
+        endpoint = f"{FEISHU_API_BASE}/im/v1/messages"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"receive_id_type": "chat_id"},
+                        json={
+                            "receive_id": chat_id,
+                            "content": json.dumps(card, ensure_ascii=False),
+                            "msg_type": "interactive",
+                        },
+                    )
+                    data = resp.json()
+                    if data.get("code") == 0:
+                        return True
+                    if self._is_auth_error(data.get("code")):
+                        await self.clear_tenant_access_token()
+                    logger.error(
+                        f"发送卡片失败: {data}",
+                        extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                    )
+                    return False
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.error(
+                    f"发送卡片异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
                 )
-                data = resp.json()
-                if data.get("code") == 0:
-                    return True
-                if self._is_auth_error(data.get("code")):
-                    await self.clear_tenant_access_token()
-                logger.error(f"发送卡片失败: {data}")
+                if attempt < max_attempts:
+                    await self._retry_delay(attempt)
+                    continue
                 return False
-        except Exception as e:
-            logger.error(f"发送卡片异常: {e}")
-            return False
+            except Exception as e:
+                logger.error(
+                    f"发送卡片异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                return False
 
     async def download_message_resource(self, message_id: str, file_key: str, resource_type: str = "file") -> Optional[bytes]:
         token = await self.get_tenant_access_token()
         if not token:
             return None
 
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(
-                    f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/resources/{file_key}",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"type": resource_type},
+        max_attempts = 3
+        endpoint = f"{FEISHU_API_BASE}/im/v1/messages/{message_id}/resources/{file_key}"
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"type": resource_type},
+                    )
+                    if resp.status_code == 200:
+                        return resp.content
+                    logger.error(
+                        f"下载飞书文件失败: status={resp.status_code}, body={resp.text[:300]}",
+                        extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                    )
+                    return None
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.error(
+                    f"下载飞书文件异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
                 )
-                if resp.status_code == 200:
-                    return resp.content
-                logger.error(f"下载飞书文件失败: status={resp.status_code}, body={resp.text[:300]}")
+                if attempt < max_attempts:
+                    await self._retry_delay(attempt)
+                    continue
                 return None
-        except Exception as e:
-            logger.error(f"下载飞书文件异常: {e}")
-            return None
+            except Exception as e:
+                logger.error(
+                    f"下载飞书文件异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                return None
 
 
 feishu_adapter = FeishuAdapter()

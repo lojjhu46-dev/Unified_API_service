@@ -49,10 +49,7 @@ async def _run_in_executor(func, *args) -> Any:
 @app.post("/xlsx/read_structure")
 async def read_structure(request: Request, body: dict) -> dict:
     """读取 XLSX 工作簿结构"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     resolved, err = validate_file_path(file_path)
@@ -70,10 +67,7 @@ async def read_structure(request: Request, body: dict) -> dict:
 @app.post("/xlsx/read_cell")
 async def read_cell(request: Request, body: dict) -> dict:
     """读取指定单元格的值"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
@@ -101,10 +95,7 @@ async def read_cell(request: Request, body: dict) -> dict:
 @app.post("/xlsx/modify_cell")
 async def modify_cell(request: Request, body: dict) -> dict:
     """修改指定单元格的值"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
@@ -133,10 +124,7 @@ async def modify_cell(request: Request, body: dict) -> dict:
 @app.post("/xlsx/append_row")
 async def append_row(request: Request, body: dict) -> dict:
     """在指定工作表末尾追加一行"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
@@ -162,10 +150,7 @@ async def append_row(request: Request, body: dict) -> dict:
 @app.post("/xlsx/delete_row")
 async def delete_row(request: Request, body: dict) -> dict:
     """删除指定行（1-based）"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     sheet = body.get("sheet", "")
@@ -193,10 +178,7 @@ async def delete_row(request: Request, body: dict) -> dict:
 @app.post("/xlsx/save_copy")
 async def save_copy(request: Request, body: dict) -> dict:
     """保存文档副本到指定路径"""
-    try:
-        verify_api_key(request)
-    except Exception as e:
-        return fail(str(e))
+    verify_api_key(request)
 
     file_path = body.get("file_path", "")
     output_path = body.get("output_path", "")

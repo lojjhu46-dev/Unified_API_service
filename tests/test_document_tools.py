@@ -1,5 +1,9 @@
 """Phase 8: 文档智能体工具测试"""
 
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import app.documents.tools as document_tools
 from app.config import settings
@@ -87,6 +91,49 @@ class SpyExecutor(DocumentOperationAgent):
             summary="via executor",
             verification={"structure": {"source": "executor"}},
         )
+
+
+class TableDocxBackend(MockDocxBackend):
+    """返回含表格单元格文本的 DOCX mock 后端。"""
+
+    async def read_structure(self, file_path: str) -> dict:
+        self._get_paras(file_path)
+        return {
+            "type": "docx",
+            "paragraph_count": 1,
+            "paragraphs": [{"index": 0, "text": "封面", "style": "Normal"}],
+            "headings": [],
+            "tables": [
+                {
+                    "index": 0,
+                    "rows": 2,
+                    "cols": 1,
+                    "cells": [
+                        {
+                            "row": 1,
+                            "col": 0,
+                            "text": "实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法",
+                            "merged": False,
+                        },
+                    ],
+                },
+            ],
+        }
+
+
+def _setup_table_docx_executor(file_path: str) -> TableDocxBackend:
+    executor = DocumentOperationAgent()
+    backend = TableDocxBackend()
+    backend.load_document(file_path, ["封面"])
+    backend.load_tables(file_path, [
+        [
+            ["项目"],
+            ["实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法"],
+        ],
+    ])
+    executor.register_backend(BackendType.DOCX_MCP, backend)
+    set_executor(executor)
+    return backend
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +296,46 @@ class TestDocumentReview:
 
 class TestDocumentPlan:
     @pytest.mark.asyncio
+    async def test_plan_docx_edit_preloads_table_structure(self, tmp_path):
+        f = _create_file(tmp_path, "test.docx", "")
+        executor = DocumentOperationAgent()
+        backend = TableDocxBackend()
+        backend.load_document(f, ["封面"])
+        executor.register_backend(BackendType.DOCX_MCP, backend)
+        set_executor(executor)
+
+        mock_data = {
+            "intent": "edit",
+            "operations": [
+                {
+                    "action": "clear_table_cell",
+                    "target": {"table_index": 0, "row": 1, "col": 0},
+                    "value": None,
+                    "description": "清空实验目的单元格",
+                },
+            ],
+            "risk_level": "high",
+            "requires_confirmation": True,
+            "clarification_question": None,
+            "unsupported_reason": None,
+        }
+        mock_generate = AsyncMock(return_value=json.dumps(mock_data, ensure_ascii=False))
+
+        with patch("app.documents.planner.llm_gateway.generate", new=mock_generate):
+            result = await document_plan({
+                "user_command": "删除实验目的的内容",
+                "file_path": f,
+        })
+
+        assert result["success"] is True
+        assert result["plan"]["intent"] == "edit"
+        assert result["plan"]["operations"][0]["action"] == "clear_table_cell"
+        assert result["plan"]["operations"][0]["target"] == {"table_index": 0, "row": 1, "col": 0}
+        assert result["plan"]["requires_confirmation"] is True
+        prompt = mock_generate.call_args.args[0]
+        assert "表格[0] R1C0: 实验目的" in prompt
+
+    @pytest.mark.asyncio
     async def test_plan_includes_file_path(self, monkeypatch, tmp_path):
         """document_plan 返回的 plan 必须包含 file_path"""
         f = _create_file(tmp_path, "test.pdf", "")
@@ -410,6 +497,36 @@ class TestDocumentApplyPlan:
             "confirmed": True,
         })
         assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_apply_docx_clear_table_cell_confirmed_edits_copy(self, tmp_path):
+        f = _create_file(tmp_path, "test.docx", "")
+        backend = _setup_table_docx_executor(f)
+
+        result = await document_apply_plan({
+            "plan": {
+                "intent": "edit",
+                "file_type": "docx",
+                "file_path": f,
+                "backend_required": "docx_mcp",
+                "risk_level": "high",
+                "requires_confirmation": True,
+                "operations": [
+                    {
+                        "action": "clear_table_cell",
+                        "target": {"table_index": 0, "row": 1, "col": 0},
+                        "description": "清空实验目的单元格",
+                    },
+                ],
+            },
+            "confirmed": True,
+        })
+
+        assert result["success"] is True
+        output_file = result["result"]["output_file"]
+        assert output_file is not None
+        assert "实验目的" in backend._get_table_cell(f, 0, 1, 0)
+        assert backend._get_table_cell(output_file, 0, 1, 0) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -652,3 +769,54 @@ class TestPersonalDocumentId:
         })
         assert result["success"] is True
         assert result["structure"]["line_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_source_registers_copy_then_copy_edits_in_place(self, monkeypatch, registry_with_personal_file):
+        from app.retrieval.document_registry import document_registry
+
+        first = await document_apply_plan({
+            "document_id": "doc_public_id",
+            "owner_user_id": "owner1",
+            "confirmed": True,
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "backend_required": "text_adapter",
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 1}, "value": "第一次编辑"},
+                ],
+            },
+        })
+
+        assert first["success"] is True
+        first_output = first["result"]["output_file"]
+        generated_id = first["result"]["verification"]["generated_copy_document_id"]
+        generated_record = document_registry.get(generated_id)
+        assert generated_record["is_generated_copy"] == 1
+        assert generated_record["source_document_id"] == "doc_public_id"
+        assert generated_record["stored_path"] == first_output
+        assert first_output != str(registry_with_personal_file.resolve())
+        assert registry_with_personal_file.read_text(encoding="utf-8").splitlines()[0] == "第一行"
+        assert Path(first_output).read_text(encoding="utf-8").splitlines()[0] == "第一次编辑"
+
+        second = await document_apply_plan({
+            "document_id": generated_id,
+            "owner_user_id": "owner1",
+            "confirmed": True,
+            "plan": {
+                "intent": "edit",
+                "file_type": "txt",
+                "backend_required": "text_adapter",
+                "operations": [
+                    {"action": "replace_line", "target": {"line": 2}, "value": "第二次编辑"},
+                ],
+            },
+        })
+
+        assert second["success"] is True
+        assert second["result"]["output_file"] == first_output
+        assert second["result"]["verification"]["edited_in_place"] is True
+        assert "generated_copy_document_id" not in second["result"]["verification"]
+        copy_lines = Path(first_output).read_text(encoding="utf-8").splitlines()
+        assert copy_lines == ["第一次编辑", "第二次编辑"]
+        assert registry_with_personal_file.read_text(encoding="utf-8").splitlines()[1] == "第二行"

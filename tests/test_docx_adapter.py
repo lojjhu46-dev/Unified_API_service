@@ -32,6 +32,12 @@ def sample_doc(backend):
         "第三章 结果",
         "性能提升50%。",
     ])
+    backend.load_tables("/tmp/test.docx", [
+        [
+            ["项目", "说明"],
+            ["实验目的：掌握 Pandas 读取数据及 Matplotlib 绘图方法", "实验内容"],
+        ],
+    ])
     return "/tmp/test.docx"
 
 
@@ -87,9 +93,31 @@ class TestAtomicOperations:
         assert text == "第四章 结论"
 
     @pytest.mark.asyncio
+    async def test_read_table_cell(self, backend, sample_doc):
+        text = await backend.read_table_cell(sample_doc, 0, 1, 0)
+        assert "实验目的" in text
+
+    @pytest.mark.asyncio
+    async def test_replace_table_cell(self, backend, sample_doc):
+        await backend.replace_table_cell(sample_doc, 0, 1, 0, "新的实验目的")
+        text = await backend.read_table_cell(sample_doc, 0, 1, 0)
+        assert text == "新的实验目的"
+
+    @pytest.mark.asyncio
+    async def test_clear_table_cell(self, backend, sample_doc):
+        await backend.clear_table_cell(sample_doc, 0, 1, 0)
+        text = await backend.read_table_cell(sample_doc, 0, 1, 0)
+        assert text == ""
+
+    @pytest.mark.asyncio
     async def test_index_out_of_range(self, backend, sample_doc):
         with pytest.raises(IndexError):
             await backend.read_paragraph(sample_doc, 99)
+
+    @pytest.mark.asyncio
+    async def test_table_cell_index_out_of_range(self, backend, sample_doc):
+        with pytest.raises(IndexError):
+            await backend.read_table_cell(sample_doc, 0, 99, 0)
 
     @pytest.mark.asyncio
     async def test_file_not_loaded(self, backend):
@@ -249,6 +277,82 @@ class TestExecuteEdit:
         assert result.success
         assert "2 项操作" in result.summary
 
+    @pytest.mark.asyncio
+    async def test_replace_table_cell_via_execute(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="replace_table_cell",
+                    target={"table_index": 0, "row": 1, "col": 0},
+                    value="新的实验目的",
+                    description="替换实验目的单元格",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+
+        assert result.success
+        assert result.output_file is not None
+        original_text = await backend.read_table_cell(sample_doc, 0, 1, 0)
+        copy_text = await backend.read_table_cell(result.output_file, 0, 1, 0)
+        assert "实验目的" in original_text
+        assert copy_text == "新的实验目的"
+
+    @pytest.mark.asyncio
+    async def test_clear_table_cell_via_execute(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(
+                    action="clear_table_cell",
+                    target={"table_index": 0, "row": 1, "col": 0},
+                    description="清空实验目的单元格",
+                ),
+            ],
+        )
+        result = await backend.execute(plan)
+
+        assert result.success
+        original_text = await backend.read_table_cell(sample_doc, 0, 1, 0)
+        copy_text = await backend.read_table_cell(result.output_file, 0, 1, 0)
+        assert "实验目的" in original_text
+        assert copy_text == ""
+
+    @pytest.mark.asyncio
+    async def test_edit_in_place_does_not_create_second_copy(self, backend, sample_doc):
+        copy_path = "/tmp/test_副本_abcd.docx"
+        await backend.save_copy(sample_doc, copy_path)
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=copy_path,
+            backend_required=BackendType.DOCX_MCP,
+            edit_in_place=True,
+            operations=[
+                DocumentOperation(
+                    action="replace_paragraph",
+                    target={"paragraph_index": 0},
+                    value="续编标题",
+                ),
+            ],
+        )
+
+        result = await backend.execute(plan)
+
+        assert result.success
+        assert result.output_file == copy_path
+        assert result.verification["edited_in_place"] is True
+        assert "original_unchanged" not in result.verification
+        assert await backend.read_paragraph(copy_path, 0) == "续编标题"
+        assert await backend.read_paragraph(sample_doc, 0) == "标题：项目报告"
+
 
 # ---------------------------------------------------------------------------
 # execute() 只读操作
@@ -340,6 +444,22 @@ class TestExecuteErrors:
         result = await backend.execute(plan)
         assert not result.success
         assert "paragraph_index" in result.error
+
+    @pytest.mark.asyncio
+    async def test_missing_table_cell_target_returns_error(self, backend, sample_doc):
+        plan = DocumentPlan(
+            intent=DocumentIntent.EDIT,
+            file_type=FileType.DOCX,
+            file_path=sample_doc,
+            backend_required=BackendType.DOCX_MCP,
+            operations=[
+                DocumentOperation(action="clear_table_cell", target={"table_index": 0, "row": 1}),
+            ],
+        )
+        result = await backend.execute(plan)
+        assert not result.success
+        assert result.output_file is None
+        assert "col" in result.error
 
     @pytest.mark.asyncio
     async def test_partial_edit_no_output_file(self, backend, sample_doc):

@@ -61,6 +61,21 @@ class DocxBackend(DocumentBackend):
         ...
 
     @abstractmethod
+    async def read_table_cell(self, file_path: str, table_index: int, row: int, col: int) -> str:
+        """读取指定表格单元格文本"""
+        ...
+
+    @abstractmethod
+    async def replace_table_cell(self, file_path: str, table_index: int, row: int, col: int, new_text: str) -> None:
+        """替换指定表格单元格文本"""
+        ...
+
+    @abstractmethod
+    async def clear_table_cell(self, file_path: str, table_index: int, row: int, col: int) -> None:
+        """清空指定表格单元格文本"""
+        ...
+
+    @abstractmethod
     async def save_copy(self, file_path: str, output_path: str) -> str:
         """保存文档副本到指定路径，返回输出路径"""
         ...
@@ -129,39 +144,45 @@ class DocxBackend(DocumentBackend):
             return DocumentOperationResult(success=False, error=str(e))
 
     async def _handle_edit(self, plan: DocumentPlan) -> DocumentOperationResult:
-        """处理编辑操作（在副本上执行）"""
-        output_path = self._build_output_path(plan.file_path)
+        """处理编辑操作：源文档生成副本，系统副本可原地续编。"""
+        output_path = plan.file_path if plan.edit_in_place else self._build_output_path(plan.file_path)
         warnings: list[str] = []
 
         try:
-            # 保存副本
-            await self.save_copy(plan.file_path, output_path)
+            if not plan.edit_in_place:
+                await self.save_copy(plan.file_path, output_path)
 
             # 执行操作
             for i, op in enumerate(plan.operations):
                 try:
                     await self._dispatch_operation(output_path, op)
                 except Exception as e:
+                    verification = {
+                        "partial_output": output_path,
+                        "edited_in_place": plan.edit_in_place,
+                    }
                     return DocumentOperationResult(
                         success=False,
                         summary=f"操作 {i + 1}/{len(plan.operations)} 失败",
                         error=str(e),
                         warnings=warnings,
-                        verification={"partial_output": output_path},
+                        verification=verification,
                     )
 
+            verification = {"edited_in_place": plan.edit_in_place}
+            if not plan.edit_in_place:
+                verification["original_unchanged"] = True
             return DocumentOperationResult(
                 success=True,
                 output_file=output_path,
                 summary=f"已完成 {len(plan.operations)} 项操作",
                 warnings=warnings,
-                verification={"original_unchanged": True},
+                verification=verification,
             )
         except Exception as e:
             logger.error(f"编辑操作失败: {e}")
             return DocumentOperationResult(
                 success=False,
-                output_file=output_path if Path(output_path).exists() else None,
                 error=str(e),
             )
 
@@ -184,6 +205,14 @@ class DocxBackend(DocumentBackend):
         elif action in ("append_text", "append_paragraph"):
             await self.append_paragraph(file_path, op.value or "")
 
+        elif action == "replace_table_cell":
+            table_index, row, col = self._extract_table_cell_target(op)
+            await self.replace_table_cell(file_path, table_index, row, col, op.value or "")
+
+        elif action == "clear_table_cell":
+            table_index, row, col = self._extract_table_cell_target(op)
+            await self.clear_table_cell(file_path, table_index, row, col)
+
         else:
             raise ValueError(f"不支持的操作动作: {op.action}")
 
@@ -195,6 +224,15 @@ class DocxBackend(DocumentBackend):
             if key in target:
                 return int(target[key])
         return None
+
+    @staticmethod
+    def _extract_table_cell_target(op: DocumentOperation) -> tuple[int, int, int]:
+        """从 target 中提取 table_index/row/col，0 是合法索引。"""
+        target = op.target
+        missing = [key for key in ("table_index", "row", "col") if key not in target]
+        if missing:
+            raise ValueError(f"{op.action} 缺少 {', '.join(missing)}: {op.target}")
+        return int(target["table_index"]), int(target["row"]), int(target["col"])
 
     @staticmethod
     def _build_output_path(file_path: str) -> str:
@@ -215,6 +253,8 @@ class MockDocxBackend(DocxBackend):
         self._available = True
         # file_path -> list[str]（段落文本）
         self._documents: dict[str, list[str]] = {}
+        # file_path -> list[table][row][col]（表格文本）
+        self._tables: dict[str, list[list[list[str]]]] = {}
 
     @property
     def is_available(self) -> bool:
@@ -227,6 +267,11 @@ class MockDocxBackend(DocxBackend):
     def load_document(self, file_path: str, paragraphs: list[str]) -> None:
         """测试用：加载模拟文档"""
         self._documents[file_path] = list(paragraphs)
+        self._tables.setdefault(file_path, [])
+
+    def load_tables(self, file_path: str, tables: list[list[list[str]]]) -> None:
+        """测试用：加载模拟表格"""
+        self._tables[file_path] = copy.deepcopy(tables)
 
     async def read_structure(self, file_path: str) -> dict[str, Any]:
         if not self.is_available:
@@ -236,7 +281,7 @@ class MockDocxBackend(DocxBackend):
             "type": "docx",
             "paragraph_count": len(paras),
             "headings": [p for p in paras if p.startswith("#")],
-            "tables": [],
+            "tables": self._build_tables_structure(file_path),
         }
 
     def _get_paras(self, file_path: str) -> list[str]:
@@ -275,6 +320,19 @@ class MockDocxBackend(DocxBackend):
         paras = self._get_paras(file_path)
         paras.append(text)
 
+    async def read_table_cell(self, file_path: str, table_index: int, row: int, col: int) -> str:
+        if not self.is_available:
+            raise BackendUnavailableError("MockDocxBackend 不可用")
+        return self._get_table_cell(file_path, table_index, row, col)
+
+    async def replace_table_cell(self, file_path: str, table_index: int, row: int, col: int, new_text: str) -> None:
+        if not self.is_available:
+            raise BackendUnavailableError("MockDocxBackend 不可用")
+        self._set_table_cell(file_path, table_index, row, col, new_text)
+
+    async def clear_table_cell(self, file_path: str, table_index: int, row: int, col: int) -> None:
+        await self.replace_table_cell(file_path, table_index, row, col, "")
+
     async def save_copy(self, file_path: str, output_path: str) -> str:
         if not self.is_available:
             raise BackendUnavailableError("MockDocxBackend 不可用")
@@ -283,4 +341,51 @@ class MockDocxBackend(DocxBackend):
             raise FileNotFoundError(f"文件未加载: {file_path}")
         # 保存副本到内存（复制段落列表）
         self._documents[output_path] = copy.deepcopy(paras)
+        self._tables[output_path] = copy.deepcopy(self._tables.get(file_path, []))
         return output_path
+
+    def _get_tables(self, file_path: str) -> list[list[list[str]]]:
+        self._get_paras(file_path)
+        return self._tables.setdefault(file_path, [])
+
+    def _get_table_cell(self, file_path: str, table_index: int, row: int, col: int) -> str:
+        if table_index < 0 or row < 0 or col < 0:
+            raise IndexError(f"表格单元格索引越界: table_index={table_index}, row={row}, col={col}")
+        tables = self._get_tables(file_path)
+        try:
+            return tables[table_index][row][col]
+        except IndexError:
+            raise IndexError(f"表格单元格索引越界: table_index={table_index}, row={row}, col={col}")
+
+    def _set_table_cell(self, file_path: str, table_index: int, row: int, col: int, value: str) -> None:
+        if table_index < 0 or row < 0 or col < 0:
+            raise IndexError(f"表格单元格索引越界: table_index={table_index}, row={row}, col={col}")
+        tables = self._get_tables(file_path)
+        try:
+            tables[table_index][row][col] = value
+        except IndexError:
+            raise IndexError(f"表格单元格索引越界: table_index={table_index}, row={row}, col={col}")
+
+    def _build_tables_structure(self, file_path: str) -> list[dict[str, Any]]:
+        tables = self._tables.get(file_path, [])
+        result = []
+        for table_index, table in enumerate(tables):
+            cells = []
+            max_cols = 0
+            for row_index, row_cells in enumerate(table):
+                max_cols = max(max_cols, len(row_cells))
+                for col_index, text in enumerate(row_cells):
+                    cells.append({
+                        "row": row_index,
+                        "col": col_index,
+                        "text": text,
+                        "merged": False,
+                    })
+            result.append({
+                "index": table_index,
+                "rows": len(table),
+                "cols": max_cols,
+                "cells": cells,
+                "truncated": False,
+            })
+        return result

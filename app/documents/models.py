@@ -124,6 +124,11 @@ class DocumentPlan(BaseModel):
         default=None,
         description="intent=unsupported 时的原因说明",
     )
+    edit_in_place: bool = Field(
+        default=False,
+        exclude=True,
+        description="内部执行字段：系统生成的编辑副本可原地续编，不由 planner 生成",
+    )
 
     # ---- 安全规则校验 ----
 

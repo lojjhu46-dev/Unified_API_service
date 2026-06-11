@@ -1,6 +1,6 @@
 """TXT 真实本地 adapter
 
-使用 UTF-8 文本读写，编辑只作用于副本，不覆盖原文件。
+使用 UTF-8 文本读写。源文档编辑由上层先生成副本，系统生成的编辑副本可原地续编。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ class RealTxtBackend(TxtBackend):
     """TXT 真实本地后端
 
     直接读写文件系统上的 UTF-8 文本文件。
-    编辑操作在副本上执行，不覆盖原文件。
+    是否生成副本由 TxtBackend._handle_edit() 根据 DocumentPlan.edit_in_place 决定。
     """
 
     @property

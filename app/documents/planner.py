@@ -75,10 +75,25 @@ def build_structure_brief(structure: dict[str, Any]) -> str:
             if tables:
                 parts.append(f"含 {len(tables)} 个表格")
                 for t in tables[:5]:  # 最多显示前 5 个表格
+                    if not isinstance(t, dict):
+                        continue
                     idx = t.get("index", 0)
                     rows = t.get("rows", 0)
                     cols = t.get("cols", 0)
                     parts.append(f"  表格[{idx}]: {rows}行 x {cols}列")
+                    cells = t.get("cells", [])
+                    if isinstance(cells, list) and cells:
+                        for cell in cells[:30]:
+                            if not isinstance(cell, dict):
+                                continue
+                            text = (cell.get("text") or "").strip()
+                            if not text:
+                                continue
+                            if len(text) > 400:
+                                text = text[:400] + "..."
+                            row = cell.get("row", 0)
+                            col = cell.get("col", 0)
+                            parts.append(f"    表格[{idx}] R{row}C{col}: {text}")
         elif isinstance(tables, int) and tables > 0:
             parts.append(f"含 {tables} 个表格")
 
@@ -152,7 +167,9 @@ _PLANNER_SYSTEM = """你是文档编辑规划助手。根据用户命令和文�
 2. 删除、替换、清空、批量修改操作的 risk_level 设为 high，requires_confirmation 设为 true。
 3. intent 为 unsupported 时，说明原因。
 4. operations 中的 target 必须使用文档结构中的具体定位信息（段落号、单元格引用、行号等）。
-5. 只输出 JSON，不要输出任何解释。"""
+5. DOCX 表格单元格内容可以用于定位；如果目标位于表格单元格，target 必须包含 table_index、row、col。
+6. 删除/清空 DOCX 表格单元格内容时，action 使用 clear_table_cell；替换 DOCX 表格单元格内容时，action 使用 replace_table_cell。
+7. 只输出 JSON，不要输出任何解释。"""
 
 
 def _build_planner_prompt(
@@ -218,7 +235,7 @@ class DocumentPlanningAgent:
                 unsupported_reason=f"规划智能体调用失败: {e}",
             )
 
-        return self._parse_plan(raw, file_type, user_command)
+        return self._parse_plan(raw, file_type, user_command, structure or {})
 
     # ---- 解析 LLM 输出 ----
 
@@ -227,6 +244,7 @@ class DocumentPlanningAgent:
         raw: str,
         file_type: FileType,
         user_command: str,
+        structure: dict[str, Any] | None = None,
     ) -> DocumentPlan:
         """解析 LLM 输出为 DocumentPlan，含防御性后处理。"""
         data = self._extract_json(raw)
@@ -304,6 +322,19 @@ class DocumentPlanningAgent:
             risk_level = RiskLevel.HIGH
             requires_confirmation = True
 
+        # DOCX 相对表格定位：例如 “在「教师评语及成绩：」的上一个表格填充内容”
+        relative_table_result = self._apply_relative_table_reference(
+            user_command,
+            file_type,
+            structure or {},
+            operations,
+        )
+        if relative_table_result.get("clarification"):
+            clarification = relative_table_result["clarification"]
+            operations = []
+        else:
+            operations = relative_table_result.get("operations", operations)
+
         # 模糊定位强制澄清
         if operations and self._is_vague_target(user_command, operations):
             clarification = (
@@ -326,6 +357,91 @@ class DocumentPlanningAgent:
             clarification_question=clarification,
             unsupported_reason=unsupported_reason,
         )
+
+    @classmethod
+    def _apply_relative_table_reference(
+        cls,
+        user_command: str,
+        file_type: FileType,
+        structure: dict[str, Any],
+        operations: list[DocumentOperation],
+    ) -> dict[str, Any]:
+        """处理“锚点文本的上一个表格”这类确定性相对定位。
+
+        LLM 容易把包含锚点文本的表格当作目标；这里用文档结构强制把
+        table_index 改为锚点表格之前的那个表格。
+        """
+        if file_type != FileType.DOCX or not operations:
+            return {"operations": operations}
+
+        anchor = cls._extract_previous_table_anchor(user_command)
+        if not anchor:
+            return {"operations": operations}
+
+        tables = structure.get("tables", [])
+        if not isinstance(tables, list) or not tables:
+            return {"clarification": f"未找到表格结构，无法定位“{anchor}”的上一个表格。"}
+
+        anchor_position = cls._find_table_position_containing_text(tables, anchor)
+        if anchor_position is None:
+            return {"clarification": f"未在文档表格中找到锚点文本“{anchor}”，无法定位上一个表格。"}
+        if anchor_position <= 0:
+            return {"clarification": f"已找到“{anchor}”所在表格，但它前面没有上一个表格。"}
+
+        previous_table = tables[anchor_position - 1]
+        if not isinstance(previous_table, dict):
+            return {"clarification": f"“{anchor}”的上一个表格结构无效，无法定位。"}
+        previous_table_index = previous_table.get("index", anchor_position - 1)
+
+        adjusted: list[DocumentOperation] = []
+        changed = False
+        for op in operations:
+            target = dict(op.target or {})
+            if "table_index" in target:
+                target["table_index"] = previous_table_index
+                adjusted.append(op.model_copy(update={"target": target}))
+                changed = True
+            else:
+                adjusted.append(op)
+
+        if not changed:
+            return {
+                "clarification": (
+                    f"已定位到“{anchor}”的上一个表格，但当前编辑方案没有表格单元格定位，"
+                    "请补充要填充的具体单元格。"
+                )
+            }
+        return {"operations": adjusted}
+
+    @staticmethod
+    def _extract_previous_table_anchor(command: str) -> str | None:
+        patterns = [
+            r"[\"“”「『](.+?)[\"“”」』]\s*的?\s*上一个表格",
+            r"在\s*(.+?)\s*的?\s*上一个表格",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, command)
+            if match:
+                anchor = match.group(1).strip()
+                return anchor or None
+        return None
+
+    @staticmethod
+    def _find_table_position_containing_text(tables: list[Any], anchor: str) -> int | None:
+        normalized_anchor = re.sub(r"\s+", "", anchor)
+        for position, table in enumerate(tables):
+            if not isinstance(table, dict):
+                continue
+            cells = table.get("cells", [])
+            if not isinstance(cells, list):
+                continue
+            for cell in cells:
+                if not isinstance(cell, dict):
+                    continue
+                text = re.sub(r"\s+", "", str(cell.get("text") or ""))
+                if normalized_anchor and normalized_anchor in text:
+                    return position
+        return None
 
     # ---- 辅助方法 ----
 
@@ -385,6 +501,25 @@ class DocumentPlanningAgent:
         for op in operations:
             action_lower = op.action.lower()
             if any(kw in action_lower for kw in _HIGH_RISK_ACTIONS):
+                return True
+        return False
+
+    @staticmethod
+    def _has_table_cell_target(operations: list[DocumentOperation]) -> bool:
+        """检查 DOCX 操作是否定位到表格单元格。"""
+        table_target_keys = {"table_index", "table", "row", "col", "cell_ref"}
+        for op in operations:
+            target = op.target or {}
+            if "table_index" in target:
+                return True
+            if {"row", "col"}.issubset(target.keys()) and any(k in target for k in ("table", "table_index")):
+                return True
+            if target.get("target_type") in {"table_cell", "cell"}:
+                return True
+            action = op.action.lower()
+            if "table" in action or "cell" in action:
+                return True
+            if table_target_keys.intersection(target.keys()) and "paragraph_index" not in target:
                 return True
         return False
 

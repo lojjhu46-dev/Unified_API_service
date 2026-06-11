@@ -244,19 +244,17 @@ class TestHttpDocxBackend:
 
     @pytest.mark.asyncio
     async def test_timeout_then_recovery(self, backend):
-        """超时后应能恢复，不永久阻断"""
-        fail_resp = httpx.Response(200, json={"success": True, "data": {"type": "docx", "paragraph_count": 3}})
+        """临时超时应在本次调用内短重试并恢复"""
         ok_resp = httpx.Response(200, json={"success": True, "data": {"type": "docx", "paragraph_count": 5}})
-        with patch("httpx.AsyncClient.post", new=AsyncMock(side_effect=[
+        post = AsyncMock(side_effect=[
             httpx.TimeoutException("timeout"),
             ok_resp,
-        ])):
-            from app.documents.adapters.base import BackendUnavailableError
-            with pytest.raises(BackendUnavailableError):
-                await backend.read_structure("/tmp/test.docx")
-            # 第二次调用应成功
+        ])
+        with patch("httpx.AsyncClient.post", new=post), patch("asyncio.sleep", new=AsyncMock()) as sleep:
             structure = await backend.read_structure("/tmp/test.docx")
-            assert structure["paragraph_count"] == 5
+        assert structure["paragraph_count"] == 5
+        assert post.await_count == 2
+        sleep.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_success_false(self, backend):
@@ -302,3 +300,16 @@ class TestHttpXlsxBackend:
         mock_resp = httpx.Response(200, json={"success": True, "data": {}})
         with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=mock_resp)):
             await backend.modify_cell("/tmp/test.xlsx", "Sheet1", "A1", "新值")
+
+    @pytest.mark.asyncio
+    async def test_timeout_then_recovery(self, backend):
+        ok_resp = httpx.Response(200, json={"success": True, "data": {"value": "张三"}})
+        post = AsyncMock(side_effect=[
+            httpx.ConnectTimeout("timeout"),
+            ok_resp,
+        ])
+        with patch("httpx.AsyncClient.post", new=post), patch("asyncio.sleep", new=AsyncMock()) as sleep:
+            value = await backend.read_cell("/tmp/test.xlsx", "Sheet1", "A1")
+        assert value == "张三"
+        assert post.await_count == 2
+        sleep.assert_awaited_once()

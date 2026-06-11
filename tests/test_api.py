@@ -866,6 +866,62 @@ def test_rag_reuses_answer_from_tenth_recent_turn(client):
     mock_generate.assert_not_awaited()
 
 
+def test_regenerate_answer_skips_recent_reuse_and_runs_rag(client, caplog):
+    full_history = [
+        {"role": "user", "content": "人工智能有什么特点"},
+        {"role": "assistant", "content": "旧答案：AI 的特点包括学习和推理。"},
+    ]
+    mock_memory = MagicMock()
+
+    async def get_history(_session_id, max_messages=6):
+        return full_history[-max_messages:]
+
+    mock_memory.get_history = AsyncMock(side_effect=get_history)
+    mock_memory.create_session = AsyncMock(return_value="test_session")
+    mock_memory.append_turn = AsyncMock()
+
+    source = SourceItem(
+        title="ai.txt",
+        snippet="人工智能特点",
+        content="人工智能具备学习、推理、感知和生成能力。",
+        score=1.0,
+    )
+
+    with patch("app.orchestrator.orchestrator.memory", mock_memory), \
+         patch("app.orchestrator.rewrite_question", new=AsyncMock(return_value="人工智能有什么特点")) as mock_rewrite, \
+         patch("app.orchestrator.orchestrator.retriever.search", new=AsyncMock(return_value=[source])) as mock_search, \
+         patch("app.orchestrator.orchestrator.llm.generate", new=AsyncMock(return_value="新答案：AI 可以学习、推理和生成内容。")) as mock_generate:
+        with caplog.at_level("INFO", logger="app.orchestrator"):
+            response = client.post(
+                "/ask",
+                json={
+                    "user_id": "test_user",
+                    "question": "重新生成答案",
+                },
+            )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["route"] == "rag"
+    assert data["answer"] == "新答案：AI 可以学习、推理和生成内容。"
+    assert data["answer"] != "旧答案：AI 的特点包括学习和推理。"
+    assert data["standalone_question"] == "人工智能有什么特点"
+    mock_rewrite.assert_awaited_once()
+    mock_search.assert_awaited_once()
+    mock_generate.assert_awaited_once()
+    assert mock_memory.get_history.await_args_list[0].args == ("test_session", settings.memory_reuse_window_messages)
+    assert mock_memory.get_history.await_args_list[1].args == ("test_session", settings.memory_rewrite_window_messages)
+    assert mock_memory.get_history.await_args_list[2].args == ("test_session", settings.memory_prompt_window_messages)
+    miss_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "recent_answer_reuse_miss_reason", None)
+    ]
+    assert miss_records
+    assert miss_records[-1].recent_answer_reuse_miss_reason == "regenerate_requested"
+    assert miss_records[-1].recent_answer_reuse_hit is False
+
+
 def test_web_route_does_not_reuse_recent_answer(client):
     mock_memory = MagicMock()
     mock_memory.get_history = AsyncMock(return_value=[
@@ -919,6 +975,34 @@ def test_web_route_does_not_reuse_recent_answer(client):
 
 
 class TestRecentAnswerReuse:
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "重新生成答案",
+            "重新回答",
+            "再回答一次",
+            "请重新生成",
+            "换个答案",
+            "重新检索回答",
+            "regenerate answer",
+            "answer again",
+        ],
+    )
+    def test_regenerate_request_is_detected(self, question):
+        assert app_orchestrator._is_regenerate_answer_request(question)
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "人工智能有什么特点",
+            "重新生成图片的原理是什么",
+            "请解释 regenerate answer 的含义",
+            "换个答案是否会影响检索质量？",
+        ],
+    )
+    def test_regular_question_is_not_regenerate_request(self, question):
+        assert not app_orchestrator._is_regenerate_answer_request(question)
+
     def test_exact_question_matches_latest_turn(self):
         history = [
             {"role": "user", "content": "A"},

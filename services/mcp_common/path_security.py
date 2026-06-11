@@ -33,10 +33,15 @@ def _apply_path_map(file_path: str) -> str:
     if not path_map:
         return file_path
 
+    normalized_file_path = file_path.replace("\\", "/").rstrip("/")
     for host_path, container_path in path_map.items():
-        if file_path.startswith(host_path):
-            # 替换前缀
-            return container_path + file_path[len(host_path):]
+        normalized_host_path = host_path.replace("\\", "/").rstrip("/")
+        if (
+            normalized_file_path == normalized_host_path
+            or normalized_file_path.startswith(normalized_host_path + "/")
+        ):
+            suffix = normalized_file_path[len(normalized_host_path):]
+            return container_path.rstrip("/") + suffix
 
     return file_path
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from typing import Optional
 
 from fastapi import HTTPException, Request
@@ -34,7 +35,7 @@ def verify_api_key(request: Request) -> None:
             detail="缺少 X-MCP-API-Key 请求头",
         )
 
-    if provided_key != configured_key:
+    if not secrets.compare_digest(provided_key, configured_key):
         raise HTTPException(
             status_code=403,
             detail="API Key 无效",

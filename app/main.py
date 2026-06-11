@@ -239,7 +239,12 @@ async def _handle_feishu_document_edit_confirmation(text: str, open_id: str | No
         "expires_at": time.time() + settings.feishu_pending_file_ttl_seconds,
     }
     await pending_file_store.create(pending_id, pending, settings.feishu_pending_file_ttl_seconds)
-    await feishu_adapter.send_interactive_card(chat_id, build_document_edit_confirm_card(plan, pending_id))
+    await _safe_send_feishu_card(
+        chat_id,
+        build_document_edit_confirm_card(plan, pending_id),
+        context="document_edit_confirm_card",
+        pending_id=pending_id,
+    )
     return "已生成编辑确认卡片，请点击“确认执行”或“取消”。"
 
 
@@ -282,7 +287,7 @@ async def _handle_feishu_resource_links(text: str, session_id: str, open_id: str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(log_redis_startup_health())
+    asyncio.create_task(_run_background_task_safely(log_redis_startup_health, None, task_name="redis_startup_health"))
     yield
 
 
@@ -610,7 +615,14 @@ async def process_feishu_file_event(event_data: dict) -> None:
         settings.feishu_pending_file_ttl_seconds,
     )
     card = build_personal_file_confirm_card(filename, pending_id)
-    await feishu_adapter.send_interactive_card(event_data.get("chat_id"), card)
+    await _safe_send_feishu_card(
+        event_data.get("chat_id"),
+        card,
+        context="file_confirm_card",
+        pending_id=pending_id,
+        message_id=event_data.get("message_id"),
+        dedupe_key=event_data.get("dedupe_key"),
+    )
 
 
 def build_personal_file_confirm_card(filename: str, pending_id: str) -> dict:
@@ -663,9 +675,9 @@ async def process_feishu_card_action(action_data: dict) -> None:
         chat_id = action_data.get("chat_id")
         if chat_id:
             if action in {"confirm_document_edit", "cancel_document_edit"}:
-                await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+                await _safe_send_feishu_message(chat_id, "编辑确认已过期，请重新发起编辑。", context="card_action_missing_document_edit", pending_id=pending_id)
             else:
-                await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+                await _safe_send_feishu_message(chat_id, "文件确认已过期，请重新发送文件。", context="card_action_missing_file", pending_id=pending_id)
         return
     if pending.get("expires_at", 0) < time.time():
         await pending_file_store.delete(pending_id)
@@ -677,13 +689,13 @@ async def process_feishu_card_action(action_data: dict) -> None:
         chat_id = action_data.get("chat_id") or pending.get("chat_id")
         if chat_id:
             if pending.get("type") == "document_edit":
-                await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+                await _safe_send_feishu_message(chat_id, "编辑确认已过期，请重新发起编辑。", context="card_action_expired_document_edit", pending_id=pending_id)
             else:
-                await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+                await _safe_send_feishu_message(chat_id, "文件确认已过期，请重新发送文件。", context="card_action_expired_file", pending_id=pending_id)
         return
     if not action_data.get("open_id") or action_data.get("open_id") != pending.get("open_id"):
         message = "只有发起编辑的用户可以确认执行。" if pending.get("type") == "document_edit" else "只有上传文件的用户可以确认保存。"
-        await feishu_adapter.send_message(pending.get("chat_id"), message)
+        await _safe_send_feishu_message(pending.get("chat_id"), message, context="card_action_operator_mismatch", pending_id=pending_id)
         return
 
     if pending.get("type") == "document_edit":
@@ -697,7 +709,7 @@ async def process_feishu_card_action(action_data: dict) -> None:
             pending.get("chat_id"),
             pending_id,
         )
-        await feishu_adapter.send_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。")
+        await _safe_send_feishu_message(pending.get("chat_id"), f"已取消保存 `{pending.get('file_name')}`。", context="file_save_cancelled", pending_id=pending_id)
         return
 
     if action == "summarize_file":
@@ -711,7 +723,7 @@ async def process_feishu_card_action(action_data: dict) -> None:
     if not pending:
         chat_id = action_data.get("chat_id")
         if chat_id:
-            await feishu_adapter.send_message(chat_id, "文件确认已过期，请重新发送文件。")
+            await _safe_send_feishu_message(chat_id, "文件确认已过期，请重新发送文件。", context="file_confirm_consume_missing", pending_id=pending_id)
         return
     await pending_file_store.clear_latest_pending(
         pending.get("open_id"),
@@ -729,9 +741,17 @@ async def process_feishu_document_edit_card_action(action_data: dict, pending: d
     pending_id = action_data.get("pending_id")
     chat_id = pending.get("chat_id")
 
+    async def send_document_edit_notification(message: str, *, status: str) -> None:
+        await _safe_send_feishu_message(
+            chat_id,
+            message,
+            context=f"document_edit_{status}",
+            pending_id=pending_id,
+        )
+
     if action == "cancel_document_edit":
         await pending_file_store.delete(pending_id)
-        await feishu_adapter.send_message(chat_id, "已取消文档编辑。")
+        await send_document_edit_notification("已取消文档编辑。", status="cancelled")
         return
 
     if action != "confirm_document_edit":
@@ -739,7 +759,7 @@ async def process_feishu_document_edit_card_action(action_data: dict, pending: d
 
     pending = await pending_file_store.consume(pending_id)
     if not pending:
-        await feishu_adapter.send_message(chat_id, "编辑确认已过期，请重新发起编辑。")
+        await send_document_edit_notification("编辑确认已过期，请重新发起编辑。", status="expired")
         return
 
     execution = await tool_registry.execute_with_result("document_apply_plan", {
@@ -755,9 +775,12 @@ async def process_feishu_document_edit_card_action(action_data: dict, pending: d
         message = f"文档编辑执行成功：{summary}"
         if output_file:
             message += f"\n输出文件：{output_file}"
-        await feishu_adapter.send_message(chat_id, message)
+        await send_document_edit_notification(message, status="success")
     else:
-        await feishu_adapter.send_message(chat_id, f"文档编辑执行失败：{result.get('error', '未知错误')}")
+        await send_document_edit_notification(
+            f"文档编辑执行失败：{result.get('error', '未知错误')}",
+            status="failed",
+        )
 
 
 async def summarize_pending_feishu_file(pending: dict) -> None:
@@ -769,11 +792,11 @@ async def summarize_pending_feishu_file(pending: dict) -> None:
             pending.get("file_key"),
         )
         if not content:
-            await feishu_adapter.send_message(chat_id, "文件下载失败，请稍后重试。")
+            await _safe_send_feishu_message(chat_id, "文件下载失败，请稍后重试。", context="file_summarize_download_failed")
             return
         result = await summarize_uploaded_file_content(content, filename)
         if not result.get("success"):
-            await feishu_adapter.send_message(chat_id, result.get("error") or "文件识别总结失败。")
+            await _safe_send_feishu_message(chat_id, result.get("error") or "文件识别总结失败。", context="file_summarize_failed")
             return
         warnings = "\n".join(f"- {warning}" for warning in result.get("warnings", []))
         message = (
@@ -784,10 +807,10 @@ async def summarize_pending_feishu_file(pending: dict) -> None:
         )
         if warnings:
             message += f"\n\n注意：\n{warnings}"
-        await feishu_adapter.send_message(chat_id, message)
+        await _safe_send_feishu_message(chat_id, message, context="file_summarize_success")
     except Exception as e:
         logger.error(f"飞书文件识别总结失败: {e}", exc_info=True)
-        await feishu_adapter.send_message(chat_id, "文件识别总结失败，请稍后重试。")
+        await _safe_send_feishu_message(chat_id, "文件识别总结失败，请稍后重试。", context="file_summarize_exception")
 
 
 async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
@@ -799,10 +822,10 @@ async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
             pending.get("file_key"),
         )
         if not content:
-            await feishu_adapter.send_message(chat_id, "文件下载失败，请稍后重试。")
+            await _safe_send_feishu_message(chat_id, "文件下载失败，请稍后重试。", context="personal_file_download_failed")
             return
         if len(content) > 10 * 1024 * 1024:
-            await feishu_adapter.send_message(chat_id, "文件大小不能超过10MB。")
+            await _safe_send_feishu_message(chat_id, "文件大小不能超过10MB。", context="personal_file_too_large")
             return
 
         document_id = str(uuid.uuid4())[:12]
@@ -828,13 +851,14 @@ async def save_feishu_file_to_personal_knowledge(pending: dict) -> None:
             channel="feishu",
         )
         orchestrator.retriever.refresh()
-        await feishu_adapter.send_message(
+        await _safe_send_feishu_message(
             chat_id,
             f"已保存到个人知识库：{result['filename']}，共 {result['chunks']} 个切块。",
+            context="personal_file_save_success",
         )
     except Exception as e:
         logger.error(f"飞书文件保存到个人知识库失败: {e}", exc_info=True)
-        await feishu_adapter.send_message(chat_id, "文件保存失败，请稍后重试。")
+        await _safe_send_feishu_message(chat_id, "文件保存失败，请稍后重试。", context="personal_file_save_exception")
 
 
 async def save_feishu_file_to_enterprise_knowledge(pending: dict) -> None:
@@ -846,10 +870,10 @@ async def save_feishu_file_to_enterprise_knowledge(pending: dict) -> None:
             pending.get("file_key"),
         )
         if not content:
-            await feishu_adapter.send_message(chat_id, "文件下载失败，请稍后重试。")
+            await _safe_send_feishu_message(chat_id, "文件下载失败，请稍后重试。", context="enterprise_file_download_failed")
             return
         if len(content) > 10 * 1024 * 1024:
-            await feishu_adapter.send_message(chat_id, "文件大小不能超过10MB。")
+            await _safe_send_feishu_message(chat_id, "文件大小不能超过10MB。", context="enterprise_file_too_large")
             return
 
         document_id = str(uuid.uuid4())[:12]
@@ -873,13 +897,14 @@ async def save_feishu_file_to_enterprise_knowledge(pending: dict) -> None:
             channel="feishu",
         )
         orchestrator.retriever.refresh()
-        await feishu_adapter.send_message(
+        await _safe_send_feishu_message(
             chat_id,
             f"已保存到企业知识库：{result['filename']}，共 {result['chunks']} 个切块。",
+            context="enterprise_file_save_success",
         )
     except Exception as e:
         logger.error(f"飞书文件保存到企业知识库失败: {e}", exc_info=True)
-        await feishu_adapter.send_message(chat_id, "文件保存失败，请稍后重试。")
+        await _safe_send_feishu_message(chat_id, "文件保存失败，请稍后重试。", context="enterprise_file_save_exception")
 
 
 async def send_feishu_processing_heartbeat(chat_id: str, dedupe_key: str | None = None) -> None:
@@ -927,7 +952,12 @@ async def send_feishu_status_message(
 ) -> bool:
     """发送飞书处理状态普通消息，失败只记录日志。"""
     try:
-        ok = await feishu_adapter.send_message(chat_id, text)
+        ok = await _safe_send_feishu_message(
+            chat_id,
+            text,
+            context=f"status_{status_type}",
+            dedupe_key=dedupe_key,
+        )
         logger.info(
             "Feishu status message sent",
             extra={
@@ -951,11 +981,98 @@ async def send_feishu_status_message(
         return False
 
 
+async def _safe_send_feishu_message(
+    chat_id: str | None,
+    text: str,
+    *,
+    context: str,
+    pending_id: str | None = None,
+    message_id: str | None = None,
+    dedupe_key: str | None = None,
+) -> bool:
+    if not chat_id:
+        logger.error(
+            "Feishu send skipped: missing chat_id",
+            extra={"context": context, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+        return False
+    try:
+        sent = await feishu_adapter.send_message(chat_id, text)
+    except Exception as e:
+        logger.error(
+            f"Feishu message send raised: {type(e).__name__}: {e}",
+            exc_info=True,
+            extra={"context": context, "chat_id": chat_id, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+        return False
+    if not sent:
+        logger.error(
+            "Feishu message send returned false",
+            extra={"context": context, "chat_id": chat_id, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+    return sent
+
+
+async def _safe_send_feishu_card(
+    chat_id: str | None,
+    card: dict,
+    *,
+    context: str,
+    pending_id: str | None = None,
+    message_id: str | None = None,
+    dedupe_key: str | None = None,
+) -> bool:
+    if not chat_id:
+        logger.error(
+            "Feishu card send skipped: missing chat_id",
+            extra={"context": context, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+        return False
+    try:
+        sent = await feishu_adapter.send_interactive_card(chat_id, card)
+    except Exception as e:
+        logger.error(
+            f"Feishu card send raised: {type(e).__name__}: {e}",
+            exc_info=True,
+            extra={"context": context, "chat_id": chat_id, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+        return False
+    if not sent:
+        logger.error(
+            "Feishu card send returned false",
+            extra={"context": context, "chat_id": chat_id, "pending_id": pending_id, "message_id": message_id, "dedupe_key": dedupe_key},
+        )
+    return sent
+
+
+async def _run_background_task_safely(handler, payload: dict | None, *, task_name: str | None = None) -> None:
+    try:
+        if payload is None:
+            await handler()
+        else:
+            await handler(payload)
+    except Exception as e:
+        payload = payload or {}
+        logger.error(
+            f"Background task failed: {type(e).__name__}: {e}",
+            exc_info=True,
+            extra={
+                "task_name": task_name or getattr(handler, "__name__", "unknown"),
+                "message_id": payload.get("message_id"),
+                "pending_id": payload.get("pending_id"),
+                "dedupe_key": payload.get("dedupe_key"),
+                "chat_id": payload.get("chat_id"),
+                "open_id": payload.get("open_id"),
+            },
+        )
+
+
 def _schedule_feishu_task(background_tasks: BackgroundTasks | None, handler, payload: dict) -> None:
+    task_name = getattr(handler, "__name__", "unknown")
     if background_tasks is not None:
-        background_tasks.add_task(handler, payload)
+        background_tasks.add_task(_run_background_task_safely, handler, payload, task_name=task_name)
         return
-    asyncio.create_task(handler(payload))
+    asyncio.create_task(_run_background_task_safely(handler, payload, task_name=task_name))
 
 
 def _feishu_rate_limit_identity(

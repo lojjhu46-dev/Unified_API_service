@@ -60,6 +60,8 @@ services:
       - ./data/personal_uploads:/data/personal_uploads
     environment:
       - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
+      - MCP_API_KEY=${MCP_API_KEY:-}
+      - MCP_PATH_MAP=${MCP_PATH_MAP:-}
       - LOG_LEVEL=INFO
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/health').read()"]
@@ -79,6 +81,8 @@ services:
       - ./data/personal_uploads:/data/personal_uploads
     environment:
       - MCP_ALLOWED_DIR=/data/uploads,/data/personal_uploads
+      - MCP_API_KEY=${MCP_API_KEY:-}
+      - MCP_PATH_MAP=${MCP_PATH_MAP:-}
       - LOG_LEVEL=INFO
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9101/health').read()"]

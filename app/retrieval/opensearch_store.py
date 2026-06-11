@@ -237,7 +237,11 @@ def _sync_opensearch_search_with_status(
             succeeded=True,
         )
     except Exception as e:
-        logger.warning(f"OpenSearch search failed: {e}")
+        logger.warning(
+            f"OpenSearch search failed: {type(e).__name__}: {e}",
+            exc_info=True,
+            extra={"query": query, "metadata_filter": metadata_filter},
+        )
         return OpenSearchSearchResult(
             results=[],
             available=True,

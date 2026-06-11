@@ -6,10 +6,33 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 from typing import Any
 
 from docx import Document
+
+
+def _paragraph_style_name(paragraph) -> str:
+    if paragraph.style and paragraph.style.name:
+        return paragraph.style.name
+    return ""
+
+
+def _truncate_text(text: str, max_length: int) -> str:
+    if len(text) > max_length:
+        return text[:max_length] + "..."
+    return text
+
+
+def _get_table_cell(doc: Document, table_index: int, row: int, col: int):
+    if table_index < 0 or table_index >= len(doc.tables):
+        raise IndexError(f"表格索引 {table_index} 超出范围（共 {len(doc.tables)} 个表格）")
+    table = doc.tables[table_index]
+    if row < 0 or row >= len(table.rows):
+        raise IndexError(f"表格 {table_index} 行索引 {row} 超出范围（共 {len(table.rows)} 行）")
+    row_cells = table.rows[row].cells
+    if col < 0 or col >= len(row_cells):
+        raise IndexError(f"表格 {table_index} 列索引 {col} 超出范围（该行共 {len(row_cells)} 列）")
+    return row_cells[col]
 
 
 def read_structure(file_path: str) -> dict[str, Any]:
@@ -23,27 +46,51 @@ def read_structure(file_path: str) -> dict[str, Any]:
     max_text_length = 500  # 每段最多 500 字
 
     for i, p in enumerate(paragraphs[:max_paragraphs]):
-        text = p.text
-        # 截断过长的文本
-        if len(text) > max_text_length:
-            text = text[:max_text_length] + "..."
+        text = _truncate_text(p.text, max_text_length)
+        style_name = _paragraph_style_name(p)
 
         paragraphs_info.append({
             "index": i,
             "text": text,
+            "style": style_name,
         })
 
-        if p.style and p.style.name and p.style.name.startswith("Heading"):
+        if style_name.startswith("Heading"):
             headings.append(p.text)
 
-    # tables 改为列表格式
     tables_info = []
+    max_tables = 20
+    max_cells_per_table = 500
+    max_cell_text_length = 1000
     for i, table in enumerate(doc.tables):
+        cells = []
+        seen_cell_elements = set()
+        for row_index, row in enumerate(table.rows):
+            for col_index, cell in enumerate(row.cells):
+                cell_element = cell._tc
+                if cell_element in seen_cell_elements:
+                    continue
+                seen_cell_elements.add(cell_element)
+                text = _truncate_text(cell.text, max_cell_text_length)
+                cells.append({
+                    "row": row_index,
+                    "col": col_index,
+                    "text": text,
+                    "merged": False,
+                })
+                if len(cells) >= max_cells_per_table:
+                    break
+            if len(cells) >= max_cells_per_table:
+                break
         tables_info.append({
             "index": i,
             "rows": len(table.rows),
             "cols": len(table.columns),
+            "cells": cells,
+            "truncated": len(cells) >= max_cells_per_table,
         })
+        if len(tables_info) >= max_tables:
+            break
 
     return {
         "type": "docx",
@@ -51,6 +98,7 @@ def read_structure(file_path: str) -> dict[str, Any]:
         "paragraphs": paragraphs_info,
         "headings": headings,
         "tables": tables_info,
+        "tables_truncated": len(doc.tables) > max_tables,
     }
 
 
@@ -103,6 +151,26 @@ def append_paragraph(file_path: str, text: str) -> None:
     doc = Document(file_path)
     doc.add_paragraph(text)
     doc.save(file_path)
+
+
+def read_table_cell(file_path: str, table_index: int, row: int, col: int) -> str:
+    """读取指定表格单元格文本"""
+    doc = Document(file_path)
+    cell = _get_table_cell(doc, table_index, row, col)
+    return cell.text
+
+
+def replace_table_cell(file_path: str, table_index: int, row: int, col: int, new_text: str) -> None:
+    """替换指定表格单元格文本"""
+    doc = Document(file_path)
+    cell = _get_table_cell(doc, table_index, row, col)
+    cell.text = new_text
+    doc.save(file_path)
+
+
+def clear_table_cell(file_path: str, table_index: int, row: int, col: int) -> None:
+    """清空指定表格单元格文本"""
+    replace_table_cell(file_path, table_index, row, col, "")
 
 
 def save_copy(file_path: str, output_path: str) -> str:

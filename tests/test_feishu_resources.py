@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from app.channels.feishu_resources import (
@@ -120,3 +121,40 @@ async def test_read_resource_permission_error_is_structured():
     assert result["success"] is False
     assert result["permission_error"] is True
     assert "没有该资源的读取权限" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_read_resource_retries_transient_timeout():
+    client = FeishuResourceClient(AsyncMock(return_value="tenant_token"), "https://open.feishu.cn/open-apis")
+    get = AsyncMock(side_effect=[
+        httpx.ConnectTimeout("timeout"),
+        _response({"code": 0, "data": {"content": "正文内容"}}),
+    ])
+
+    with patch("httpx.AsyncClient.get", new=get), patch("asyncio.sleep", new=AsyncMock()) as sleep:
+        result = await client.read_resource(
+            FeishuResourceLink("docx", "docx_token", "https://abc.feishu.cn/docx/docx_token")
+        )
+
+    assert result["success"] is True
+    assert result["text"] == "正文内容"
+    assert get.await_count == 2
+    sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_read_resource_non_json_error_is_structured():
+    client = FeishuResourceClient(AsyncMock(return_value="tenant_token"), "https://open.feishu.cn/open-apis")
+    response = MagicMock()
+    response.status_code = 502
+    response.text = "bad gateway"
+    response.json.side_effect = ValueError("not json")
+
+    with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=response)):
+        result = await client.read_resource(
+            FeishuResourceLink("docx", "docx_token", "https://abc.feishu.cn/docx/docx_token")
+        )
+
+    assert result["success"] is False
+    assert result["permission_error"] is False
+    assert "非 JSON 响应" in result["error"]

@@ -6,12 +6,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
 
 from app.documents.adapters.base import BackendUnavailableError
 from app.documents.adapters.xlsx import XlsxBackend
+from app.observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class HttpXlsxBackend(XlsxBackend):
@@ -46,22 +50,44 @@ class HttpXlsxBackend(XlsxBackend):
         headers = {}
         if self._api_key:
             headers["X-MCP-API-Key"] = self._api_key
-        try:
-            resp = await client.post(url, json=payload, headers=headers)
-        except httpx.TimeoutException:
-            raise BackendUnavailableError(f"XLSX MCP 超时: {url}")
-        except httpx.RequestError as e:
-            raise BackendUnavailableError(f"XLSX MCP 连接失败: {e}")
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                break
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                logger.warning(
+                    f"XLSX MCP 请求异常: {type(e).__name__}: {e}",
+                    exc_info=True,
+                    extra={"endpoint": endpoint, "attempt": attempt, "max_attempts": max_attempts},
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                raise BackendUnavailableError(f"XLSX MCP 连接失败: {e}") from e
 
         if resp.status_code != 200:
+            logger.warning(
+                f"XLSX MCP HTTP {resp.status_code}: {resp.text[:200]}",
+                extra={"endpoint": endpoint},
+            )
             raise BackendUnavailableError(f"XLSX MCP HTTP {resp.status_code}: {url}")
 
         try:
             body = resp.json()
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"XLSX MCP 响应非 JSON: {type(e).__name__}: {e}",
+                exc_info=True,
+                extra={"endpoint": endpoint, "body": resp.text[:200]},
+            )
             raise BackendUnavailableError(f"XLSX MCP 响应非 JSON: {resp.text[:200]}")
 
         if not body.get("success"):
+            logger.warning(
+                f"XLSX MCP 业务失败: {body.get('error', '未知')}",
+                extra={"endpoint": endpoint},
+            )
             raise BackendUnavailableError(f"XLSX MCP 错误: {body.get('error', '未知')}")
 
         return body.get("data", {})
